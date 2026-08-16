@@ -1,0 +1,48 @@
+[Unit]
+Description=Copymint bot
+Documentation=https://github.com/morsyxbt/nft-public-mint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=copymint
+Group=copymint
+WorkingDirectory=/opt/copymint
+
+# Secrets live in a root-owned file the service user can read, never in this
+# unit — systemctl cat is world-readable and would otherwise print them.
+EnvironmentFile=/etc/copymint/env
+
+ExecStart=/usr/bin/node dist/bot/index.js
+
+# A mint bot that dies mid-drop is worse than one that never started, so it
+# always comes back. StartLimit exists so a genuine config error surfaces as a
+# stopped unit rather than an infinite crash loop.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# The wallet store is the only thing worth protecting on this box, so the
+# process gets no more of the filesystem than it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/copymint
+Environment=COPYMINT_HOME=/var/lib/copymint
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=copymint
+
+[Install]
+WantedBy=multi-user.target

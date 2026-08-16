@@ -1,7 +1,7 @@
 {
   "name": "nft-public-mint",
   "version": "1.0.0",
-  "description": "CLI sniper for public SeaDrop NFT mints — builds calldata on-chain, no OpenSea token required",
+  "description": "CLI sniper for public SeaDrop NFT mints \u2014 builds calldata on-chain, no OpenSea token required",
   "main": "dist/index.js",
   "bin": {
     "nft-public-mint": "dist/index.js"
@@ -9,7 +9,16 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "bot": "node dist/bot/index.js",
+    "dev:bot": "ts-node src/bot/index.ts",
+    "encrypt-keys": "ts-node src/tools/encrypt-keys.ts",
+    "wallets": "ts-node src/tools/wallets.ts",
+    "verify": "ts-node src/tools/verify.ts",
+    "shakedown": "ts-node src/tools/shakedown.ts",
+    "find-drops": "ts-node src/tools/find-drops.ts",
+    "probe": "ts-node src/tools/probe.ts",
+    "balances": "ts-node src/tools/balances.ts"
   },
   "keywords": [
     "nft",
@@ -25,6 +34,7 @@
     "chalk": "^4.1.2",
     "dotenv": "^16.3.1",
     "ethers": "^6.9.0",
+    "grammy": "^1.21.1",
     "ora": "^5.4.1"
   },
   "devDependencies": {
