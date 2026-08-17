@@ -34,6 +34,7 @@ import {
   OpenSeaApiError,
   OpenSeaFailure,
   fetchMintCalldata,
+  fetchDrop,
 } from "./opensea-api";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -222,7 +223,40 @@ export const OPEN_POLL = {
   backoffFactor: 2,
   firstBackoffMs: 2_000,
   maxBackoffMs: 30_000,
+  /**
+   * How often to ask whether the drop still exists at all.
+   *
+   * The mint endpoint answers 404 both for a stage that has not opened and for
+   * a drop that has finished, so probing alone cannot tell "wait" from "this is
+   * over". Observed live: a drop sold its last tokens during an earlier stage,
+   * so the stage being waited for never opened, and the hold spent 100 probes
+   * across its full three-minute grace before giving up with a timeout rather
+   * than a reason.
+   *
+   * The drop endpoint does distinguish them — it answers normally for an
+   * unopened stage and 404s once the drop is gone — so one call every fifteen
+   * seconds buys an accurate early exit for a fraction of the requests.
+   */
+  dropRecheckMs: 15_000,
 };
+
+/** Why a hold should stop waiting, or undefined to carry on. */
+export async function dropEnded(apiKey: string, slug: string): Promise<string | undefined> {
+  try {
+    const drop = await fetchDrop(apiKey, slug);
+    const total = Number(drop.total_supply ?? 0);
+    const max = Number(drop.max_supply ?? 0);
+    if (max > 0 && total >= max) return `the drop is minted out (${total}/${max})`;
+    return undefined;
+  } catch (err) {
+    // Only a definitive "not here" ends the hold. A timeout or a 5xx says
+    // nothing about the drop and must not cancel a wait that is otherwise fine.
+    if (err instanceof OpenSeaApiError && err.status === 404) {
+      return "OpenSea no longer lists this drop — it has ended or been removed";
+    }
+    return undefined;
+  }
+}
 
 /**
  * What a refusal during the hold means for whether to keep waiting.
@@ -335,6 +369,16 @@ export async function holdUntilOpen(
   let probeTimeoutMs = OPEN_POLL.probeTimeoutMs;
   let lastReason = "waiting for the stage to open";
 
+  // Fail before the wait, not after it. A drop that is already gone would
+  // otherwise be discovered only once the grace period expired — potentially
+  // twenty minutes of sleeping followed by three of probing, to conclude
+  // something that was knowable at the start.
+  const goneAtStart = await dropEnded(deps.apiKey, req.slug);
+  if (goneAtStart) {
+    throw new OpenSeaMintError(`Nothing to wait for — ${goneAtStart}.`);
+  }
+  let lastDropCheck = Date.now();
+
   for (;;) {
     const now = Date.now();
 
@@ -358,6 +402,20 @@ export async function holdUntilOpen(
     // Without a published time there is nothing to be early relative to, so any
     // answer counts. With one, only answers from the open onwards do.
     const reachedOpenTime = openAt === undefined || now >= openAt;
+
+    // Past the open and still being refused: ask whether there is still a drop
+    // to wait for. Only from here, because before the open a refusal is
+    // expected and carries no suggestion that anything is wrong.
+    if (reachedOpenTime && now - lastDropCheck >= OPEN_POLL.dropRecheckMs) {
+      lastDropCheck = now;
+      const gone = await dropEnded(deps.apiKey, req.slug);
+      if (gone) {
+        throw new OpenSeaMintError(
+          `Stopped waiting after ${Math.round((now - (openAt ?? startedAt)) / 1000)}s — ${gone}.\n` +
+            `Last answer from the mint endpoint: ${lastReason}`
+        );
+      }
+    }
 
     attempts += 1;
     try {

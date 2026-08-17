@@ -15,6 +15,7 @@ import {
   writeDefaultConfig,
   writeConfigIfMissing,
   updateUserSettings,
+  chainOverrideFrom,
   BotConfig,
   ResolvedConfig,
   ConfigError,
@@ -354,10 +355,8 @@ function fail(ctx: Context, err: unknown): Promise<unknown> {
  */
 async function chainFor(ctx: Context, contract?: string): Promise<ChainContext> {
   const parts = args(ctx);
-  const onIndex = parts.indexOf("on");
-  if (onIndex !== -1 && parts[onIndex + 1]) {
-    return session.chain(parts[onIndex + 1]);
-  }
+  const override = chainOverrideFrom(parts);
+  if (override) return session.chain(override);
   if (contract && isAddress(contract)) {
     // Detection is authoritative: the chain with code at that address is the
     // chain the contract is on. It is not a default — it is an answer.

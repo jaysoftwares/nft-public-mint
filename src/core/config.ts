@@ -101,6 +101,22 @@ export class ConfigError extends Error {
   }
 }
 
+/**
+ * Pull an explicit `on <chain>` out of a command's arguments.
+ *
+ * Shared by every command because the button flows now express their chosen
+ * chain the same way a typed command does — appending `on <chain>` — so this
+ * one parser decides what both mean. It is deliberately pure and tested:
+ * a wiring slip here sends money to the chain the operator did not pick, which
+ * is the failure the flow was changed to prevent.
+ */
+export function chainOverrideFrom(parts: string[]): string | undefined {
+  const index = parts.indexOf("on");
+  if (index === -1) return undefined;
+  const value = parts[index + 1];
+  return value && value.trim().length > 0 ? value.trim().toLowerCase() : undefined;
+}
+
 export const DEFAULT_CONFIG: BotConfig = {
   chain: "base",
   // Setup sentinel. The Telegram flow refuses wallet creation until each user

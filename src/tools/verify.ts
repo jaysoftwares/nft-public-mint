@@ -60,7 +60,12 @@ import {
 } from "../core/allowlist";
 import { id as ethersId, TypedDataEncoder } from "ethers";
 import { inspectCalldata, openSignal, OPEN_POLL } from "../core/mint-opensea";
-import { writeDefaultConfig, updateUserSettings, ConfigError } from "../core/config";
+import {
+  writeDefaultConfig,
+  updateUserSettings,
+  chainOverrideFrom,
+  ConfigError,
+} from "../core/config";
 import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
 import { ensureUserFundingWallet } from "../bot/user-wallet";
@@ -566,6 +571,38 @@ async function main(): Promise<void> {
     !parseFundAmount("2", CAP).ok && parseFundAmount("0.2", CAP).ok
   );
 
+  // ── which chain a command means ───────────────────────────────────────
+  //
+  // The button flows express the chosen chain by appending "on <chain>", the
+  // same way a typed command does, so this parser is the single point where a
+  // wiring slip would send money to a chain nobody picked.
+  section("chain selection");
+
+  const chainCases: [string[], string | undefined][] = [
+    // What the fund flow now emits.
+    [["derived+funded", "0.002", "on", "robinhood"], "robinhood"],
+    [["all", "on", "base"], "base"],
+    [["0xabc", "2", "derived+funded", "wait", "on", "robinhood"], "robinhood"],
+    [["0xabc", "2", "derived+funded", "wait", "at", "17:30", "on", "base"], "base"],
+    [["ROBINHOOD"], undefined],
+    [["on", "Robinhood"], "robinhood"],
+    [["on", "  base  "], "base"],
+    // No override present.
+    [["derived+funded", "0.002"], undefined],
+    [[], undefined],
+    // Malformed: "on" with nothing after it must not resolve to a chain.
+    [["all", "on"], undefined],
+    [["all", "on", ""], undefined],
+  ];
+  for (const [parts, expected] of chainCases) {
+    const got = chainOverrideFrom(parts);
+    check(
+      `[${parts.join(" ")}] → ${expected ?? "no override"}`,
+      got === expected,
+      `got ${got}`
+    );
+  }
+
   // ── holding for a stage that has not opened ───────────────────────────
   //
   // The hold has to tell three things apart: the stage is shut (keep asking),
@@ -642,6 +679,21 @@ async function main(): Promise<void> {
   check(
     "a hung probe cannot delay detection by more than its timeout plus the gap",
     OPEN_POLL.probeTimeoutMs + OPEN_POLL.tightMs < 5_000
+  );
+
+  // A finished drop and an unopened stage both answer 404 on the mint
+  // endpoint. Seen live: a drop sold out during an earlier stage, so the one
+  // being waited for never opened, and the hold burned its whole grace period
+  // to report a timeout instead of the reason.
+  check("the hold rechecks whether the drop still exists", OPEN_POLL.dropRecheckMs > 0);
+  check(
+    "…often enough to exit early rather than at the grace deadline",
+    OPEN_POLL.dropRecheckMs * 4 <= OPEN_POLL.graceMs,
+    `${OPEN_POLL.dropRecheckMs}ms vs ${OPEN_POLL.graceMs}ms`
+  );
+  check(
+    "…but rarely enough to stay a rounding error on the request budget",
+    OPEN_POLL.dropRecheckMs >= OPEN_POLL.tightMs * 10
   );
 
   // The worst case that matters: how many requests a full grace period of
