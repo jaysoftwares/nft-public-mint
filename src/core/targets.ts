@@ -14,12 +14,16 @@ import { getAddress } from "ethers";
 import { stateDir, ensureStateDir } from "./paths";
 
 export type Tier = "high" | "med" | "low";
+export type MintMode = "free" | "paid" | "both";
 
 export const TIERS: Tier[] = ["high", "med", "low"];
+export const MINT_MODES: MintMode[] = ["free", "paid", "both"];
 
 export interface WatchTarget {
   address: string;
   tier: Tier;
+  /** Which source transactions this target is allowed to trigger. */
+  mintMode: MintMode;
   label?: string;
   addedAt: number;
   /** Total fires ever, for reporting. */
@@ -40,7 +44,13 @@ function read(): TargetsFile {
   if (!existsSync(file())) return { targets: [] };
   try {
     const parsed = JSON.parse(readFileSync(file(), "utf8")) as Partial<TargetsFile>;
-    return { targets: parsed.targets ?? [] };
+    return {
+      targets: (parsed.targets ?? []).map((target) => ({
+        ...target,
+        // Migration for targets saved before the filter existed.
+        mintMode: MINT_MODES.includes(target.mintMode) ? target.mintMode : "both",
+      })),
+    };
   } catch {
     return { targets: [] };
   }
@@ -73,7 +83,12 @@ export function find(address: string): WatchTarget | undefined {
   return read().targets.find((t) => t.address.toLowerCase() === wanted);
 }
 
-export function add(address: string, tier: Tier, label?: string): WatchTarget {
+export function add(
+  address: string,
+  tier: Tier,
+  mintMode: MintMode = "both",
+  label?: string
+): WatchTarget {
   const normalised = normalise(address);
   const data = read();
 
@@ -82,6 +97,7 @@ export function add(address: string, tier: Tier, label?: string): WatchTarget {
   );
   if (existing) {
     existing.tier = tier;
+    existing.mintMode = mintMode;
     if (label !== undefined) existing.label = label;
     write(data);
     return existing;
@@ -90,6 +106,7 @@ export function add(address: string, tier: Tier, label?: string): WatchTarget {
   const target: WatchTarget = {
     address: normalised,
     tier,
+    mintMode,
     label,
     addedAt: Date.now(),
     fires: 0,
@@ -98,6 +115,25 @@ export function add(address: string, tier: Tier, label?: string): WatchTarget {
   data.targets.push(target);
   write(data);
   return target;
+}
+
+export function setMintMode(address: string, mintMode: MintMode): WatchTarget {
+  const wanted = normalise(address).toLowerCase();
+  const data = read();
+  const target = data.targets.find((entry) => entry.address.toLowerCase() === wanted);
+  if (!target) throw new TargetsError("That address is not being watched.");
+  target.mintMode = mintMode;
+  write(data);
+  return target;
+}
+
+/** Free means the copied source transaction sent zero native ETH. */
+export function allowsMint(target: Pick<WatchTarget, "mintMode">, valueWei: bigint): boolean {
+  return (
+    target.mintMode === "both" ||
+    (target.mintMode === "free" && valueWei === 0n) ||
+    (target.mintMode === "paid" && valueWei > 0n)
+  );
 }
 
 export function remove(address: string): boolean {
@@ -144,4 +180,14 @@ export function parseTier(value: string | undefined, fallback: Tier = "low"): Ti
   const lower = value.trim().toLowerCase();
   if ((TIERS as string[]).includes(lower)) return lower as Tier;
   throw new TargetsError(`Unknown tier "${value}". Use one of: ${TIERS.join(", ")}.`);
+}
+
+export function parseMintMode(
+  value: string | undefined,
+  fallback: MintMode = "both"
+): MintMode {
+  if (!value) return fallback;
+  const lower = value.trim().toLowerCase();
+  if ((MINT_MODES as string[]).includes(lower)) return lower as MintMode;
+  throw new TargetsError(`Unknown mint filter "${value}". Use: free, paid, or both.`);
 }

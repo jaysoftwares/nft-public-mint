@@ -64,6 +64,14 @@ Every private chat gets an isolated directory and setup flow. The user sends
 and deleted after ten minutes regardless. Their session comes up without a
 service restart; other users' sessions keep running.
 
+Users may instead restore an existing 12/24-word BIP-39 seed during setup. Once
+running, **Wallets → Import wallet** accepts a private key or the first 1/10
+accounts from another seed. Secret messages are deleted immediately; imported
+wallets remain manual-only until the user explicitly enables auto-fire.
+
+Each watched target stores its own copy filter: free mints, paid mints, or both.
+Here, free means the source transaction sends zero native ETH.
+
 The phrase travels through Telegram, whose cloud chats are not end-to-end
 encrypted. Users should enable Telegram two-step verification and write the
 phrase on paper. It restores every derived wallet, but **not** imported keys,

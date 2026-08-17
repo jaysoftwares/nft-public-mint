@@ -184,6 +184,8 @@ export async function rpcBatch<T>(
 const DEFAULT_CALLS_PER_SEC = Number(process.env.RPC_MAX_CALLS_PER_SEC ?? 45);
 
 const buckets = new Map<string, { tokens: number; last: number }>();
+/** Providers/plans discovered to reject JSON-RPC array payloads entirely. */
+const unbatchableHosts = new Set<string>();
 
 async function takeTokens(host: string, count: number, perSecond: number): Promise<void> {
   let bucket = buckets.get(host);
@@ -239,7 +241,8 @@ export async function rpcBatchChunked<T>(
   const perSecond = DEFAULT_CALLS_PER_SEC;
   const out: BatchEntry<T>[] = calls.map(() => ({}));
   let pending = calls.map((_, i) => i);
-  let size = Math.max(1, chunkSize);
+  let batchSupported = !unbatchableHosts.has(host);
+  let size = batchSupported ? Math.max(1, chunkSize) : 1;
 
   for (let round = 0; round < MAX_ROUNDS && pending.length > 0; round++) {
     const retry: number[] = [];
@@ -247,6 +250,25 @@ export async function rpcBatchChunked<T>(
     for (let offset = 0; offset < pending.length; ) {
       const indices = pending.slice(offset, offset + size);
       await takeTokens(host, indices.length, perSecond);
+
+      // Some QuickNode plans reject every JSON-RPC array, including an array
+      // containing one call. Once discovered, use ordinary requests for that
+      // host; callers still receive the same ordered BatchEntry[] shape.
+      if (!batchSupported) {
+        const index = indices[0];
+        const call = calls[index];
+        try {
+          out[index] = {
+            result: await rpcCall<T>(url, call.method, call.params, timeoutMs),
+          };
+        } catch (err) {
+          const message = (err as Error).message;
+          if (isRateLimit(message)) retry.push(index);
+          else out[index] = { error: message };
+        }
+        offset += 1;
+        continue;
+      }
 
       try {
         const results = await rpcBatch<T>(
@@ -273,11 +295,13 @@ export async function rpcBatchChunked<T>(
           size = stated;
           continue; // same offset, smaller slice
         }
-        if (size > 1) {
-          size = Math.max(1, Math.floor(size / 2));
-          continue;
-        }
-        throw err;
+        // A non-rate rejection with no stated limit is normally a provider or
+        // account tier that does not support batch payloads at all. Falling
+        // back to single calls is safe for other generic gateway failures too.
+        batchSupported = false;
+        unbatchableHosts.add(host);
+        size = 1;
+        continue;
       }
     }
 

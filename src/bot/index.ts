@@ -23,7 +23,13 @@ import { storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
 import { Session, ChainContext } from "./session";
 import { ManagedWallet } from "../core/wallet-store";
-import { readImportBlob, initNew, storeExists } from "../core/wallet-store";
+import {
+  readImportBlob,
+  initNew,
+  initFromMnemonic,
+  importEntriesFromMnemonic,
+  storeExists,
+} from "../core/wallet-store";
 import { ensureUserFundingWallet } from "./user-wallet";
 import { resolve as resolveWallets, summarise, SelectorError } from "../core/tags";
 import { gasReservation, shortfalls } from "../core/balances";
@@ -75,11 +81,13 @@ import {
   mainMenu,
   mintMenu,
   walletsMenu,
+  walletImportMenu,
   moneyMenu,
   copyMenu,
   quantityKeyboard,
   selectorKeyboard,
   tierKeyboard,
+  mintModeKeyboard,
   amountKeyboard,
   confirmKeyboard,
   simpleConfirm,
@@ -341,6 +349,7 @@ const HELP = `<b>Copymint</b>
 /wallets [selector] — list matching wallets
 /wallets csv — every wallet, tag and balance as a file
 /generate &lt;n&gt; — derive n more wallets
+/import — securely prompt for a private key or seed phrase
 /autofire &lt;selector&gt; on|off — autonomous firing per wallet
 /tag &lt;selector&gt; &lt;tag&gt; · /untag &lt;selector&gt; &lt;tag&gt;
 
@@ -360,7 +369,7 @@ const HELP = `<b>Copymint</b>
 whichever you're eligible for. Times are UTC.
 
 <b>Copy-mint</b>
-/watch &lt;address&gt; [high|med|low] [label] — mirror a wallet's mints
+/watch &lt;address&gt; [high|med|low] [free|paid|both] [label] — mirror selected mints
 /unwatch &lt;address&gt; · /targets — manage the watch list
 /copy on|off — autonomous firing kill switch
 /caps — spend limits and today's usage
@@ -1617,18 +1626,23 @@ async function cmdFcfs(ctx: Context): Promise<void> {
 }
 
 async function cmdWatch(ctx: Context): Promise<void> {
-  const [address, tierArg, ...labelParts] = args(ctx);
+  const [address, tierArg, modeOrLabel, ...remainingLabel] = args(ctx);
   if (!address) {
     await ctx.reply(
-      "Usage: <code>/watch 0xAlpha… high alpha-wallet</code>\nTiers: <code>high</code> <code>med</code> <code>low</code> — they set how many wallets fire.",
+      "Usage: <code>/watch 0xAlpha… high free alpha-wallet</code>\nTiers: <code>high</code> <code>med</code> <code>low</code>. Filters: <code>free</code> <code>paid</code> <code>both</code>.",
       { parse_mode: "HTML" }
     );
     return;
   }
 
   const tier = targets.parseTier(tierArg, "low");
+  const modeIsExplicit = ["free", "paid", "both"].includes((modeOrLabel ?? "").toLowerCase());
+  const mintMode = targets.parseMintMode(modeIsExplicit ? modeOrLabel : undefined, "both");
+  const labelParts = modeIsExplicit
+    ? remainingLabel
+    : [modeOrLabel, ...remainingLabel].filter((part): part is string => part !== undefined);
   const label = labelParts.join(" ") || undefined;
-  const target = targets.add(address, tier, label);
+  const target = targets.add(address, tier, mintMode, label);
   await session.retargetWatchers();
 
   const walletsPerFire = config.copy.tiers[tier];
@@ -1637,6 +1651,7 @@ async function cmdWatch(ctx: Context): Promise<void> {
       `<b>Watching</b> <code>${esc(target.address)}</code>`,
       ``,
       `tier <b>${tier}</b> → up to ${walletsPerFire} wallets per signal`,
+      `copy <b>${mintMode === "both" ? "free + paid" : `${mintMode} only`}</b>`,
       label ? `label ${esc(label)}` : ``,
       ``,
       session.copyEnabled
@@ -1679,7 +1694,7 @@ async function cmdTargets(ctx: Context): Promise<void> {
     const recent = targets.firesInWindow(t.address, 3_600_000);
     return (
       `<code>${short(t.address)}</code>  <b>${t.tier}</b> →${perFire}w  ` +
-      `${t.fires} fires${recent > 0 ? ` (${recent} this hour)` : ""}` +
+      `<b>${t.mintMode}</b> · ${t.fires} fires${recent > 0 ? ` (${recent} this hour)` : ""}` +
       (t.label ? `  ${esc(t.label)}` : "")
     );
   });
@@ -1692,6 +1707,7 @@ async function cmdTargets(ctx: Context): Promise<void> {
       ...lines,
       ``,
       `<i>Cooldown: max ${config.copy.maxFiresPerTargetPerHour}/target/hour · dedup ${config.copy.dedupWindowSec}s</i>`,
+      `<i>Free means the target transaction sends 0 native ETH; paid means it sends more than 0.</i>`,
     ].join("\n"),
     { parse_mode: "HTML", reply_markup: targetsKeyboard(list) }
   );
@@ -1819,6 +1835,78 @@ function renderCopyEvent(
       );
       break;
     }
+  }
+}
+
+async function showWalletImport(ctx: Context): Promise<void> {
+  await ctx.reply(
+    [
+      `<b>Import an existing wallet</b>`,
+      ``,
+      `Choose a private key, or import the first account(s) from another BIP-39 seed phrase.`,
+      ``,
+      `<i>The secret message is deleted immediately after the bot reads it. Telegram`,
+      `cloud chats are not end-to-end encrypted, and the VPS operator can access`,
+      `wallets while the service is running. Imported wallets start manual-only.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: walletImportMenu() }
+  );
+}
+
+async function beginWalletSecretImport(
+  ctx: Context,
+  kind: "key" | "seed",
+  count = 1
+): Promise<void> {
+  const flow = startFlow(ctx.chat!.id, "importWallet", "secret");
+  flow.importCount = kind === "seed" ? count : 0;
+  await ctx.reply(
+    [
+      `<b>${kind === "seed" ? `Import ${count} seed account${count === 1 ? "" : "s"}` : "Import private key"}</b>`,
+      ``,
+      kind === "seed"
+        ? `Send the 12- or 24-word BIP-39 seed phrase in your next message.`
+        : `Send the 64-character private key in your next message.`,
+      ``,
+      `<b>Do not send this secret to anyone else.</b> This bot deletes the`,
+      `message after reading it, but Telegram will still have transported it.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: backTo("x", "✕ Cancel") }
+  );
+}
+
+async function importWalletSecret(ctx: Context, flow: Flow, secret: string): Promise<void> {
+  // Best-effort deletion happens before validation or any reply, so invalid
+  // secrets do not linger in chat either.
+  await ctx.deleteMessage().catch(() => undefined);
+  try {
+    const entries =
+      (flow.importCount ?? 0) > 0
+        ? importEntriesFromMnemonic(secret, flow.importCount!)
+        : [{ privateKey: secret }];
+    const result = session.store.importKeys(entries);
+    clearFlow(ctx.chat!.id);
+
+    await ctx.reply(
+      [
+        `<b>Wallet import complete</b>`,
+        ``,
+        `${result.added.length} added · ${result.duplicates.length} already present`,
+        ...result.added.slice(0, 10).map((address) => `<code>${esc(address)}</code>`),
+        result.added.length > 10 ? `…and ${result.added.length - 10} more` : ``,
+        ``,
+        `<i>Imported wallets are manual-only. Use Wallets → Auto-fire only if`,
+        `you deliberately want them to spend on copy signals.</i>`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      { parse_mode: "HTML", reply_markup: walletsMenu() }
+    );
+  } catch (err) {
+    await ctx.reply(
+      `⚠️ ${esc((err as Error).message)}\n\nThe secret message was deleted. Send it again, or tap Cancel.`,
+      { parse_mode: "HTML", reply_markup: backTo("x", "✕ Cancel") }
+    );
   }
 }
 
@@ -1964,6 +2052,78 @@ async function showSetup(ctx: Context): Promise<void> {
     return;
   }
   await ctx.reply(SETUP_HEADER, { parse_mode: "HTML", reply_markup: setupMenu() });
+}
+
+async function beginSeedRestore(ctx: Context): Promise<void> {
+  if (isReady() || storeExists()) {
+    await ctx.reply(
+      "A wallet store already exists. Use Wallets → Import wallet to merge accounts from another seed."
+    );
+    return;
+  }
+  if (config.vault === ZeroAddress) {
+    await ctx.reply("Set your NFT vault before restoring a wallet store.", {
+      reply_markup: settingsMenu(true),
+    });
+    return;
+  }
+  startFlow(ctx.chat!.id, "restore", "secret");
+  await ctx.reply(
+    [
+      `<b>Restore an existing seed</b>`,
+      ``,
+      `Send your 12- or 24-word BIP-39 phrase in the next message. Its first`,
+      `account becomes your funding wallet; you can derive the rest here.`,
+      ``,
+      `<b>The message will be deleted immediately after it is read.</b> Telegram`,
+      `cloud chats are not end-to-end encrypted, so only continue if you accept`,
+      `the hosted/custodial security tradeoff described in What is this?`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: backTo("s:cancel", "✕ Cancel") }
+  );
+}
+
+async function restoreSeed(ctx: Context, phrase: string): Promise<void> {
+  await ctx.deleteMessage().catch(() => undefined);
+  try {
+    initFromMnemonic(phrase, currentRuntime().passphrase);
+  } catch (err) {
+    await ctx.reply(
+      `⚠️ ${esc((err as Error).message)}\n\nThe phrase message was deleted. Send it again, or tap Cancel.`,
+      { parse_mode: "HTML", reply_markup: backTo("s:cancel", "✕ Cancel") }
+    );
+    return;
+  }
+
+  clearFlow(ctx.chat!.id);
+  try {
+    await startSession();
+  } catch (err) {
+    await ctx.reply(
+      [
+        `<b>Seed restored — session temporarily offline</b>`,
+        ``,
+        esc((err as Error).message),
+        ``,
+        `<i>The encrypted store is safe. Tap retry when the RPC is reachable.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("↻ Retry", "s:retry") }
+    );
+    return;
+  }
+
+  await ctx.reply(
+    [
+      `<b>Existing seed restored</b>`,
+      ``,
+      `Funding wallet`,
+      `<code>${esc(config.funder)}</code>`,
+      ``,
+      `<i>The phrase message was deleted. Generate any additional mint wallets`,
+      `you want; they derive from the restored phrase.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: afterSetupMenu() }
+  );
 }
 
 async function cmdSetupRetry(ctx: Context): Promise<void> {
@@ -2221,7 +2381,7 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
       keyboard: mintMenu(),
     },
     wallets: {
-      text: `<b>Wallets</b>\n\n<i>Generating more costs nothing — they come from the same seed phrase you already wrote down.</i>`,
+      text: `<b>Wallets</b>\n\n<i>Generate from your main seed, or securely import an existing seed/private key. Imported wallets start manual-only.</i>`,
       keyboard: walletsMenu(),
     },
     autofire: {
@@ -2240,7 +2400,8 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
         `<b>Copy-mint</b>\n\n` +
         (session.copyEnabled
           ? `<b>ON</b> — signals from ${watched} target(s) will spend without confirmation, bounded by caps.`
-          : `<b>OFF</b> — signals are reported but nothing fires.`),
+          : `<b>OFF</b> — signals are reported but nothing fires.`) +
+        `\n\n<i>Each target can copy free mints, paid mints, or both.</i>`,
       keyboard: copyMenu(session.copyEnabled),
     },
   };
@@ -2336,7 +2497,11 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
     case "drain":
       return runWithArgs(ctx, ["all"], cmdDrain);
     case "watch":
-      return runWithArgs(ctx, [flow.contract!, flow.tier ?? "low"], cmdWatch);
+      return runWithArgs(
+        ctx,
+        [flow.contract!, flow.tier ?? "low", flow.mintMode ?? "both"],
+        cmdWatch
+      );
     case "destination":
       return;
   }
@@ -2361,6 +2526,8 @@ async function onCallback(ctx: Context): Promise<void> {
         return cmdSetupExplain(ctx);
       case "warn":
         return cmdSetupWarn(ctx);
+      case "restore":
+        return beginSeedRestore(ctx);
       case "create":
         return cmdSetupCreate(ctx);
       case "burn":
@@ -2368,6 +2535,7 @@ async function onCallback(ctx: Context): Promise<void> {
       case "retry":
         return cmdSetupRetry(ctx);
       case "cancel":
+        clearFlow(chatId);
         return showSetup(ctx);
     }
     return;
@@ -2379,6 +2547,7 @@ async function onCallback(ctx: Context): Promise<void> {
     const [action, ...values] = rest;
     switch (action) {
       case "menu":
+        clearFlow(chatId);
         return showUserSettings(ctx);
       case "destination":
         return beginDestinationChange(ctx);
@@ -2417,6 +2586,14 @@ async function onCallback(ctx: Context): Promise<void> {
     case "g":
       return runWithArgs(ctx, [payload], cmdGenerate);
 
+    case "im": {
+      const [kind, count] = rest;
+      if (kind === "menu") return showWalletImport(ctx);
+      if (kind === "key") return beginWalletSecretImport(ctx, "key");
+      if (kind === "seed") return beginWalletSecretImport(ctx, "seed", Number(count) || 1);
+      return;
+    }
+
     case "c":
       return runWithArgs(ctx, [payload], cmdCopy);
 
@@ -2435,6 +2612,17 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "uw":
       return runWithArgs(ctx, [payload], cmdUnwatch);
+
+    case "tf": {
+      const [modeValue, address] = rest;
+      const mode = targets.parseMintMode(modeValue);
+      const target = targets.setMintMode(address, mode);
+      await ctx.reply(
+        `<b>Copy filter updated</b>\n\n<code>${esc(short(target.address))}</code> → <b>${mode === "both" ? "free + paid" : `${mode} only`}</b>`,
+        { parse_mode: "HTML", reply_markup: targetsKeyboard(targets.list()) }
+      );
+      return;
+    }
 
     case "i": {
       const kind = payload as Flow["kind"];
@@ -2497,6 +2685,20 @@ async function onCallback(ctx: Context): Promise<void> {
       const flow = getFlow(chatId);
       if (!flow) return;
       flow.tier = payload;
+      if (flow.kind === "watch") {
+        await ctx.reply(
+          `<b>Watch filter</b>\n\nWhich mints from this target should be copied?`,
+          { parse_mode: "HTML", reply_markup: mintModeKeyboard() }
+        );
+        return;
+      }
+      return executeFlow(ctx, flow, false);
+    }
+
+    case "pm": {
+      const flow = getFlow(chatId);
+      if (!flow || flow.kind !== "watch") return;
+      flow.mintMode = targets.parseMintMode(payload);
       return executeFlow(ctx, flow, false);
     }
 
@@ -2524,6 +2726,12 @@ async function onText(ctx: Context): Promise<void> {
 
   const flow = getFlow(chatId);
   if (!flow) return;
+
+  if (flow.step === "secret") {
+    if (flow.kind === "restore") return restoreSeed(ctx, text);
+    if (flow.kind === "importWallet") return importWalletSecret(ctx, flow, text);
+    return;
+  }
 
   if (flow.kind === "destination" && flow.step === "address") {
     if (!isAddress(text)) {
@@ -2611,7 +2819,12 @@ async function main(): Promise<void> {
     if (callback.startsWith("s:") || callback.startsWith("cfg:")) return next();
     if ((ctx.message?.text ?? "").startsWith("/settings")) return next();
     const chatId = ctx.chat?.id;
-    if (chatId !== undefined && getFlow(chatId)?.kind === "destination") return next();
+    if (
+      chatId !== undefined &&
+      ["destination", "restore"].includes(getFlow(chatId)?.kind ?? "")
+    ) {
+      return next();
+    }
     // Only a callback update has a query to answer — asking otherwise throws
     // synchronously and would swallow the setup screen.
     if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => undefined);
@@ -2628,6 +2841,7 @@ async function main(): Promise<void> {
   bot.command("help", (ctx) => ctx.reply(HELP, { parse_mode: "HTML" }));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));
+  bot.command("import", (ctx) => showWalletImport(ctx).catch((e) => fail(ctx, e)));
   bot.command("generate", (ctx) => cmdGenerate(ctx).catch((e) => fail(ctx, e)));
   bot.command("autofire", (ctx) => cmdAutoFire(ctx).catch((e) => fail(ctx, e)));
   bot.command("tag", (ctx) => cmdTag(ctx, false).catch((e) => fail(ctx, e)));

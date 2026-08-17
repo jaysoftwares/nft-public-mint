@@ -180,6 +180,28 @@ export interface ImportResult {
 }
 
 /**
+ * Turn the first accounts from another BIP-39 phrase into import entries.
+ * The phrase itself is never persisted; only the selected private keys are
+ * merged into imported.enc by UnlockedStore.importKeys().
+ */
+export function importEntriesFromMnemonic(phrase: string, count: number): ImportEntry[] {
+  if (!Number.isInteger(count) || count < 1 || count > 100) {
+    throw new WalletStoreError("Import count must be between 1 and 100 accounts.");
+  }
+  const normalised = phrase.trim().replace(/\s+/g, " ");
+  if (!Mnemonic.isValidMnemonic(normalised)) {
+    throw new WalletStoreError(
+      "That is not a valid BIP-39 mnemonic — check the word count and spelling."
+    );
+  }
+  const account = HDNodeWallet.fromPhrase(normalised, undefined, ACCOUNT_PATH);
+  return Array.from({ length: count }, (_, index) => ({
+    privateKey: account.deriveChild(index).privateKey,
+    label: `seed import ${index}`,
+  }));
+}
+
+/**
  * An unlocked store. Holds live signers in memory for the process lifetime;
  * nothing here is written back except metadata and the imported key file.
  */
@@ -309,27 +331,34 @@ export class UnlockedStore {
   importKeys(entries: ImportEntry[]): ImportResult {
     const added: string[] = [];
     const duplicates: string[] = [];
-    const existing = new Set(this.imported.map((e) => e.wallet.address));
-
-    for (const entry of entries) {
+    // Include derived addresses too. Importing the same signer under two ids
+    // would let two commands race the same nonce and corrupt both operations.
+    const existing = new Set(this.all().map((wallet) => wallet.address));
+    // Validate the complete submission before mutating memory or disk.
+    const validated = entries.map((entry) => {
       const key = entry.privateKey.trim();
-      let wallet: Wallet;
       try {
-        wallet = new Wallet(key.startsWith("0x") ? key : `0x${key}`);
+        return {
+          wallet: new Wallet(key.startsWith("0x") ? key : `0x${key}`),
+          label: entry.label,
+        };
       } catch {
         throw new WalletStoreError(
-          `One of the keys is not a valid private key (${key.slice(0, 6)}…). Nothing was imported.`
+          "That is not a valid private key. Nothing was imported."
         );
       }
+    });
+
+    for (const { wallet, label } of validated) {
       if (existing.has(wallet.address)) {
         duplicates.push(wallet.address);
         continue;
       }
       existing.add(wallet.address);
-      this.imported.push({ wallet, label: entry.label });
+      this.imported.push({ wallet, label });
       this.meta.imported.push({
         address: wallet.address,
-        label: entry.label,
+        label,
         autoFire: false,
         tags: [],
       });

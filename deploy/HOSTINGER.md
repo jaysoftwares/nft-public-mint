@@ -149,6 +149,11 @@ the message deletes itself after ten minutes.
 That user's bot session then comes up fully — no service restart needed — and
 offers **➕ Generate 500 wallets**. Other users' sessions keep running.
 
+Users can also choose **Restore existing seed** during setup. After setup,
+**Wallets → Import wallet** accepts a private key or selected accounts from
+another BIP-39 seed phrase. Imported wallets start manual-only. When adding a
+copy target, the bot also asks whether to copy free mints, paid mints, or both.
+
 > **The phrase goes through Telegram.** Cloud chats are not end-to-end
 > encrypted, so it passes through Telegram's servers on the way to whoever is
 > reading. Deleting the message is cleanup, not a guarantee about what was
@@ -182,7 +187,7 @@ measured from your desk.
 set -a; . /etc/copymint/env; set +a
 cd /opt/copymint
 
-node dist/tools/verify.js                    # 150 offline checks
+node dist/tools/verify.js                    # 165 offline checks
 node dist/tools/shakedown.js --chain base    # live, read-only
 ```
 

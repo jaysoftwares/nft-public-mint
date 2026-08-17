@@ -12,6 +12,7 @@
 import { rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer } from "node:http";
 
 const SCRATCH = join(tmpdir(), `copymint-verify-${process.pid}-${Date.now()}`);
 process.env.COPYMINT_HOME = SCRATCH;
@@ -19,7 +20,13 @@ process.env.COPYMINT_HOME = SCRATCH;
 /* eslint-disable import/first */
 import { Wallet, parseEther, Transaction } from "ethers";
 import { sealJson, unsealJson, DecryptError } from "../core/crypto";
-import { initFromMnemonic, unlock, readImportBlob, storeExists } from "../core/wallet-store";
+import {
+  initFromMnemonic,
+  unlock,
+  readImportBlob,
+  storeExists,
+  importEntriesFromMnemonic,
+} from "../core/wallet-store";
 import {
   resolve as resolveWallets,
   resolveForAutoFire,
@@ -47,6 +54,8 @@ import { writeDefaultConfig, updateUserSettings, ConfigError } from "../core/con
 import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
 import { ensureUserFundingWallet } from "../bot/user-wallet";
+import * as watchTargets from "../core/targets";
+import { rpcBatchChunked } from "../core/rpc";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 import {
   deriveDigest,
@@ -115,6 +124,45 @@ async function main(): Promise<void> {
   );
 
   // ── owner settings ────────────────────────────────────────────────────
+  section("RPC batch fallback");
+  let rejectedBatches = 0;
+  let singleCalls = 0;
+  const noBatchServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      response.setHeader("content-type", "application/json");
+      if (Array.isArray(body)) {
+        rejectedBatches++;
+        // Reproduce the live provider response: one object with no useful
+        // error text instead of the required array of batch responses.
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: null }));
+        return;
+      }
+      singleCalls++;
+      response.end(
+        JSON.stringify({ jsonrpc: "2.0", id: body.id, result: body.params[0] })
+      );
+    });
+  });
+  await new Promise<void>((resolve) => noBatchServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const serverAddress = noBatchServer.address() as { port: number };
+    const fallback = await rpcBatchChunked<string>(
+      `http://127.0.0.1:${serverAddress.port}`,
+      ["0x1", "0x2", "0x3"].map((value) => ({ method: "test_echo", params: [value] }))
+    );
+    check("unsupported batch is detected", rejectedBatches === 1);
+    check("batch falls back to ordinary calls", singleCalls === 3);
+    check(
+      "fallback preserves ordered results",
+      fallback.map((entry) => entry.result).join(",") === "0x1,0x2,0x3"
+    );
+  } finally {
+    await new Promise<void>((resolve) => noBatchServer.close(() => resolve()));
+  }
+
   section("user settings");
   const configPath = writeDefaultConfig();
   const savedSettings = updateUserSettings({
@@ -206,6 +254,52 @@ async function main(): Promise<void> {
   check("state context returns to root", stateDir() === SCRATCH);
 
   // ── wallet store ──────────────────────────────────────────────────────
+  section("Telegram wallet imports");
+  withStateDir(userStateDir(33333), () => {
+    initFromMnemonic(TEST_MNEMONIC, "import-test-passphrase");
+    const importStore = unlock("import-test-passphrase");
+    importStore.generate(1);
+    const seedEntries = importEntriesFromMnemonic(
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+      2
+    );
+    const seedImport = importStore.importKeys(seedEntries);
+    check("seed phrase derives requested import count", seedEntries.length === 2);
+    check("seed-derived private keys import", seedImport.added.length === 2);
+    check(
+      "seed-imported wallets default to manual-only",
+      importStore.all().filter((wallet) => wallet.kind === "imported").every((wallet) => !wallet.autoFire)
+    );
+    const derivedDuplicate = importStore.importKeys([
+      { privateKey: importStore.signer("d:0").privateKey },
+    ]);
+    check(
+      "a derived signer cannot be imported twice under another id",
+      derivedDuplicate.added.length === 0 && derivedDuplicate.duplicates.length === 1
+    );
+    check(
+      "invalid seed phrase is rejected",
+      throws(() => importEntriesFromMnemonic("not a seed phrase", 1))
+    );
+  });
+
+  section("per-target mint filters");
+  withStateDir(userStateDir(44444), () => {
+    const freeTarget = watchTargets.add(VECTORS[0], "high", "free", "free-alpha");
+    check("new target persists free-only filter", freeTarget.mintMode === "free");
+    check("free-only target accepts zero-value mint", watchTargets.allowsMint(freeTarget, 0n));
+    check("free-only target rejects paid mint", !watchTargets.allowsMint(freeTarget, 1n));
+    const paidTarget = watchTargets.setMintMode(VECTORS[0], "paid");
+    check("target filter can change to paid", paidTarget.mintMode === "paid");
+    check("paid-only target rejects free mint", !watchTargets.allowsMint(paidTarget, 0n));
+    check("paid-only target accepts paid mint", watchTargets.allowsMint(paidTarget, 1n));
+    const bothTarget = watchTargets.setMintMode(VECTORS[0], "both");
+    check(
+      "both filter accepts free and paid",
+      watchTargets.allowsMint(bothTarget, 0n) && watchTargets.allowsMint(bothTarget, 1n)
+    );
+  });
+
   section("wallet store");
   check("starts empty", !storeExists());
 

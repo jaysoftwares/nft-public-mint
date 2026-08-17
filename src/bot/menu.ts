@@ -23,17 +23,21 @@ export type FlowKind =
   | "sweep"
   | "check"
   | "drain"
-  | "destination";
+  | "destination"
+  | "importWallet"
+  | "restore";
 
 export interface Flow {
   kind: FlowKind;
   /** What the flow is currently waiting for. */
-  step: "contract" | "amount" | "address" | "ready";
+  step: "contract" | "amount" | "address" | "secret" | "ready";
   contract?: string;
   quantity?: number;
   selector?: string;
   amount?: string;
   tier?: string;
+  mintMode?: string;
+  importCount?: number;
   address?: string;
   waitForOpen?: boolean;
   startedAt: number;
@@ -118,9 +122,22 @@ export function walletsMenu(): InlineKeyboard {
     .row()
     .text("➕ Generate 500", "g:500")
     .row()
+    .text("🔑 Import wallet", "im:menu")
+    .row()
     .text("⚡ Auto-fire", "m:autofire")
     .row()
     .text("‹ Back", "m:main");
+}
+
+export function walletImportMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🔑 Private key", "im:key")
+    .row()
+    .text("🌱 Seed phrase · first account", "im:seed:1")
+    .row()
+    .text("🌱 Seed phrase · first 10", "im:seed:10")
+    .row()
+    .text("‹ Back", "m:wallets");
 }
 
 /**
@@ -169,11 +186,18 @@ export function walletsPager(offset: number, shown: number, total: number, selec
   return keyboard.row().text("📄 Export all as CSV", "a:csv").row().text("‹ Back", "m:wallets");
 }
 
-/** One unwatch button per target, so removing one never needs its address typed. */
-export function targetsKeyboard(entries: { address: string; label?: string }[]): InlineKeyboard {
+/** Per-target price filters plus removal, without asking users to retype addresses. */
+export function targetsKeyboard(
+  entries: { address: string; label?: string; mintMode: string }[]
+): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   for (const entry of entries.slice(0, 10)) {
     const name = entry.label || `${entry.address.slice(0, 6)}…${entry.address.slice(-4)}`;
+    keyboard
+      .text(entry.mintMode === "free" ? "✅ Free" : "Free", `tf:free:${entry.address}`)
+      .text(entry.mintMode === "paid" ? "✅ Paid" : "Paid", `tf:paid:${entry.address}`)
+      .text(entry.mintMode === "both" ? "✅ Both" : "Both", `tf:both:${entry.address}`)
+      .row();
     keyboard.text(`✕ ${name}`, `uw:${entry.address}`).row();
   }
   return keyboard.text("➕ Watch a wallet", "i:watch").row().text("‹ Back", "m:copy");
@@ -237,6 +261,17 @@ export function tierKeyboard(): InlineKeyboard {
     .text("✕ Cancel", "x");
 }
 
+export function mintModeKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🆓 Free only", "pm:free")
+    .row()
+    .text("💳 Paid only", "pm:paid")
+    .row()
+    .text("🔀 Free + paid", "pm:both")
+    .row()
+    .text("✕ Cancel", "x");
+}
+
 export function amountKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
     .text("0.001", "v:0.001")
@@ -281,6 +316,8 @@ export function backTo(target: string, label = "‹ Back"): InlineKeyboard {
 export function setupMenu(): InlineKeyboard {
   return new InlineKeyboard()
     .text("🔐 Create wallet store", "s:warn")
+    .row()
+    .text("♻️ Restore existing seed", "s:restore")
     .row()
     .text("⚙️ Your settings", "cfg:menu")
     .row()

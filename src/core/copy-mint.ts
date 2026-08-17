@@ -142,6 +142,15 @@ export class CopyEngine {
         skip("Target no longer watched");
         return;
       }
+      const value = BigInt(tx.value);
+      if (!targets.allowsMint(watch, value)) {
+        const kind = value === 0n ? "free" : "paid";
+        skip(
+          `${kind === "free" ? "Free" : "Paid"} mint filtered`,
+          `This target is set to copy ${watch.mintMode} mints only.`
+        );
+        return;
+      }
       const firesInWindow = targets.firesInWindow(target, 3_600_000);
 
       // ── Which wallets are allowed to act ──
@@ -159,7 +168,6 @@ export class CopyEngine {
       }
 
       // ── Rewrite and simulate ──
-      const value = BigInt(tx.value);
       let replay;
       try {
         replay = await buildReplay({
