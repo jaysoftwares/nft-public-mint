@@ -274,10 +274,12 @@ export function mintModeKeyboard(): InlineKeyboard {
 
 export function amountKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
+    .text("0.0005", "v:0.0005")
     .text("0.001", "v:0.001")
-    .text("0.002", "v:0.002")
     .row()
+    .text("0.002", "v:0.002")
     .text("0.005", "v:0.005")
+    .row()
     .text("0.01", "v:0.01")
     .row()
     .text("✕ Cancel", "x");
