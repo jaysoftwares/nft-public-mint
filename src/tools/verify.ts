@@ -602,9 +602,17 @@ async function main(): Promise<void> {
     openSignal("minted_out", false) === "wait"
   );
 
-  // A rejected key is the one refusal that waiting cannot repair.
+  // Refusals that waiting cannot repair, whenever they arrive.
   check("a bad API key aborts rather than spinning", openSignal("auth", true) === "abort");
   check("…even before the open", openSignal("auth", false) === "abort");
+  // Seen live: an exchange hot wallet gets HTTP 400 "Account can not perform
+  // trading operations". Treating that as retryable spun the hold for its full
+  // grace period against an address OpenSea was never going to serve.
+  check(
+    "a barred account aborts rather than spinning",
+    openSignal("account_restricted", true) === "abort"
+  );
+  check("…even before the open", openSignal("account_restricted", false) === "abort");
 
   // Pacing has to stay inside the rate limit it exists to protect.
   check("probes never come closer than the floor", OPEN_POLL.tightMs >= OPEN_POLL.floorMs);

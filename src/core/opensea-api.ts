@@ -61,6 +61,11 @@ export type OpenSeaFailure =
   | "not_eligible"
   /** OpenSea checks the minter's balance before issuing calldata. */
   | "insufficient_balance"
+  /**
+   * The account itself is barred from trading — flagged, restricted or
+   * sanctioned. Permanent for that address, and nothing to do with the stage.
+   */
+  | "account_restricted"
   | "rate_limited"
   | "server"
   | "unknown";
@@ -158,6 +163,19 @@ function classify(status: number, body: string): OpenSeaApiError {
   }
   if (status === 404) {
     return new OpenSeaApiError("not_live", "OpenSea has no live mint for that drop.", status, body);
+  }
+  // A barred account is permanent and address-specific. Observed live as
+  // HTTP 400 "Account can not perform trading operations" on an exchange hot
+  // wallet. It must be distinguished from a closed stage: retrying cannot fix
+  // it, so a pre-open hold would otherwise spin out its whole grace period
+  // against a wallet that was never going to be served.
+  if (/can\s*not\s+perform\s+trading|cannot\s+perform\s+trading|account\s+(is\s+)?(restricted|blocked|suspended|disabled)|sanction/i.test(body)) {
+    return new OpenSeaApiError(
+      "account_restricted",
+      `OpenSea will not serve this address: ${summarise(body)}`,
+      status,
+      body
+    );
   }
   // Checked before the supply test: "insufficient balance" is about the wallet,
   // not the drop, and confusing the two would abort a whole run over one

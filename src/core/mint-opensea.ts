@@ -231,8 +231,10 @@ export function openSignal(
   kind: OpenSeaFailure | undefined,
   reachedOpenTime: boolean
 ): "open" | "wait" | "abort" {
-  // A rejected key is the one thing no amount of waiting repairs.
-  if (kind === "auth") return "abort";
+  // Neither a rejected key nor a barred account is repaired by waiting, and
+  // both are visible before the open — so they abort regardless of timing.
+  // A restricted prober would otherwise spin out the whole grace period.
+  if (kind === "auth" || kind === "account_restricted") return "abort";
 
   if (!reachedOpenTime) return "wait";
 
@@ -304,7 +306,7 @@ const sleep = (ms: number): Promise<void> =>
  * or unable to pay). That is still a green light: the burst goes ahead and each
  * wallet gets its own answer.
  */
-async function holdUntilOpen(
+export async function holdUntilOpen(
   req: OpenSeaMintRequest,
   deps: OpenSeaMintDeps,
   prober: { id: string; address: string },
