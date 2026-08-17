@@ -210,11 +210,17 @@ arriving, and a reconcile slice comfortably inside 30 seconds.
 
 **Updating**
 
+Run this from the clone you made in step 4, not from `/opt/copymint` — that
+directory is rsynced into by `setup.sh` and has no `.git` of its own.
+
 ```bash
-cd /opt/copymint && git pull
-npm install --omit=dev && npx tsc
+cd /tmp/copymint && git pull
+bash deploy/setup.sh
 systemctl restart copymint
 ```
+
+The restart is not optional: `setup.sh` rebuilds `dist/`, but the running
+process keeps the old code until it is replaced.
 
 User stores live in `/var/lib/copymint/users/<chatId>`; none of that touches them.
 

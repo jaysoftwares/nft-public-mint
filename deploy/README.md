@@ -97,10 +97,23 @@ restart.** Autonomous spending resumes after a reboot only because
 
 ## Updating
 
+`/opt/copymint` is **not** a git checkout — `setup.sh` rsyncs into it from
+wherever you cloned. So the update runs from the clone, not from the install:
+
 ```bash
-cd /opt/copymint && git pull
-npm install --omit=dev && npx tsc
+cd /tmp/copymint && git pull    # wherever you cloned it
+bash deploy/setup.sh
 systemctl restart copymint
+```
+
+`setup.sh` is idempotent: it re-syncs, reinstalls dependencies, rebuilds, and
+reinstalls the unit. It does **not** start the service, and a rebuild alone
+changes nothing until the process restarts — Node has the old code in memory.
+Confirm the restart actually took:
+
+```bash
+systemctl show copymint -p ActiveEnterTimestamp --value   # must be AFTER
+stat -c %y /opt/copymint/dist/bot/index.js                # this
 ```
 
 User stores live under `/var/lib/copymint/users/` and are untouched by any of that.
