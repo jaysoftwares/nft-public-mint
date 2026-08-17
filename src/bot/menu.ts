@@ -272,6 +272,14 @@ export function mintModeKeyboard(): InlineKeyboard {
     .text("✕ Cancel", "x");
 }
 
+/**
+ * Common top-up targets, plus a way to say something else.
+ *
+ * The presets cover the amounts a disposable minting wallet actually needs, but
+ * they are a shortcut, not the whole range — a drop priced outside them left no
+ * way through the buttons at all. Typing an amount always worked; nothing
+ * advertised it, which made it the same as not existing.
+ */
 export function amountKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
     .text("0.0005", "v:0.0005")
@@ -281,6 +289,8 @@ export function amountKeyboard(): InlineKeyboard {
     .text("0.005", "v:0.005")
     .row()
     .text("0.01", "v:0.01")
+    .row()
+    .text("✏️ Custom amount", "v:custom")
     .row()
     .text("✕ Cancel", "x");
 }

@@ -11,13 +11,55 @@
 // but the same sharded dispatcher is used so no provider gets a 500-request
 // burst.
 
-import { Wallet, HDNodeWallet, formatEther } from "ethers";
+import { Wallet, HDNodeWallet, formatEther, parseEther } from "ethers";
 import { Endpoint, dispatchAll, prepareTx, DispatchOutcome } from "./dispatcher";
 import { BalanceQuery, Shortfall } from "./balances";
 import { rpcCall } from "./rpc";
 
 /** A plain ETH transfer costs exactly this much gas — never more. */
 export const TRANSFER_GAS = 21_000;
+
+export type FundAmount =
+  | { ok: true; wei: bigint; text: string }
+  | { ok: false; reason: "empty" | "malformed" | "zero" | "too_large" };
+
+/**
+ * Read a hand-typed funding target.
+ *
+ * Separate from the buttons because a typed amount is the one that can be
+ * wrong. Funding tops every selected wallet *up to* this balance, so the figure
+ * is multiplied by the size of the set — across 500 wallets a misplaced decimal
+ * is a three-order-of-magnitude mistake, and no later screen states the total
+ * in a way that would catch it.
+ *
+ * Deliberately tolerant of how people write amounts and strict about what the
+ * number means: a stray "ETH", a leading Ξ or surrounding spaces are stripped,
+ * while zero and anything above `maxWei` are refused outright rather than
+ * carried forward to be confirmed.
+ */
+export function parseFundAmount(raw: string, maxWei: bigint): FundAmount {
+  const cleaned = raw
+    .trim()
+    .replace(/^Ξ/, "")
+    .replace(/\s*(eth|ether)$/i, "")
+    .replace(/\s+/g, "");
+
+  if (cleaned.length === 0) return { ok: false, reason: "empty" };
+  if (!/^\d*\.?\d+$/.test(cleaned)) return { ok: false, reason: "malformed" };
+
+  let wei: bigint;
+  try {
+    wei = parseEther(cleaned);
+  } catch {
+    // More decimal places than wei can represent.
+    return { ok: false, reason: "malformed" };
+  }
+
+  if (wei === 0n) return { ok: false, reason: "zero" };
+  if (wei > maxWei) return { ok: false, reason: "too_large" };
+
+  return { ok: true, wei, text: cleaned };
+}
 
 export interface FundingPlan {
   transfers: { id: string; address: string; amount: bigint }[];

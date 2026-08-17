@@ -38,6 +38,7 @@ import {
   executeFunding,
   planEthSweep,
   executeEthSweep,
+  parseFundAmount,
   TRANSFER_GAS,
 } from "../core/funding";
 import { discoverHoldings, sweepNfts, latestBlock } from "../core/holdings";
@@ -119,6 +120,18 @@ interface UserRuntime {
   passphrase: string;
   session?: Session;
 }
+
+/**
+ * Ceiling on a hand-typed funding target, per wallet.
+ *
+ * Funding tops every selected wallet *up to* this balance, so the figure is
+ * multiplied by the size of the set — 500 wallets makes a misplaced decimal a
+ * three-order-of-magnitude mistake. The preset buttons top out at 0.01, so this
+ * leaves ample room for a genuinely expensive drop while still catching the
+ * fat-finger. Typed commands are unaffected; this guards the button flow, where
+ * there is no argument to re-read before it runs.
+ */
+const MAX_FUND_PER_WALLET_WEI = parseEther("0.5");
 
 const runtimeContext = new AsyncLocalStorage<UserRuntime>();
 const runtimePromises = new Map<number, Promise<UserRuntime>>();
@@ -2529,10 +2542,16 @@ async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
 
   if (flow.kind === "fund") {
     if (!flow.amount) {
-      await ctx.reply(`<b>Fund</b>\n\nTop each wallet up to what balance?`, {
-        parse_mode: "HTML",
-        reply_markup: amountKeyboard(),
-      });
+      await ctx.reply(
+        [
+          `<b>Fund</b>`,
+          ``,
+          `Top each wallet up to what balance?`,
+          ``,
+          `<i>Pick one, tap ✏️ for a custom amount, or just type one.</i>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: amountKeyboard() }
+      );
       return;
     }
     if (!flow.selector) {
@@ -2787,6 +2806,26 @@ async function onCallback(ctx: Context): Promise<void> {
     case "v": {
       const flow = getFlow(chatId);
       if (!flow) return;
+
+      if (payload === "custom") {
+        // Hand the flow back to onText, which already knows how to read an
+        // amount — this only makes that path visible.
+        flow.step = "amount";
+        flow.amount = undefined;
+        await ctx.reply(
+          [
+            `<b>Custom amount</b>`,
+            ``,
+            `Send the ETH balance to top each wallet up to.`,
+            ``,
+            `<i>A plain number, like</i> <code>0.0035</code><i>. Wallets already at or`,
+            `above it are skipped, so only the shortfall is ever sent.</i>`,
+          ].join("\n"),
+          { parse_mode: "HTML", reply_markup: backTo("x", "✕ Cancel") }
+        );
+        return;
+      }
+
       flow.amount = payload;
       return advanceFlow(ctx, flow);
     }
@@ -2920,11 +2959,35 @@ async function onText(ctx: Context): Promise<void> {
   }
 
   if (flow.step === "amount") {
-    if (!/^\d*\.?\d+$/.test(text)) {
-      await ctx.reply("Send a plain ETH amount, like 0.002.");
-      return;
+    const parsed = parseFundAmount(text, MAX_FUND_PER_WALLET_WEI);
+
+    if (!parsed.ok) {
+      switch (parsed.reason) {
+        case "zero":
+          await ctx.reply("Zero would fund nothing. Send an amount above 0, or tap Cancel.");
+          return;
+        case "too_large":
+          await ctx.reply(
+            [
+              `⚠️ That is above the ${eth(MAX_FUND_PER_WALLET_WEI)} ETH per-wallet ceiling.`,
+              ``,
+              `<i>Funding tops up every selected wallet to that balance, so the amount`,
+              `is multiplied by the size of the set. If you meant it, use</i>`,
+              `<code>/fund &lt;selector&gt; &lt;eth&gt;</code><i> on a smaller selection.</i>`,
+            ].join("\n"),
+            { parse_mode: "HTML" }
+          );
+          return;
+        default:
+          await ctx.reply(
+            "Send a plain ETH amount, like <code>0.002</code> — digits and one decimal point.",
+            { parse_mode: "HTML" }
+          );
+          return;
+      }
     }
-    flow.amount = text;
+
+    flow.amount = parsed.text;
     return advanceFlow(ctx, flow);
   }
 }

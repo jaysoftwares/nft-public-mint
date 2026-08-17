@@ -33,7 +33,13 @@ import {
   emptyContext,
   SelectorError,
 } from "../core/tags";
-import { planFunding, planEthSweep, signEthSweep, TRANSFER_GAS } from "../core/funding";
+import {
+  planFunding,
+  planEthSweep,
+  signEthSweep,
+  parseFundAmount,
+  TRANSFER_GAS,
+} from "../core/funding";
 import { requiredPerWallet, shortfalls } from "../core/balances";
 import { substituteAddress, contains, selectorOf } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
@@ -499,6 +505,66 @@ async function main(): Promise<void> {
     );
   }
   check("Robinhood maps to the slug OpenSea answers on", openSeaChainSlug(4663) === "robinhood");
+
+  // ── a hand-typed funding amount ───────────────────────────────────────
+  //
+  // The buttons cannot be fat-fingered; a typed amount can, and it is
+  // multiplied by the size of the wallet set.
+  section("custom funding amount");
+
+  const CAP = parseEther("0.5");
+  const accepts: [string, string][] = [
+    ["0.0035", "0.0035"],
+    ["0.5", "0.5"],
+    ["  0.002  ", "0.002"],
+    ["0.002 ETH", "0.002"],
+    ["0.002eth", "0.002"],
+    ["Ξ0.002", "0.002"],
+    [".5", ".5"],
+    ["1", "1"],
+  ];
+  for (const [input, expectText] of accepts) {
+    const got = parseFundAmount(input, input === "1" ? parseEther("1") : CAP);
+    check(
+      `accepts ${JSON.stringify(input)}`,
+      got.ok && got.text === expectText,
+      got.ok ? got.text : got.reason
+    );
+  }
+
+  check("0.002 parses to the right wei", (() => {
+    const r = parseFundAmount("0.002", CAP);
+    return r.ok && r.wei === parseEther("0.002");
+  })());
+
+  const rejects: [string, string][] = [
+    ["0", "zero"],
+    ["0.0", "zero"],
+    ["", "empty"],
+    ["   ", "empty"],
+    ["abc", "malformed"],
+    ["0.002.3", "malformed"],
+    ["-0.002", "malformed"],
+    ["1e-3", "malformed"],
+    ["0,002", "malformed"],
+    ["0.0000000000000000001", "malformed"],
+    ["1", "too_large"],
+    ["100", "too_large"],
+  ];
+  for (const [input, reason] of rejects) {
+    const got = parseFundAmount(input, CAP);
+    check(
+      `rejects ${JSON.stringify(input)} as ${reason}`,
+      !got.ok && got.reason === reason,
+      got.ok ? `accepted ${got.text}` : got.reason
+    );
+  }
+
+  // The mistake this guard exists for: a decimal slipped one place.
+  check(
+    "a misplaced decimal is refused, not confirmed",
+    !parseFundAmount("2", CAP).ok && parseFundAmount("0.2", CAP).ok
+  );
 
   // ── holding for a stage that has not opened ───────────────────────────
   //
