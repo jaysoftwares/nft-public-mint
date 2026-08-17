@@ -140,7 +140,7 @@ async function main(): Promise<void> {
 
   // ── 3. Batching ─────────────────────────────────────────────────────
   section("3. JSON-RPC batching");
-  note("Nonce reconcile checks 500 wallets in one request. Without batching that becomes 500.");
+  note("Nonce reconciliation stays on JSON-RPC batches capped below the endpoint RPS limit.");
   try {
     const results = await rpcBatch<string>(readUrl, [
       { method: "eth_chainId", params: [] },

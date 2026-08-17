@@ -124,20 +124,26 @@ async function main(): Promise<void> {
   );
 
   // ── owner settings ────────────────────────────────────────────────────
-  section("RPC batch fallback");
-  let rejectedBatches = 0;
+  section("RPC batch sizing");
+  const observedBatchSizes: number[] = [];
   let singleCalls = 0;
-  const noBatchServer = createServer((request, response) => {
+  const batchServer = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
     request.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       response.setHeader("content-type", "application/json");
       if (Array.isArray(body)) {
-        rejectedBatches++;
-        // Reproduce the live provider response: one object with no useful
-        // error text instead of the required array of batch responses.
-        response.end(JSON.stringify({ jsonrpc: "2.0", id: null }));
+        observedBatchSizes.push(body.length);
+        response.end(
+          JSON.stringify(
+            body.map((entry) => ({
+              jsonrpc: "2.0",
+              id: entry.id,
+              result: entry.params[0],
+            }))
+          )
+        );
         return;
       }
       singleCalls++;
@@ -146,21 +152,22 @@ async function main(): Promise<void> {
       );
     });
   });
-  await new Promise<void>((resolve) => noBatchServer.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => batchServer.listen(0, "127.0.0.1", resolve));
   try {
-    const serverAddress = noBatchServer.address() as { port: number };
-    const fallback = await rpcBatchChunked<string>(
+    const serverAddress = batchServer.address() as { port: number };
+    const values = Array.from({ length: 46 }, (_, index) => `0x${index.toString(16)}`);
+    const batched = await rpcBatchChunked<string>(
       `http://127.0.0.1:${serverAddress.port}`,
-      ["0x1", "0x2", "0x3"].map((value) => ({ method: "test_echo", params: [value] }))
+      values.map((value) => ({ method: "test_echo", params: [value] }))
     );
-    check("unsupported batch is detected", rejectedBatches === 1);
-    check("batch falls back to ordinary calls", singleCalls === 3);
+    check("batch size is capped below provider RPS", observedBatchSizes.join(",") === "45,1");
+    check("transport stays on JSON-RPC batches", singleCalls === 0);
     check(
-      "fallback preserves ordered results",
-      fallback.map((entry) => entry.result).join(",") === "0x1,0x2,0x3"
+      "chunked batches preserve ordered results",
+      batched.map((entry) => entry.result).join(",") === values.join(",")
     );
   } finally {
-    await new Promise<void>((resolve) => noBatchServer.close(() => resolve()));
+    await new Promise<void>((resolve) => batchServer.close(() => resolve()));
   }
 
   section("user settings");

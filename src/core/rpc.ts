@@ -184,8 +184,6 @@ export async function rpcBatch<T>(
 const DEFAULT_CALLS_PER_SEC = Number(process.env.RPC_MAX_CALLS_PER_SEC ?? 45);
 
 const buckets = new Map<string, { tokens: number; last: number }>();
-/** Providers/plans discovered to reject JSON-RPC array payloads entirely. */
-const unbatchableHosts = new Set<string>();
 
 async function takeTokens(host: string, count: number, perSecond: number): Promise<void> {
   let bucket = buckets.get(host);
@@ -197,13 +195,11 @@ async function takeTokens(host: string, count: number, perSecond: number): Promi
     const now = Date.now();
     bucket.tokens = Math.min(perSecond, bucket.tokens + ((now - bucket.last) / 1000) * perSecond);
     bucket.last = now;
-    // A batch larger than the whole budget can never be fully covered; let it
-    // through once the bucket is full rather than deadlocking.
-    if (bucket.tokens >= Math.min(count, perSecond)) {
+    if (bucket.tokens >= count) {
       bucket.tokens -= count;
       return;
     }
-    const deficit = Math.min(count, perSecond) - bucket.tokens;
+    const deficit = count - bucket.tokens;
     await sleep(Math.max(20, Math.ceil((deficit / perSecond) * 1000)));
   }
 }
@@ -241,8 +237,12 @@ export async function rpcBatchChunked<T>(
   const perSecond = DEFAULT_CALLS_PER_SEC;
   const out: BatchEntry<T>[] = calls.map(() => ({}));
   let pending = calls.map((_, i) => i);
-  let batchSupported = !unbatchableHosts.has(host);
-  let size = batchSupported ? Math.max(1, chunkSize) : 1;
+  // QuickNode counts every entry in a JSON-RPC batch against the endpoint's
+  // RPS limit. Never construct a batch larger than the configured budget: the
+  // live 50-RPS endpoint accepts 50 entries and rate-limits every entry above
+  // that. Keep the configured margin (45 by default) for concurrent hot-path
+  // reads while retaining one real JSON-RPC array per chunk.
+  let size = Math.max(1, Math.min(chunkSize, perSecond));
 
   for (let round = 0; round < MAX_ROUNDS && pending.length > 0; round++) {
     const retry: number[] = [];
@@ -250,25 +250,6 @@ export async function rpcBatchChunked<T>(
     for (let offset = 0; offset < pending.length; ) {
       const indices = pending.slice(offset, offset + size);
       await takeTokens(host, indices.length, perSecond);
-
-      // Some QuickNode plans reject every JSON-RPC array, including an array
-      // containing one call. Once discovered, use ordinary requests for that
-      // host; callers still receive the same ordered BatchEntry[] shape.
-      if (!batchSupported) {
-        const index = indices[0];
-        const call = calls[index];
-        try {
-          out[index] = {
-            result: await rpcCall<T>(url, call.method, call.params, timeoutMs),
-          };
-        } catch (err) {
-          const message = (err as Error).message;
-          if (isRateLimit(message)) retry.push(index);
-          else out[index] = { error: message };
-        }
-        offset += 1;
-        continue;
-      }
 
       try {
         const results = await rpcBatch<T>(
@@ -295,13 +276,14 @@ export async function rpcBatchChunked<T>(
           size = stated;
           continue; // same offset, smaller slice
         }
-        // A non-rate rejection with no stated limit is normally a provider or
-        // account tier that does not support batch payloads at all. Falling
-        // back to single calls is safe for other generic gateway failures too.
-        batchSupported = false;
-        unbatchableHosts.add(host);
-        size = 1;
-        continue;
+        if (size > 1) {
+          size = Math.max(1, Math.floor(size / 2));
+          continue;
+        }
+        // Do not silently replace batching with sequential calls. This bot is
+        // latency-sensitive; an endpoint that rejects even a one-entry array
+        // is a configuration failure that the operator must see and replace.
+        throw err;
       }
     }
 
