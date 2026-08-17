@@ -182,6 +182,12 @@ async function main(): Promise<void> {
   updateUserSettings({ funder: VECTORS[1] });
   const configWithFunder = JSON.parse(readFileSync(configPath, "utf8"));
   check("derived funder is persisted separately", configWithFunder.funder === VECTORS[1]);
+  updateUserSettings({ copyEnabled: true });
+  const configWithCopyEnabled = JSON.parse(readFileSync(configPath, "utf8"));
+  check("Telegram copy ON survives restart", configWithCopyEnabled.copy.enabled === true);
+  updateUserSettings({ copyEnabled: false });
+  const configWithCopyDisabled = JSON.parse(readFileSync(configPath, "utf8"));
+  check("Telegram copy OFF survives restart", configWithCopyDisabled.copy.enabled === false);
   check(
     "invalid destination is rejected",
     throws(() => updateUserSettings({ destination: "not-an-address" }), ConfigError)

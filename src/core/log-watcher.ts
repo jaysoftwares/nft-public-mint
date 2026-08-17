@@ -14,9 +14,10 @@
 //   reconnect the missed range is replayed through eth_getLogs before live
 //   events resume.
 //
-//   A silent socket is indistinguishable from a quiet chain. Blocks arrive every
-//   two seconds, so a stream with nothing on it for a minute is assumed dead and
-//   torn down rather than trusted.
+//   A log subscription is legitimately silent while the watched wallets do
+//   nothing. A lightweight eth_blockNumber request probes that same socket, so
+//   silence is only treated as a disconnect when the provider also ignores the
+//   health checks.
 
 import { rpcCall } from "./rpc";
 
@@ -88,6 +89,8 @@ export class LogWatcher {
   private lastSeenBlock = 0;
   private lastMessageAt = 0;
   private heartbeat?: NodeJS.Timeout;
+  private heartbeatRequestIds = new Set<number>();
+  private reconnectTimer?: NodeJS.Timeout;
   private pollTimer?: NodeJS.Timeout;
   private subscriptionIds = new Set<string>();
   private nextRequestId = 1;
@@ -127,6 +130,7 @@ export class LogWatcher {
   async retarget(targets: string[]): Promise<void> {
     this.opts.targets = targets;
     if (!this.running) return;
+    this.clearReconnect();
     this.teardownSocket();
     this.stopPolling();
     await this.start();
@@ -134,6 +138,7 @@ export class LogWatcher {
 
   stop(): void {
     this.running = false;
+    this.clearReconnect();
     this.teardownSocket();
     this.stopPolling();
     if (this.heartbeat) clearInterval(this.heartbeat);
@@ -144,14 +149,17 @@ export class LogWatcher {
   private connect(): void {
     if (!this.running || !this.opts.wsUrl) return;
 
+    let socket: WebSocket;
     try {
-      this.socket = new WebSocket(this.opts.wsUrl);
+      socket = new WebSocket(this.opts.wsUrl);
+      this.socket = socket;
     } catch (err) {
       this.scheduleReconnect((err as Error).message);
       return;
     }
 
-    this.socket.addEventListener("open", () => {
+    socket.addEventListener("open", () => {
+      if (!this.running || this.socket !== socket) return;
       this.reconnectAttempt = 0;
       this.lastMessageAt = Date.now();
       this.subscribe();
@@ -160,16 +168,22 @@ export class LogWatcher {
       this.startHeartbeat();
     });
 
-    this.socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) return;
       this.lastMessageAt = Date.now();
       this.handleMessage(String(event.data));
     });
 
-    this.socket.addEventListener("close", () => {
-      if (this.running) this.scheduleReconnect("socket closed");
+    socket.addEventListener("close", () => {
+      // Closing a socket intentionally during retarget/heartbeat recovery must
+      // not schedule a second reconnect from its later close event.
+      if (this.running && this.socket === socket) {
+        this.socket = undefined;
+        this.scheduleReconnect("socket closed");
+      }
     });
 
-    this.socket.addEventListener("error", () => {
+    socket.addEventListener("error", () => {
       // 'close' always follows; reconnect is handled there to avoid doubling up.
     });
   }
@@ -212,6 +226,10 @@ export class LogWatcher {
       return;
     }
 
+    if (message.id !== undefined && this.heartbeatRequestIds.delete(message.id)) {
+      return;
+    }
+
     if (typeof message.result === "string" && message.id !== undefined) {
       this.subscriptionIds.add(message.result);
       return;
@@ -226,19 +244,28 @@ export class LogWatcher {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
       if (!this.running) return;
-      // Blocks land every ~2s; a full minute of silence means the stream is dead
-      // even though the socket still reports itself open.
-      if (Date.now() - this.lastMessageAt > 60_000) {
-        this.opts.onStatus("Stream silent for 60s — reconnecting.", "warn");
+      const silentFor = Date.now() - this.lastMessageAt;
+      if (silentFor > 60_000) {
+        this.opts.onStatus("WebSocket health check timed out — reconnecting.", "warn");
         this.teardownSocket();
         this.scheduleReconnect("heartbeat timeout");
+        return;
+      }
+
+      // A watched-address log stream can be quiet for hours. Probe the
+      // connection with ordinary JSON-RPC instead of mistaking quiet activity
+      // for a dead socket. The response updates lastMessageAt in the listener.
+      if (silentFor > 15_000) {
+        const id = this.nextRequestId++;
+        this.heartbeatRequestIds.add(id);
+        this.send({ id, method: "eth_blockNumber", params: [] });
       }
     }, 20_000);
     this.heartbeat.unref?.();
   }
 
   private scheduleReconnect(reason: string): void {
-    if (!this.running) return;
+    if (!this.running || this.reconnectTimer) return;
     this.teardownSocket();
 
     this.reconnectAttempt += 1;
@@ -247,7 +274,16 @@ export class LogWatcher {
       `Watcher disconnected (${reason}) — retry ${this.reconnectAttempt} in ${Math.round(delay / 1000)}s.`,
       "warn"
     );
-    setTimeout(() => this.connect(), delay).unref?.();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect();
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  private clearReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   private teardownSocket(): void {
@@ -263,6 +299,7 @@ export class LogWatcher {
     }
     this.socket = undefined;
     this.subscriptionIds.clear();
+    this.heartbeatRequestIds.clear();
   }
 
   // ── Polling fallback ────────────────────────────────────────────────

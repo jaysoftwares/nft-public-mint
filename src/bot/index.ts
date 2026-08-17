@@ -1723,7 +1723,10 @@ async function cmdCopy(ctx: Context): Promise<void> {
     return;
   }
 
-  session.copyEnabled = state === "on";
+  const enabled = state === "on";
+  updateUserSettings({ copyEnabled: enabled });
+  config.copy.enabled = enabled;
+  session.copyEnabled = enabled;
   await ctx.reply(
     session.copyEnabled
       ? [
@@ -1732,8 +1735,8 @@ async function cmdCopy(ctx: Context): Promise<void> {
           `Signals from ${targets.list().length} target(s) will now spend without confirmation,`,
           `bounded by /caps.`,
           ``,
-          `<i>This does not survive a restart — after a reboot the bot returns to`,
-          `whatever copy.enabled says in config.json.</i>`,
+          `<i>This choice is saved for your account and remains ON after a restart.`,
+          `Use Turn OFF or /copy off to stop autonomous firing.</i>`,
         ].join("\n")
       : `<b>Copy-mint OFF</b>\n\nSignals will be reported but nothing will fire.`,
     { parse_mode: "HTML" }

@@ -190,6 +190,8 @@ export interface UserSettingsUpdate {
   destination?: string;
   /** Bot-controlled derived wallet used to disperse and reclaim ETH. */
   funder?: string;
+  /** Explicit Telegram copy-mint kill-switch choice. */
+  copyEnabled?: boolean;
 }
 
 /**
@@ -201,6 +203,7 @@ export interface UserSettingsUpdate {
 export function updateUserSettings(update: UserSettingsUpdate): {
   destination?: string;
   funder?: string;
+  copyEnabled?: boolean;
 } {
   const path = FILES.config();
   if (!existsSync(path)) {
@@ -214,7 +217,7 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     throw new ConfigError(`config.json is not valid JSON: ${(err as Error).message}`);
   }
 
-  const result: { destination?: string; funder?: string } = {};
+  const result: { destination?: string; funder?: string; copyEnabled?: boolean } = {};
 
   if (update.destination !== undefined) {
     try {
@@ -236,7 +239,24 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     }
   }
 
-  if (result.destination === undefined && result.funder === undefined) {
+  if (update.copyEnabled !== undefined) {
+    if (typeof update.copyEnabled !== "boolean") {
+      throw new ConfigError("Copy-mint state must be on or off.");
+    }
+    raw.copy = {
+      ...DEFAULT_CONFIG.copy,
+      ...(raw.copy ?? {}),
+      tiers: { ...DEFAULT_CONFIG.copy.tiers, ...(raw.copy?.tiers ?? {}) },
+      enabled: update.copyEnabled,
+    };
+    result.copyEnabled = update.copyEnabled;
+  }
+
+  if (
+    result.destination === undefined &&
+    result.funder === undefined &&
+    result.copyEnabled === undefined
+  ) {
     throw new ConfigError("No user setting was supplied.");
   }
 

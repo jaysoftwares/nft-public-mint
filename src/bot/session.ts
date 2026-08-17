@@ -65,11 +65,9 @@ export class Session {
   private reconcileCursors = new Map<string, number>();
 
   /**
-   * Runtime kill switch, seeded from config.
-   *
-   * Deliberately not persisted: /copy off must take effect instantly, and
-   * /copy on must NOT survive a restart. Autonomous spending resumes after a
-   * reboot only because config.json says it should.
+   * Runtime kill switch, seeded from the user's persisted config. Telegram
+   * changes update both values so an intentional ON/OFF choice survives a
+   * deployment restart without changing another user's session.
    */
   copyEnabled = false;
 
