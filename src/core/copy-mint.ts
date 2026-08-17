@@ -10,7 +10,7 @@
 // that costs money, so an abort costs nothing at all.
 
 import { ManagedWallet } from "./wallet-store";
-import { TagContext, resolveForAutoFire } from "./tags";
+import { TagContext, resolveForAutoFire, AutoFirePool } from "./tags";
 import { NonceManager } from "./nonce-manager";
 import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
@@ -19,7 +19,7 @@ import { evaluate, PolicyCaps, PolicyVerdict } from "./policy";
 import { rpcCall } from "./rpc";
 import { record, spentSince } from "./ledger";
 import * as targets from "./targets";
-import { Wallet, HDNodeWallet } from "ethers";
+import { Wallet, HDNodeWallet, formatEther } from "ethers";
 import { CopyConfig } from "./config";
 
 interface RawTransaction {
@@ -67,6 +67,54 @@ export type CopyEvent =
   | { type: "simulated"; gasLimit: number; addressBound: boolean; selector: string }
   | { type: "firing"; walletCount: number; totalCommitWei: bigint; trimReason?: string }
   | { type: "result"; result: CopyResult };
+
+/**
+ * Say why no wallet fired, in terms the operator can act on.
+ *
+ * The old wording — "N manual-only, N stuck, none funded and armed" — described
+ * an armed-but-unfunded set and a funded-but-unarmed set identically, so a
+ * freshly funded wallet reported as having no money. Each cause now gets its
+ * own sentence and its own remedy, and the funding bar is quoted so a balance
+ * can be checked against it rather than guessed at.
+ */
+export function explainEmptyPool(pool: AutoFirePool, selector: string): string {
+  const bar = `${formatEther(pool.minFundedWei)} ETH`;
+
+  if (pool.total === 0) return "No wallets in the store yet — generate or import some first.";
+
+  if (pool.matched === 0) {
+    if (pool.unfunded === pool.total) {
+      return (
+        `All ${pool.total} wallet(s) are below the ${bar} gas reservation on this chain, ` +
+        `so none count as funded. Top them up with /fund.`
+      );
+    }
+    return (
+      `No wallet matched the copy selector "${selector}" ` +
+      `(${pool.total} in the store, ${pool.unfunded} below the ${bar} bar). ` +
+      `Change copy.walletSelector in config.json if the wrong set is being asked for.`
+    );
+  }
+
+  // Something matched, so the selector is not the problem — the rails are.
+  const causes: string[] = [];
+  if (pool.excludedManual > 0) {
+    causes.push(
+      `${pool.excludedManual} matched but ${pool.excludedManual === 1 ? "is" : "are"} not armed ` +
+        `for auto-fire — arm with /autofire, or from Wallets → Auto-fire`
+    );
+  }
+  if (pool.excludedStuck > 0) {
+    causes.push(
+      `${pool.excludedStuck} ${pool.excludedStuck === 1 ? "is" : "are"} behind a nonce gap ` +
+        `— the reconciler retries these automatically`
+    );
+  }
+  if (causes.length === 0) {
+    causes.push(`${pool.matched} matched but none survived the safety rails`);
+  }
+  return `${causes.join(". ")}.`;
+}
 
 export class CopyEngine {
   private readonly deps: CopyDeps;
@@ -160,10 +208,7 @@ export class CopyEngine {
       const candidates = pool.selected.slice(0, tierLimit);
 
       if (candidates.length === 0) {
-        skip(
-          "No eligible wallets",
-          `${pool.excludedManual} manual-only, ${pool.excludedStuck} stuck, none funded and armed.`
-        );
+        skip("No eligible wallets", explainEmptyPool(pool, this.deps.copy.walletSelector));
         return;
       }
 

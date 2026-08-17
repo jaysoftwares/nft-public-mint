@@ -60,18 +60,21 @@ import { executeAllowListMint, AllowListEvent, AllowListMintReport } from "../co
 import { fetchSigners } from "../core/signed-mint";
 import {
   slugForContract,
+  openSeaChainSlug,
   fetchDrop,
   probeIssuance,
   stageIsLive,
   describeStage,
   OpenSeaApiError,
 } from "../core/opensea-api";
+import { resolveCollectionInput } from "../core/collection-input";
 import {
   executeOpenSeaMint,
   OpenSeaMintEvent,
   OpenSeaMintReport,
 } from "../core/mint-opensea";
 import { StatusCard, esc, eth, bar, short, toCsv, txLink } from "./ui";
+import { feedFor, clearFeed, contractLabel } from "./copy-feed";
 import { askPassphrase } from "../tools/tty";
 import {
   Flow,
@@ -1325,12 +1328,31 @@ function requireApiKey(): string {
   return key;
 }
 
-async function resolveSlug(chainId: number, contract: string, given: string | undefined): Promise<string> {
+/**
+ * Contract → collection slug, for whichever chain the contract actually lives on.
+ *
+ * The chain is passed in rather than read from config: this used to report the
+ * configured default in its error, so a Robinhood contract failed with "not
+ * recognised on base" and sent people looking for the wrong problem.
+ */
+async function resolveSlug(
+  chain: ChainContext,
+  contract: string,
+  given: string | undefined
+): Promise<string> {
   if (given && !given.startsWith("0x")) return given;
-  const slug = await slugForContract(requireApiKey(), chainId, contract);
+
+  if (!openSeaChainSlug(chain.chainId)) {
+    throw new Error(
+      `OpenSea has no chain mapping for ${chain.name} (chain id ${chain.chainId}), ` +
+        `so a contract there cannot be looked up.\nPass the collection slug explicitly to mint anyway.`
+    );
+  }
+
+  const slug = await slugForContract(requireApiKey(), chain.chainId, contract);
   if (!slug) {
     throw new Error(
-      `OpenSea does not recognise ${contract} on ${config.chain}.\n` +
+      `OpenSea does not recognise ${contract} on ${chain.name}.\n` +
         "Pass the collection slug explicitly if you know it."
     );
   }
@@ -1350,7 +1372,7 @@ async function cmdProbe(ctx: Context): Promise<void> {
   const address = getAddress(contract);
   const chain = await chainFor(ctx, address);
   const apiKey = requireApiKey();
-  const slug = await resolveSlug(chain.chainId, address, slugArg);
+  const slug = await resolveSlug(chain, address, slugArg);
 
   // On-chain signers tell us whether a signed stage exists at all — a useful
   // cross-check against whatever OpenSea reports.
@@ -1414,10 +1436,13 @@ async function cmdFcfs(ctx: Context): Promise<void> {
   if (!contract || !isAddress(contract)) {
     await ctx.reply(
       [
-        "Usage: <code>/fcfs 0xContract &lt;qty&gt; [selector] [at HH:MM]</code>",
+        "Usage: <code>/fcfs 0xContract &lt;qty&gt; [selector] [wait] [at HH:MM]</code>",
         "",
         "Mints whichever stage OpenSea says you're eligible for — allowlist,",
         "signed or public. Times are UTC.",
+        "",
+        "<code>wait</code> holds until the stage actually opens and fires the",
+        "instant it does. Without it a closed stage is simply refused.",
       ].join("\n"),
       { parse_mode: "HTML" }
     );
@@ -1434,6 +1459,10 @@ async function cmdFcfs(ctx: Context): Promise<void> {
   const chain = await chainFor(ctx, address);
   const apiKey = requireApiKey();
 
+  // "wait" holds until OpenSea actually starts issuing calldata, rather than
+  // firing once and taking a refusal as the answer.
+  const waitForOpen = parts.includes("wait");
+
   // "at HH:MM" schedules the burst; anything else is a wallet selector.
   const atIndex = parts.indexOf("at");
   let startAt: Date | undefined;
@@ -1448,9 +1477,19 @@ async function cmdFcfs(ctx: Context): Promise<void> {
     if (when.getTime() <= Date.now()) when.setUTCDate(when.getUTCDate() + 1);
     startAt = when;
   }
+  // Whatever is left after the contract, the quantity and the timing keywords
+  // is the wallet selector. Indexing into the unsliced array here used to make
+  // "wait" and the clock time reachable as selectors.
   const selector =
-    parts.slice(2).find((p, i) => p !== "at" && parts[i + 1] !== p && !/^\d{1,2}:\d{2}$/.test(p)) ??
-    "derived+funded";
+    parts
+      .slice(2)
+      .find(
+        (part, i, rest) =>
+          part !== "at" &&
+          part !== "wait" &&
+          rest[i - 1] !== "at" &&
+          !/^\d{1,2}:\d{2}$/.test(part)
+      ) ?? "derived+funded";
 
   const matched = await select(selector, ctx, chain.key, true);
   if (!matched) return;
@@ -1463,25 +1502,47 @@ async function cmdFcfs(ctx: Context): Promise<void> {
   let latest: OpenSeaMintReport | undefined;
 
   try {
-    const slug = await resolveSlug(chain.chainId, address, undefined);
+    const slug = await resolveSlug(chain, address, undefined);
 
     // Read the stage price ahead of time. OpenSea refuses to issue calldata to
     // a wallet that cannot cover the mint plus gas, so knowing the price lets
     // underfunded wallets be dropped before the T-0 burst instead of consuming
     // rate limit on guaranteed rejections.
     let unitPriceHintWei: bigint | undefined;
+    let stageLabel: string | undefined;
     try {
       const drop = await fetchDrop(apiKey, slug);
-      const live = drop.stages.find(stageIsLive) ?? drop.stages[0];
-      if (live?.price) unitPriceHintWei = BigInt(live.price);
+      const live = drop.stages.find(stageIsLive);
+
+      // Holding needs to know when to start listening. The soonest stage that
+      // has not opened yet is the one being waited for; if one is already live
+      // there is nothing to wait for and the hold falls through immediately.
+      const upcoming = drop.stages
+        .filter((s) => Date.parse(s.start_time) > Date.now())
+        .sort((a, b) => Date.parse(a.start_time) - Date.parse(b.start_time))[0];
+
+      const target = live ?? upcoming ?? drop.stages[0];
+      if (target?.price) unitPriceHintWei = BigInt(target.price);
+      if (target) stageLabel = describeStage(target);
+
+      // An explicit "at" always wins — it is the operator overriding what
+      // OpenSea published, which is the entire reason the option exists.
+      if (waitForOpen && !startAt && !live && upcoming) {
+        startAt = new Date(Date.parse(upcoming.start_time));
+      }
     } catch {
       // Falls back to gas-only screening, which is still better than none.
     }
 
     status.update(
       `<b>FCFS mint</b>  <code>${esc(slug)}</code>\n\n${matched.length} wallet(s) selected` +
+        (stageLabel ? `\nstage ${esc(stageLabel)}` : "") +
         (unitPriceHintWei !== undefined ? `\nstage price ${eth(unitPriceHintWei)} ETH` : "") +
-        (startAt ? `\n⏳ firing at ${startAt.toISOString().slice(11, 16)} UTC` : "\nstarting now…")
+        (startAt
+          ? `\n⏳ ${waitForOpen ? "holding for" : "firing at"} ${startAt.toISOString().slice(11, 16)} UTC`
+          : waitForOpen
+            ? `\n⏳ holding until OpenSea opens the stage`
+            : "\nstarting now…")
     );
 
     const render = (event: OpenSeaMintEvent): void => {
@@ -1489,6 +1550,24 @@ async function cmdFcfs(ctx: Context): Promise<void> {
         case "waiting":
           status.update(
             `<b>FCFS mint</b>  <code>${esc(slug)}</code>\n\n⏳ holding — ${Math.round(event.msRemaining / 1000)}s\n<i>OpenSea won't issue calldata before the stage opens,\nso the fetch starts at T-0.</i>`
+          );
+          break;
+        case "probing":
+          status.update(
+            [
+              `<b>FCFS mint</b>  <code>${esc(slug)}</code>`,
+              ``,
+              `🔄 asking — attempt ${event.attempt}`,
+              `${event.msPastOpen >= 0 ? "+" : ""}${Math.round(event.msPastOpen / 1000)}s vs published open`,
+              ``,
+              `<i>${esc(event.reason.slice(0, 120))}</i>`,
+              `<i>One wallet is doing the asking, well inside the rate limit.</i>`,
+            ].join("\n")
+          );
+          break;
+        case "open":
+          status.update(
+            `<b>FCFS mint</b>  <code>${esc(slug)}</code>\n\n🟢 <b>stage open</b> after ${event.attempts} ask(s) · waited ${(event.waitedMs / 1000).toFixed(1)}s\n\n${event.hadCalldata ? "fetching the rest…" : "fetching calldata…"}`
           );
           break;
         case "fetching":
@@ -1554,6 +1633,7 @@ async function cmdFcfs(ctx: Context): Promise<void> {
         quantity,
         wallets: matched.map((w) => ({ id: w.id, address: w.address })),
         startAt,
+        waitForOpen,
         skipUnderfunded: true,
         unitPriceHintWei,
       },
@@ -1727,6 +1807,9 @@ async function cmdCopy(ctx: Context): Promise<void> {
   updateUserSettings({ copyEnabled: enabled });
   config.copy.enabled = enabled;
   session.copyEnabled = enabled;
+  // Seal the live card off rather than leaving it updating above a message
+  // that says firing has stopped.
+  if (!enabled) clearFeed(currentRuntime().chatId);
   await ctx.reply(
     session.copyEnabled
       ? [
@@ -1772,45 +1855,57 @@ async function cmdCaps(ctx: Context): Promise<void> {
   );
 }
 
-/** Live copy-mint reporting. Never on the critical path — these fire after dispatch. */
+/**
+ * Live copy-mint reporting. Never on the critical path — these fire after dispatch.
+ *
+ * Watch activity goes to a card that updates in place; only a result, which
+ * means money moved, earns a message of its own. See copy-feed.ts for why.
+ */
 function renderCopyEvent(
   event: CopyEvent,
   chain: ChainContext,
   notify: (html: string) => void
 ): void {
+  const feed = feedFor(bot, currentRuntime().chatId);
+
   switch (event.type) {
     case "signal":
-      notify(
-        `👁 <b>Mint detected</b>\n` +
-          `target <code>${esc(short(event.target))}</code>\n` +
-          `contract <code>${esc(short(event.contract))}</code>\n` +
-          `block ${event.block} · ${esc(chain.name)}`
+      feed.countDetected();
+      feed.push(
+        `sig:${event.contract.toLowerCase()}`,
+        `👁 mint ${contractLabel(event.contract)} · ${esc(chain.name)}`,
+        `target ${esc(short(event.target))} · block ${event.block}`
       );
       break;
     case "skipped":
-      notify(
-        `⏭ <b>Skipped</b> — ${esc(event.reason)}\n` +
-          `<code>${esc(short(event.contract))}</code>` +
-          (event.detail ? `\n<i>${esc(event.detail)}</i>` : "")
+      feed.countSkipped();
+      // Keyed on the reason, not the contract: forty "Already firing" skips in
+      // a row are one fact, and reading it forty times obscures the rest.
+      feed.push(
+        `skip:${event.reason}`,
+        `⏭ ${esc(event.reason)}`,
+        event.detail ? esc(event.detail) : undefined
       );
       break;
     case "simulated":
-      notify(
-        `✅ <b>Simulation passed</b>\n` +
-          `selector <code>${esc(event.selector)}</code> · gas ${event.gasLimit}` +
-          (event.addressBound
-            ? `\n<i>Calldata embedded the target's address — rewritten to ours.</i>`
-            : "")
+      feed.push(
+        `sim:${event.selector}`,
+        `✅ simulated <code>${esc(event.selector)}</code> · gas ${event.gasLimit}`,
+        event.addressBound ? `Target's address was embedded — rewritten to ours.` : undefined
       );
       break;
     case "firing":
-      notify(
-        `🚀 <b>Firing ${event.walletCount} wallet(s)</b>\n` +
-          `committing ${eth(event.totalCommitWei)} ETH` +
-          (event.trimReason ? `\n<i>trimmed by ${esc(event.trimReason)}</i>` : "")
+      feed.push(
+        `fire:${event.walletCount}`,
+        `🚀 firing ${event.walletCount} wallet(s) · ${eth(event.totalCommitWei)} ETH`,
+        event.trimReason ? `trimmed by ${esc(event.trimReason)}` : undefined
       );
       break;
     case "result": {
+      // A result is history, not state — it goes out as its own message and
+      // closes the rolling card so the two do not compete.
+      feed.countFired(event.result.accepted);
+      void feed.close();
       const r = event.result;
       notify(
         [
@@ -2490,7 +2585,13 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
         cmdMint
       );
     case "fcfs":
-      return runWithArgs(ctx, [flow.contract!, String(flow.quantity), flow.selector!], cmdFcfs);
+      // "wait" was silently dropped here, so the ⏳ button fired immediately and
+      // a stage that had not opened yet refused every wallet at once.
+      return runWithArgs(
+        ctx,
+        [flow.contract!, String(flow.quantity), flow.selector!, ...(waitForOpen ? ["wait"] : [])],
+        cmdFcfs
+      );
     case "check":
       return runWithArgs(ctx, [flow.contract!], cmdProbe);
     case "fund":
@@ -2657,7 +2758,13 @@ async function onCallback(ctx: Context): Promise<void> {
         return;
       }
       await ctx.reply(
-        `<b>${kind === "check" ? "Probe" : kind === "fcfs" ? "FCFS mint" : "Public mint"}</b>\n\nSend the contract address.`,
+        [
+          `<b>${kind === "check" ? "Probe" : kind === "fcfs" ? "FCFS mint" : "Public mint"}</b>`,
+          ``,
+          `Send the contract address, or just paste the OpenSea link.`,
+          ``,
+          `<i>e.g. https://opensea.io/collection/omrevo</i>`,
+        ].join("\n"),
         { parse_mode: "HTML", reply_markup: backTo("m:mint", "✕ Cancel") }
       );
       return;
@@ -2756,13 +2863,59 @@ async function onText(ctx: Context): Promise<void> {
     return;
   }
 
-  if (flow.step === "contract" || flow.step === "address") {
+  // A wallet to mirror is an address and nothing else — a collection link here
+  // would be a different kind of thing entirely, so it is not offered.
+  if (flow.kind === "watch" && flow.step === "address") {
     if (!isAddress(text)) {
       await ctx.reply("That doesn't look like an address. Send a 0x… address, or tap Cancel.");
       return;
     }
     flow.contract = getAddress(text);
     flow.step = "ready";
+    return advanceFlow(ctx, flow);
+  }
+
+  if (flow.step === "contract" || flow.step === "address") {
+    let resolved;
+    try {
+      resolved = await resolveCollectionInput(
+        text,
+        (process.env.OPENSEA_API_KEY ?? "").trim() || undefined,
+        config.chain
+      );
+    } catch (err) {
+      await ctx.reply(
+        [
+          `⚠️ ${esc((err as Error).message)}`,
+          ``,
+          `<i>Any of these work:</i>`,
+          `· the contract address, <code>0x</code> plus 40 hex characters`,
+          `· the OpenSea link, <code>opensea.io/collection/…</code>`,
+          `· the collection slug on its own`,
+        ].join("\n"),
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    flow.contract = resolved.address;
+    flow.step = "ready";
+
+    // Say what the link turned into. A slug lookup is the one step where the
+    // operator cannot see what the bot decided, and confirming the wrong
+    // collection is the expensive mistake.
+    if (resolved.slug) {
+      await ctx.reply(
+        [
+          `🔗 <b>${esc(resolved.name ?? resolved.slug)}</b>`,
+          `<code>${esc(resolved.address)}</code>`,
+          resolved.chain ? `<i>on ${esc(resolved.chain)}</i>` : ``,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        { parse_mode: "HTML" }
+      );
+    }
     return advanceFlow(ctx, flow);
   }
 

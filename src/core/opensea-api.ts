@@ -32,6 +32,10 @@ export const OPENSEA_API_BASE = "https://api.opensea.io/api/v2";
 export const CHAIN_SLUGS: Record<number, string> = {
   1: "ethereum",
   8453: "base",
+  // Robinhood Chain. Verified live against the v2 API: /chain/robinhood/contract/…
+  // answers 200, and the drop endpoint reports chain "robinhood". Omitting it
+  // made every /fcfs on this chain fail at slug resolution rather than at mint.
+  4663: "robinhood",
   10: "optimism",
   42161: "arbitrum",
   137: "matic",
@@ -196,13 +200,25 @@ async function getJson<T>(url: string, apiKey: string, timeoutMs = 10_000): Prom
   }
 }
 
+/**
+ * OpenSea's name for a chain, or undefined if we have no mapping for it.
+ *
+ * Callers need this separately from the lookup below: "OpenSea does not index
+ * this chain" and "OpenSea has never seen this contract" are different failures
+ * and deserve different messages. Conflating them sent people hunting for a
+ * collection slug when the real problem was a missing entry in this table.
+ */
+export function openSeaChainSlug(chainId: number): string | undefined {
+  return CHAIN_SLUGS[chainId];
+}
+
 /** Resolve a bare contract address to its OpenSea collection slug. */
 export async function slugForContract(
   apiKey: string,
   chainId: number,
   contract: string
 ): Promise<string | undefined> {
-  const chain = CHAIN_SLUGS[chainId];
+  const chain = openSeaChainSlug(chainId);
   if (!chain) return undefined;
   try {
     const body = await getJson<{ collection?: string }>(

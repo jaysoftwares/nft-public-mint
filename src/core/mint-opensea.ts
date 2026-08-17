@@ -32,6 +32,7 @@ import { record } from "./ledger";
 import {
   MintCalldata,
   OpenSeaApiError,
+  OpenSeaFailure,
   fetchMintCalldata,
 } from "./opensea-api";
 
@@ -152,6 +153,15 @@ export interface OpenSeaMintRequest {
   wallets: { id: string; address: string }[];
   /** Wall-clock instant to begin fetching. Undefined starts immediately. */
   startAt?: Date;
+  /**
+   * Hold until the stage actually opens, rather than firing once at `startAt`.
+   *
+   * Without this a scheduled burst is a single shot: if the stage opens even a
+   * second later than published — or the clocks disagree — every wallet gets
+   * "not currently active" and the run is over. Holding turns a near miss into
+   * a wait.
+   */
+  waitForOpen?: boolean;
   skipUnderfunded: boolean;
   /**
    * Stage price in wei, read from the drop detail before T-0.
@@ -165,8 +175,83 @@ export interface OpenSeaMintRequest {
   unitPriceHintWei?: bigint;
 }
 
+/**
+ * How the pre-open hold is paced.
+ *
+ * The endpoint refuses to issue calldata before a stage opens, so the only way
+ * to start at the instant it does is to keep asking. The cost of asking is rate
+ * limit, and rate limit is scarcest at exactly the moment it matters — spending
+ * it on a countdown would leave none for the burst it exists to enable.
+ *
+ * The published start time does most of the work: while it is far away there is
+ * nothing to learn, so the hold sleeps instead of polling. Probing only tightens
+ * inside the lead window, and even then it is one request for one wallet, not a
+ * fetch for all of them. At the tight cadence that is under two requests a
+ * second against a documented budget several times larger — deliberately
+ * conservative, because being throttled at T-0 costs the drop.
+ *
+ * The loose cadence outside the window is not redundant: a published start time
+ * can move, and a stage that opens early would otherwise be missed entirely.
+ */
+export const OPEN_POLL = {
+  /** Stop sleeping and start probing this long before the published open. */
+  leadMs: 5_000,
+  /** Cadence inside the lead window, and after an unknown-time start. */
+  tightMs: 600,
+  /** Cadence while still far out — a guard against a start time that moves. */
+  looseMs: 15_000,
+  /** Never issue two probes closer together than this, whatever else says. */
+  floorMs: 400,
+  /** Give up this long after the stage was supposed to open. */
+  graceMs: 180_000,
+  /** Applied to the interval after a 429, and the ceiling it climbs to. */
+  backoffFactor: 2,
+  firstBackoffMs: 2_000,
+  maxBackoffMs: 30_000,
+};
+
+/**
+ * What a refusal during the hold means for whether to keep waiting.
+ *
+ * `reachedOpenTime` is what makes this safe, and it is not a detail. A drop
+ * usually has several stages, and OpenSea picks one server-side from the
+ * minter's eligibility — so a probe sent while some *other* stage is live gets
+ * a confident answer about that stage, not about the one being waited for. OMR
+ * EVO had four stages with a holder claim live and the public sale still an
+ * hour out; reading "not eligible" as "open" there would have fired the whole
+ * set into a stage it could not mint, an hour early, and called it a day.
+ *
+ * So nothing observed before the target open time is conclusive. After it,
+ * "not eligible" and "insufficient balance" are answers about a *wallet*, which
+ * means the stage is answering: waiting longer will not change them, and the
+ * burst should go ahead, since every wallet asks for itself and this prober's
+ * verdict is not theirs.
+ */
+export function openSignal(
+  kind: OpenSeaFailure | undefined,
+  reachedOpenTime: boolean
+): "open" | "wait" | "abort" {
+  // A rejected key is the one thing no amount of waiting repairs.
+  if (kind === "auth") return "abort";
+
+  if (!reachedOpenTime) return "wait";
+
+  switch (kind) {
+    case "not_eligible":
+    case "insufficient_balance":
+      return "open";
+    case "minted_out":
+      return "abort";
+    default:
+      // not_live, rate_limited, server, unknown, or a transport error.
+      return "wait";
+  }
+}
+
 export type OpenSeaMintEvent =
   | { type: "waiting"; msRemaining: number }
+  | { type: "probing"; attempt: number; msPastOpen: number; reason: string }
+  | { type: "open"; attempts: number; waitedMs: number; hadCalldata: boolean }
   | { type: "fetching"; done: number; total: number; failures: number }
   | { type: "fetched"; ok: number; failed: number; ms: number; unitPriceWei: bigint }
   | { type: "inspected"; ok: number; rejected: { address: string; reason: string }[] }
@@ -201,6 +286,108 @@ interface Fetched {
   id: string;
   address: string;
   tx: MintCalldata;
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Wait for the stage to start answering, then hand back the calldata that
+ * proved it.
+ *
+ * One wallet does the asking. Probing with all of them would multiply the rate
+ * limit spend by the size of the set for no extra information — the endpoint is
+ * either issuing calldata or it is not, and that is a property of the stage.
+ *
+ * Returns the prober's calldata on success, or undefined when the stage turned
+ * out to be open but had nothing to give this particular wallet (not eligible,
+ * or unable to pay). That is still a green light: the burst goes ahead and each
+ * wallet gets its own answer.
+ */
+async function holdUntilOpen(
+  req: OpenSeaMintRequest,
+  deps: OpenSeaMintDeps,
+  prober: { id: string; address: string },
+  emit: (event: OpenSeaMintEvent) => void
+): Promise<Fetched | undefined> {
+  const startedAt = Date.now();
+  const openAt = req.startAt?.getTime();
+  const deadline = (openAt ?? startedAt) + OPEN_POLL.graceMs;
+
+  let attempts = 0;
+  let backoffMs = 0;
+  let lastReason = "waiting for the stage to open";
+
+  for (;;) {
+    const now = Date.now();
+
+    if (now > deadline) {
+      throw new OpenSeaMintError(
+        `The stage never opened. Gave up ${Math.round((now - (openAt ?? startedAt)) / 1000)}s ` +
+          `after the published start, having asked ${attempts} time(s).\n` +
+          `Last answer: ${lastReason}`
+      );
+    }
+
+    // While the open is still far off there is nothing to learn from asking, so
+    // this sleeps rather than spending requests on a countdown.
+    const untilOpen = openAt === undefined ? 0 : openAt - now;
+    if (untilOpen > OPEN_POLL.leadMs) {
+      emit({ type: "waiting", msRemaining: untilOpen });
+      await sleep(Math.min(untilOpen - OPEN_POLL.leadMs, OPEN_POLL.looseMs));
+      continue;
+    }
+
+    // Without a published time there is nothing to be early relative to, so any
+    // answer counts. With one, only answers from the open onwards do.
+    const reachedOpenTime = openAt === undefined || now >= openAt;
+
+    attempts += 1;
+    try {
+      // Calldata in hand means a stage is live, eligible and priced for this
+      // wallet — even if it is not the one that was being waited for. That is a
+      // mint the operator asked for, and maxUnitPriceWei still gates the cost.
+      const tx = await fetchMintCalldata(deps.apiKey, req.slug, prober.address, req.quantity);
+      emit({
+        type: "open",
+        attempts,
+        waitedMs: Date.now() - startedAt,
+        hadCalldata: true,
+      });
+      return { id: prober.id, address: prober.address, tx };
+    } catch (err) {
+      const apiError = err instanceof OpenSeaApiError ? err : undefined;
+      lastReason = apiError?.message ?? (err as Error).message;
+      const signal = openSignal(apiError?.kind, reachedOpenTime);
+
+      if (signal === "abort") throw apiError ?? err;
+
+      if (signal === "open") {
+        emit({ type: "open", attempts, waitedMs: Date.now() - startedAt, hadCalldata: false });
+        return undefined;
+      }
+
+      // Only a throttle earns a longer gap. Backing off on "not currently
+      // active" would walk the cadence away from the open it is waiting for.
+      if (apiError?.kind === "rate_limited") {
+        backoffMs = Math.min(
+          OPEN_POLL.maxBackoffMs,
+          backoffMs === 0 ? OPEN_POLL.firstBackoffMs : backoffMs * OPEN_POLL.backoffFactor
+        );
+      } else {
+        backoffMs = 0;
+      }
+
+      const nextInMs = Math.max(OPEN_POLL.floorMs, backoffMs || OPEN_POLL.tightMs);
+      emit({
+        type: "probing",
+        attempt: attempts,
+        msPastOpen: openAt === undefined ? Date.now() - startedAt : Date.now() - openAt,
+        reason: lastReason,
+      });
+      await sleep(nextInMs);
+    }
+  }
 }
 
 export async function executeOpenSeaMint(
@@ -251,7 +438,15 @@ export async function executeOpenSeaMint(
     );
   }
 
-  if (req.startAt && req.startAt.getTime() > Date.now()) {
+  // ── Hold for the stage ──
+  //
+  // Two modes. Scheduled-only sleeps to the instant and fires once, which is
+  // right when the time is known to be right. Holding keeps asking until the
+  // endpoint actually answers, which is right when it might not be.
+  let seeded: Fetched | undefined;
+  if (req.waitForOpen) {
+    seeded = await holdUntilOpen(req, deps, affordable[0], emit);
+  } else if (req.startAt && req.startAt.getTime() > Date.now()) {
     emit({ type: "waiting", msRemaining: req.startAt.getTime() - Date.now() });
     await sleepUntil(req.startAt.getTime());
   }
@@ -261,6 +456,12 @@ export async function executeOpenSeaMint(
   const fetched: Fetched[] = [];
   const fetchFailures: { address: string; reason: string }[] = [];
 
+  // The probe that opened the door already holds valid calldata for its wallet.
+  // Throwing it away would cost a second request for no gain, at the one moment
+  // requests are worth most.
+  const queue = seeded ? affordable.filter((w) => w.id !== seeded!.id) : affordable;
+  if (seeded) fetched.push(seeded);
+
   let cursor = 0;
   let lastStart = 0;
   let done = 0;
@@ -268,8 +469,8 @@ export async function executeOpenSeaMint(
   const worker = async (): Promise<void> => {
     for (;;) {
       const index = cursor++;
-      if (index >= affordable.length) return;
-      const wallet = affordable[index];
+      if (index >= queue.length) return;
+      const wallet = queue[index];
 
       // Slot claimed synchronously so concurrent workers cannot collide on it.
       const slot = Math.max(Date.now(), lastStart + deps.pacing.minDelayMs);
@@ -299,15 +500,15 @@ export async function executeOpenSeaMint(
       }
 
       done += 1;
-      if (done % 5 === 0 || done === affordable.length) {
-        emit({ type: "fetching", done, total: affordable.length, failures: fetchFailures.length });
+      if (done % 5 === 0 || done === queue.length) {
+        emit({ type: "fetching", done, total: queue.length, failures: fetchFailures.length });
       }
     }
   };
 
   await Promise.all(
     Array.from(
-      { length: Math.max(1, Math.min(deps.pacing.concurrency, affordable.length)) },
+      { length: Math.max(1, Math.min(deps.pacing.concurrency, Math.max(1, queue.length))) },
       () => worker()
     )
   );

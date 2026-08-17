@@ -148,25 +148,65 @@ export function resolve(
   return wallets.filter((w) => matches(selector, w, ctx));
 }
 
+export interface AutoFirePool {
+  selected: ManagedWallet[];
+  /** Matched the selector but is not armed for autonomous firing. */
+  excludedManual: number;
+  /** Matched and armed, but sitting behind a nonce gap. */
+  excludedStuck: number;
+  /** Every wallet in the store, before the selector saw them. */
+  total: number;
+  /** How many the selector matched at all. */
+  matched: number;
+  /** Wallets anywhere in the store below the gas reservation. */
+  unfunded: number;
+  /** Armed, funded wallets the selector nonetheless rejected. */
+  excludedBySelector: number;
+  /** The bar `funded` is measured against, so a balance can be checked against it. */
+  minFundedWei: bigint;
+}
+
 /**
  * Resolve for an autonomous path. Wallets that opted out of auto-fire and
  * wallets with a nonce gap are removed regardless of what the selector said —
  * a selector should never be able to talk the bot into spending an imported
  * wallet or into queueing a tx behind a gap.
+ *
+ * The counts alongside the selection exist because "nothing fired" is the one
+ * outcome an operator cannot debug from the outside. Reporting only the
+ * post-selector exclusions made an unarmed wallet and an empty one produce the
+ * same message, which is how a funded wallet came to be described as unfunded.
  */
 export function resolveForAutoFire(
   selector: string,
   wallets: ManagedWallet[],
   ctx: TagContext
-): { selected: ManagedWallet[]; excludedManual: number; excludedStuck: number } {
+): AutoFirePool {
   const matched = resolve(selector, wallets, ctx);
   const excludedManual = matched.filter((w) => !w.autoFire).length;
   const afterAutoFire = matched.filter((w) => w.autoFire);
   const excludedStuck = afterAutoFire.filter((w) => ctx.state.get(w.id)?.nonceGap).length;
+
+  const isFunded = (w: ManagedWallet): boolean => {
+    const balance = ctx.state.get(w.id)?.balanceWei;
+    // An unknown balance is not evidence of an empty wallet, so it is not
+    // counted as one — a failed balance read must not read as "you have no money".
+    return balance === undefined || (balance >= ctx.minFundedWei && balance > 0n);
+  };
+
+  const matchedIds = new Set(matched.map((w) => w.id));
+
   return {
     selected: afterAutoFire.filter((w) => !ctx.state.get(w.id)?.nonceGap),
     excludedManual,
     excludedStuck,
+    total: wallets.length,
+    matched: matched.length,
+    unfunded: wallets.filter((w) => !isFunded(w)).length,
+    excludedBySelector: wallets.filter(
+      (w) => !matchedIds.has(w.id) && w.autoFire && isFunded(w)
+    ).length,
+    minFundedWei: ctx.minFundedWei,
   };
 }
 

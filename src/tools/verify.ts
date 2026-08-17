@@ -37,6 +37,10 @@ import { planFunding, planEthSweep, signEthSweep, TRANSFER_GAS } from "../core/f
 import { requiredPerWallet, shortfalls } from "../core/balances";
 import { substituteAddress, contains, selectorOf } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
+import { explainEmptyPool } from "../core/copy-mint";
+import { parseCollectionInput } from "../core/collection-input";
+import { openSeaChainSlug } from "../core/opensea-api";
+import { CHAINS } from "../chains";
 import {
   computeLeaf,
   buildTree,
@@ -49,7 +53,7 @@ import {
   ALLOWLIST_UPDATED_TOPIC,
 } from "../core/allowlist";
 import { id as ethersId, TypedDataEncoder } from "ethers";
-import { inspectCalldata } from "../core/mint-opensea";
+import { inspectCalldata, openSignal, OPEN_POLL } from "../core/mint-opensea";
 import { writeDefaultConfig, updateUserSettings, ConfigError } from "../core/config";
 import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
@@ -413,6 +417,150 @@ async function main(): Promise<void> {
   const autoImported = resolveForAutoFire("imported", all, ctx);
   check("imported wallets refused even when selected", autoImported.selected.length === 0);
   check("manual exclusion is reported", autoImported.excludedManual === 1);
+
+  // ── why nothing fired ─────────────────────────────────────────────────
+  //
+  // The reported symptom was a funded wallet being described as having no
+  // funds, because one sentence covered every cause. Each cause is now checked
+  // to name itself.
+  section("empty-pool diagnosis");
+
+  const unarmed = explainEmptyPool(resolveForAutoFire("imported", all, ctx), "imported");
+  check("an unarmed wallet is called unarmed", /not armed/i.test(unarmed), unarmed);
+  check("…and does not claim it is unfunded", !/below|top them up/i.test(unarmed), unarmed);
+  check("…and says how to arm it", /autofire/i.test(unarmed), unarmed);
+
+  const brokeCtx = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => brokeCtx.state.set(w.id, { balanceWei: 0n }));
+  const broke = explainEmptyPool(resolveForAutoFire("derived+funded", all, brokeCtx), "derived+funded");
+  check("an empty set is called unfunded", /below the 0.0005 ETH/i.test(broke), broke);
+  check("…and says how to fix it", /\/fund/.test(broke), broke);
+
+  const stuckCtx = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => stuckCtx.state.set(w.id, { balanceWei: parseEther("0.001"), nonceGap: true }));
+  const jammed = explainEmptyPool(resolveForAutoFire("derived+funded", all, stuckCtx), "derived+funded");
+  check("a jammed set is called jammed", /nonce gap/i.test(jammed), jammed);
+
+  check(
+    "an empty store says so plainly",
+    /no wallets in the store/i.test(explainEmptyPool(resolveForAutoFire("all", [], ctx), "all"))
+  );
+
+  // An unread balance must never be reported as an empty wallet — that is the
+  // exact confusion this whole section exists to prevent.
+  const blindCtx = emptyContext(parseEther("0.0005"));
+  const blind = resolveForAutoFire("all", all, blindCtx);
+  check("wallets with unknown balances are not counted unfunded", blind.unfunded === 0);
+
+  // ── pasted input ──────────────────────────────────────────────────────
+  section("collection input");
+
+  const OMR = "0x8761D975bc4eccAF48cB650Fb0871e066058Ea61";
+  const inputCases: [string, string][] = [
+    ["https://opensea.io/collection/omrevo/overview", "slug:omrevo"],
+    ["https://opensea.io/collection/omrevo", "slug:omrevo"],
+    ["opensea.io/collection/omrevo?tab=items", "slug:omrevo"],
+    ["https://opensea.io/collection/OMREVO", "slug:omrevo"],
+    ["omrevo", "slug:omrevo"],
+    [OMR, `address:${OMR}`],
+    [`  ${OMR}  `, `address:${OMR}`],
+    [`https://opensea.io/item/robinhood/${OMR}/1`, `address:${OMR}`],
+    [`https://opensea.io/assets/base/${OMR}/1`, `address:${OMR}`],
+    ["0xnothex", "invalid"],
+    ["https://example.com/collection/omrevo", "invalid"],
+    ["", "invalid"],
+  ];
+  for (const [input, expected] of inputCases) {
+    const parsed = parseCollectionInput(input);
+    const got =
+      parsed.kind === "slug"
+        ? `slug:${parsed.slug}`
+        : parsed.kind === "address"
+          ? `address:${parsed.address}`
+          : "invalid";
+    check(`${input || "(empty)"} → ${expected}`, got === expected, `got ${got}`);
+  }
+
+  check(
+    "an item URL keeps the chain as a hint",
+    (parseCollectionInput(`https://opensea.io/item/robinhood/${OMR}/1`) as { chainHint?: string })
+      .chainHint === "robinhood"
+  );
+
+  // ── OpenSea chain coverage ────────────────────────────────────────────
+  //
+  // A missing entry here is invisible until a mint fails on the chain, which is
+  // how Robinhood /fcfs failed at slug resolution rather than at the mint.
+  section("OpenSea chain slugs");
+  for (const profile of CHAINS) {
+    check(
+      `${profile.name} (${profile.chainId}) has an OpenSea slug`,
+      openSeaChainSlug(profile.chainId) !== undefined
+    );
+  }
+  check("Robinhood maps to the slug OpenSea answers on", openSeaChainSlug(4663) === "robinhood");
+
+  // ── holding for a stage that has not opened ───────────────────────────
+  //
+  // The hold has to tell three things apart: the stage is shut (keep asking),
+  // the stage is answering but has nothing for this wallet (go), and the
+  // request is hopeless (stop). Getting the middle case wrong would hold
+  // through a live drop.
+  section("pre-open hold");
+
+  // At or after the published open.
+  check("a closed stage keeps the hold waiting", openSignal("not_live", true) === "wait");
+  check("a throttle keeps the hold waiting", openSignal("rate_limited", true) === "wait");
+  check("a server error keeps the hold waiting", openSignal("server", true) === "wait");
+  check("an unclassified refusal keeps the hold waiting", openSignal("unknown", true) === "wait");
+  check("a transport error keeps the hold waiting", openSignal(undefined, true) === "wait");
+  check("an ineligible prober means the stage is open", openSignal("not_eligible", true) === "open");
+  check(
+    "an underfunded prober means the stage is open",
+    openSignal("insufficient_balance", true) === "open"
+  );
+  check("a minted-out drop aborts rather than spinning", openSignal("minted_out", true) === "abort");
+
+  // Before it — a different stage may be live and answering confidently about
+  // itself. OMR EVO had a holder claim live an hour before the public sale.
+  check(
+    "an ineligible answer BEFORE the open is not proof of the open",
+    openSignal("not_eligible", false) === "wait"
+  );
+  check(
+    "an underfunded answer BEFORE the open is not proof of the open",
+    openSignal("insufficient_balance", false) === "wait"
+  );
+  check(
+    "a minted-out answer BEFORE the open does not abort the hold",
+    openSignal("minted_out", false) === "wait"
+  );
+
+  // A rejected key is the one refusal that waiting cannot repair.
+  check("a bad API key aborts rather than spinning", openSignal("auth", true) === "abort");
+  check("…even before the open", openSignal("auth", false) === "abort");
+
+  // Pacing has to stay inside the rate limit it exists to protect.
+  check("probes never come closer than the floor", OPEN_POLL.tightMs >= OPEN_POLL.floorMs);
+  check(
+    "tight cadence stays under 2 requests/second",
+    1000 / OPEN_POLL.tightMs < 2,
+    `${(1000 / OPEN_POLL.tightMs).toFixed(2)}/s`
+  );
+  check("the hold starts listening before the published open", OPEN_POLL.leadMs > 0);
+  check("waiting far out is cheaper than waiting close in", OPEN_POLL.looseMs > OPEN_POLL.tightMs);
+  check("a throttle backs off rather than retrying at pace", OPEN_POLL.firstBackoffMs > OPEN_POLL.tightMs);
+  check("backoff is capped", OPEN_POLL.maxBackoffMs >= OPEN_POLL.firstBackoffMs);
+  check("the hold gives up eventually", OPEN_POLL.graceMs > 0 && OPEN_POLL.graceMs <= 600_000);
+
+  // The worst case that matters: how many requests a full grace period of
+  // tight probing would spend if the stage never opened at all.
+  const worstCaseProbes = Math.ceil(OPEN_POLL.graceMs / OPEN_POLL.tightMs);
+  check(
+    `a full ${OPEN_POLL.graceMs / 1000}s hold costs at most ${worstCaseProbes} requests`,
+    worstCaseProbes <= 500,
+    `${worstCaseProbes}`
+  );
 
   // ── money arithmetic ──────────────────────────────────────────────────
   section("money arithmetic");
