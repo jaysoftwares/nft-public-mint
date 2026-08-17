@@ -38,6 +38,10 @@ that needs a decision from you.
 **1. Secrets** — `nano /etc/copymint/env`. Bot token, OpenSea key, RPC URLs, and
 `COPYMINT_PASSPHRASE`.
 
+Set the passphrase before first start: the wallet store is sealed with whatever
+is in that variable, and the service unlocks it with the same one on every
+restart.
+
 That passphrase is the honest tradeoff of unattended restart. The seed is
 encrypted at rest, but a passphrase sitting beside it on the same disk means the
 encryption protects against a stolen backup or a snapshot, not against someone
@@ -45,21 +49,7 @@ who already has root. If you would rather it never touch the disk, leave it
 blank and unlock by hand after each restart — the service will exit immediately
 on boot until you do.
 
-**2. Wallet store** — create it as the service user so the files end up owned
-correctly:
-
-```bash
-sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
-  node /opt/copymint/dist/tools/wallets.js init
-sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
-  node /opt/copymint/dist/tools/wallets.js generate 500
-```
-
-`init` prints a recovery phrase once. Write it on paper. It restores every
-derived wallet — but **not** imported keys, which live in `imported.enc` and
-need their own backup.
-
-**3. Config** — `nano /var/lib/copymint/config.json`. Set `vault`, `funder` and
+**2. Config** — `nano /var/lib/copymint/config.json`. Set `vault`, `funder` and
 `telegram.allowedChatIds`.
 
 For the chat id: start the service, message the bot, then read
@@ -70,12 +60,33 @@ The vault and funder addresses are deliberately unreachable from Telegram. A
 compromised Telegram account can make the bot mint and sweep, but everything it
 moves still lands at an address only changeable over SSH.
 
-**4. Start**
+**3. Start**
 
 ```bash
 systemctl start copymint
 journalctl -u copymint -f
 ```
+
+**4. Wallet store** — created from Telegram, not from here.
+
+With no store on disk the bot boots into **setup mode**: the whitelist still
+applies, but the only buttons that do anything are the setup ones. Whoever owns
+the wallets sends `/start`, taps through the warning, and the 12-word recovery
+phrase is shown in their chat. The message is deleted on confirmation, and after
+ten minutes regardless. The session then comes up in place — no restart.
+
+This exists so the phrase is seen by the wallets' owner rather than by whoever is
+holding the SSH session. The cost is that it travels through Telegram, whose
+cloud chats are not end-to-end encrypted. To keep it off Telegram entirely,
+create the store on the terminal before first start:
+
+```bash
+sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
+  node /opt/copymint/dist/tools/wallets.js init
+```
+
+Either way the phrase restores every derived wallet — but **not** imported keys,
+which live in `imported.enc` and need their own backup.
 
 ## Operating
 

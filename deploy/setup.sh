@@ -69,6 +69,13 @@ npx tsc
 chown -R root:root "$APP_DIR"
 note "built to $APP_DIR/dist"
 
+# Write a starter config now so there is a file to edit before first start.
+# The bot writes this itself at boot too, but it then refuses to run until
+# vault and funder are set — better to have it on disk while you are still here.
+sudo -u "$SERVICE_USER" COPYMINT_HOME="$STATE_DIR" \
+  node -e 'require("'"$APP_DIR"'/dist/core/config.js").writeDefaultConfig()'
+note "starter config at $STATE_DIR/config.json"
+
 # ── Secrets file ───────────────────────────────────────────────────────
 say "Secrets"
 if [[ ! -f "$SECRET_DIR/env" ]]; then
@@ -111,23 +118,26 @@ $(printf '\033[1mRemaining steps — these need you\033[0m')
   1. Fill in the secrets:
        nano $SECRET_DIR/env
 
-  2. Create the wallet store as the service user. It prints a recovery
-     phrase once; write it on paper.
-       sudo -u $SERVICE_USER COPYMINT_HOME=$STATE_DIR \\
-         node $APP_DIR/dist/tools/wallets.js init
-       sudo -u $SERVICE_USER COPYMINT_HOME=$STATE_DIR \\
-         node $APP_DIR/dist/tools/wallets.js generate 500
-
-  3. Set vault, funder and telegram.allowedChatIds:
+  2. Set vault, funder and telegram.allowedChatIds:
        nano $STATE_DIR/config.json
 
      For the chat id: start the service, message the bot, then read
        journalctl -u copymint -n 20
      It logs the id it rejected. Put that in allowedChatIds and restart.
 
-  4. Start it:
+  3. Start it:
        systemctl start copymint
        journalctl -u copymint -f
+
+  4. Create the wallet store from Telegram.
+
+     With no store on disk the bot boots into setup mode. Whoever owns
+     the wallets messages it, taps "Create wallet store", and the
+     recovery phrase is shown in their chat rather than on this terminal.
+
+     Prefer it on a terminal instead? Do this before first start:
+       sudo -u $SERVICE_USER COPYMINT_HOME=$STATE_DIR \\
+         node $APP_DIR/dist/tools/wallets.js init
 
 $(printf '\033[90mNo inbound ports are needed — the bot uses long polling, so\033[0m')
 $(printf '\033[90mthe firewall can stay closed to everything but SSH.\033[0m')

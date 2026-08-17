@@ -162,3 +162,70 @@ export function planEthSweep(
     skipped,
   };
 }
+
+export interface EthSweepDeps {
+  signerFor: (id: string) => Wallet | HDNodeWallet;
+  /** Where the reclaimed ETH lands — the funder, so it can be redeployed. */
+  destination: string;
+  chainId: number;
+  endpoints: Endpoint[];
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  nonceFor: (address: string) => number;
+}
+
+/**
+ * Sign each planned transfer, without sending anything.
+ *
+ * The mirror image of funding: there, one funder signs many transfers and the
+ * nonces are a single sequence; here every wallet signs exactly one, so each
+ * takes its own current nonce and no sequencing is needed.
+ *
+ * Split out from dispatch so the signing can be checked offline — a sweep that
+ * signs from the wrong wallet or to the wrong destination is a silent way to
+ * lose the set's entire balance, and that deserves a test that never touches a
+ * network.
+ */
+export async function signEthSweep(
+  plan: SweepEthPlan,
+  deps: EthSweepDeps,
+  onProgress?: (done: number, total: number) => void
+): Promise<ReturnType<typeof prepareTx>[]> {
+  const prepared = [];
+  for (let i = 0; i < plan.transfers.length; i++) {
+    const transfer = plan.transfers[i];
+    const raw = await deps.signerFor(transfer.id).signTransaction({
+      to: deps.destination,
+      value: transfer.amount,
+      data: "0x",
+      nonce: deps.nonceFor(transfer.address),
+      gasLimit: TRANSFER_GAS,
+      maxFeePerGas: deps.maxFeePerGas,
+      maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+      type: 2,
+      chainId: deps.chainId,
+    });
+    prepared.push(prepareTx(transfer.id, transfer.address, raw));
+    onProgress?.(i + 1, plan.transfers.length);
+  }
+  return prepared;
+}
+
+export async function executeEthSweep(
+  plan: SweepEthPlan,
+  deps: EthSweepDeps,
+  onProgress?: (done: number, total: number) => void
+): Promise<FundingResult> {
+  if (plan.transfers.length === 0) {
+    return { dispatched: 0, accepted: 0, rejected: 0, outcomes: [] };
+  }
+
+  const prepared = await signEthSweep(plan, deps, onProgress);
+  const report = await dispatchAll(prepared, deps.endpoints);
+  return {
+    dispatched: prepared.length,
+    accepted: report.accepted,
+    rejected: report.rejected,
+    outcomes: report.outcomes,
+  };
+}

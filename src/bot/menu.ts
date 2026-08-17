@@ -15,7 +15,7 @@
 
 import { InlineKeyboard } from "grammy";
 
-export type FlowKind = "mint" | "fcfs" | "fund" | "watch" | "sweep" | "check";
+export type FlowKind = "mint" | "fcfs" | "fund" | "watch" | "sweep" | "check" | "drain";
 
 export interface Flow {
   kind: FlowKind;
@@ -84,14 +84,36 @@ export function mintMenu(): InlineKeyboard {
 export function walletsMenu(): InlineKeyboard {
   return new InlineKeyboard()
     .text("📋 List", "a:wallets")
-    .text("💵 Balances", "a:balances")
+    .text("💵 Funded only", "a:balances")
+    .row()
+    .text("📄 Export all as CSV", "a:csv")
     .row()
     .text("➕ Generate 10", "g:10")
     .text("➕ Generate 100", "g:100")
     .row()
     .text("➕ Generate 500", "g:500")
     .row()
+    .text("⚡ Auto-fire", "m:autofire")
+    .row()
     .text("‹ Back", "m:main");
+}
+
+/**
+ * Auto-fire is the switch that lets copy signals spend without a confirmation,
+ * so the two sets are offered separately: the derived wallets are disposable,
+ * the imported ones hold real value and are manual-only until said otherwise.
+ */
+export function autoFireMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ On — derived", "f:derived:on")
+    .text("🛑 Off — derived", "f:derived:off")
+    .row()
+    .text("✅ On — imported", "f:imported:on")
+    .text("🛑 Off — imported", "f:imported:off")
+    .row()
+    .text("📋 Who's armed?", "a:autofire")
+    .row()
+    .text("‹ Back", "m:wallets");
 }
 
 export function moneyMenu(): InlineKeyboard {
@@ -100,9 +122,36 @@ export function moneyMenu(): InlineKeyboard {
     .row()
     .text("🧹 Sweep NFTs → vault", "i:sweep")
     .row()
+    .text("💧 Reclaim ETH → funder", "i:drain")
+    .row()
     .text("📈 Spend caps", "a:caps")
     .row()
     .text("‹ Back", "m:main");
+}
+
+/**
+ * Page through a wallet list 25 at a time.
+ *
+ * The selector rides in the callback data so a page tap is stateless — no flow
+ * to expire between pages. Telegram's 64-byte cap is the reason it is truncated
+ * rather than passed whole; anything longer is a typed command, not a button.
+ */
+export function walletsPager(offset: number, shown: number, total: number, selector: string): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  const key = selector.slice(0, 40);
+  if (offset > 0) keyboard.text("‹ Prev", `wp:${Math.max(0, offset - 25)}:${key}`);
+  if (offset + shown < total) keyboard.text("Next ›", `wp:${offset + shown}:${key}`);
+  return keyboard.row().text("📄 Export all as CSV", "a:csv").row().text("‹ Back", "m:wallets");
+}
+
+/** One unwatch button per target, so removing one never needs its address typed. */
+export function targetsKeyboard(entries: { address: string; label?: string }[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const entry of entries.slice(0, 10)) {
+    const name = entry.label || `${entry.address.slice(0, 6)}…${entry.address.slice(-4)}`;
+    keyboard.text(`✕ ${name}`, `uw:${entry.address}`).row();
+  }
+  return keyboard.text("➕ Watch a wallet", "i:watch").row().text("‹ Back", "m:copy");
 }
 
 export function copyMenu(copyOn: boolean): InlineKeyboard {
@@ -195,6 +244,48 @@ export function simpleConfirm(label = "Confirm"): InlineKeyboard {
 
 export function backTo(target: string, label = "‹ Back"): InlineKeyboard {
   return new InlineKeyboard().text(label, target);
+}
+
+// ── First-run setup ───────────────────────────────────────────────────
+//
+// Before a wallet store exists the bot has nothing to operate on, so it boots
+// into a mode where these are the only buttons that do anything. The point is
+// that the recovery phrase is shown to the *owner*, in their own chat, rather
+// than to whoever happens to be holding the server's SSH session.
+
+export function setupMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🔐 Create wallet store", "s:warn")
+    .row()
+    .text("❔ What is this?", "s:explain");
+}
+
+export function setupConfirm(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Show me the phrase", "s:create")
+    .row()
+    .text("✕ Not now", "s:cancel");
+}
+
+/**
+ * The phrase is on screen when this is shown. Tapping deletes the message that
+ * carries it — the one mitigation available for a secret that has already been
+ * through Telegram's servers.
+ */
+export function phraseWritten(): InlineKeyboard {
+  return new InlineKeyboard().text("✅ Written down — delete this message", "s:burn");
+}
+
+export function afterSetupMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("➕ Generate 500 wallets", "g:500")
+    .row()
+    .text("➕ Generate 10", "g:10")
+    .text("➕ Generate 100", "g:100")
+    .row()
+    .text("📊 Status", "a:status")
+    .row()
+    .text("☰ Main menu", "m:main");
 }
 
 /** Human summary of a flow, shown above the confirm buttons. */

@@ -17,7 +17,7 @@ const SCRATCH = join(tmpdir(), `copymint-verify-${process.pid}-${Date.now()}`);
 process.env.COPYMINT_HOME = SCRATCH;
 
 /* eslint-disable import/first */
-import { Wallet, parseEther } from "ethers";
+import { Wallet, parseEther, Transaction } from "ethers";
 import { sealJson, unsealJson, DecryptError } from "../core/crypto";
 import { initFromMnemonic, unlock, readImportBlob, storeExists } from "../core/wallet-store";
 import {
@@ -26,7 +26,7 @@ import {
   emptyContext,
   SelectorError,
 } from "../core/tags";
-import { planFunding, planEthSweep, TRANSFER_GAS } from "../core/funding";
+import { planFunding, planEthSweep, signEthSweep, TRANSFER_GAS } from "../core/funding";
 import { requiredPerWallet, shortfalls } from "../core/balances";
 import { substituteAddress, contains, selectorOf } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
@@ -241,6 +241,48 @@ async function main(): Promise<void> {
     "sweep leaves exactly the transfer cost behind",
     sweepPlan.transfers[0].amount === parseEther("0.002") - BigInt(TRANSFER_GAS) * maxFee
   );
+
+  // Signing is checked by decoding the raw transactions back. A sweep that
+  // signs from the wrong wallet, or sends somewhere other than the funder,
+  // would empty the whole set — recovering the sender from the signature
+  // proves it did neither.
+  const DESTINATION = "0x000000000000000000000000000000000000dEaD";
+  const signed = await signEthSweep(sweepPlan, {
+    signerFor: (id: string) => store.signer(id),
+    destination: DESTINATION,
+    chainId: 8453,
+    endpoints: [],
+    maxFeePerGas: maxFee,
+    maxPriorityFeePerGas: maxFee / 2n,
+    nonceFor: () => 7,
+  });
+  check("sweep signs one transaction per transfer", signed.length === 2);
+
+  const rawTx = JSON.parse(signed[0].body).params[0] as string;
+  const decoded = Transaction.from(rawTx);
+  check(
+    "…signed by the wallet holding the funds",
+    decoded.from?.toLowerCase() === sweepPlan.transfers[0].address.toLowerCase(),
+    `signed by ${decoded.from}`
+  );
+  check("…sent to the pinned destination", decoded.to?.toLowerCase() === DESTINATION.toLowerCase());
+  check("…for the planned amount", decoded.value === sweepPlan.transfers[0].amount);
+  check("…at the wallet's own nonce", decoded.nonce === 7);
+  check("…and never exceeds a plain transfer's gas", decoded.gasLimit === BigInt(TRANSFER_GAS));
+
+  const nothing = await signEthSweep(
+    { transfers: [], total: 0n, skipped: [] },
+    {
+      signerFor: (id: string) => store.signer(id),
+      destination: DESTINATION,
+      chainId: 8453,
+      endpoints: [],
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: maxFee / 2n,
+      nonceFor: () => 0,
+    }
+  );
+  check("an empty sweep signs nothing", nothing.length === 0);
 
   // ── calldata substitution ─────────────────────────────────────────────
   section("calldata substitution");

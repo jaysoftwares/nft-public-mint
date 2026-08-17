@@ -9,16 +9,22 @@
 // The passphrase is never a chat command — it comes from the environment or the
 // console at boot.
 
-import { Bot, InputFile, Context } from "grammy";
+import { Bot, InputFile, Context, InlineKeyboard } from "grammy";
 import { isAddress, getAddress, parseEther } from "ethers";
 import { config as loadEnv } from "dotenv";
-import { loadConfig, ResolvedConfig, ConfigError } from "../core/config";
+import { loadConfig, writeDefaultConfig, ResolvedConfig, ConfigError } from "../core/config";
 import { Session, ChainContext } from "./session";
 import { ManagedWallet } from "../core/wallet-store";
-import { readImportBlob } from "../core/wallet-store";
+import { readImportBlob, initNew, storeExists } from "../core/wallet-store";
 import { resolve as resolveWallets, summarise, SelectorError } from "../core/tags";
 import { gasReservation, shortfalls } from "../core/balances";
-import { planFunding, executeFunding } from "../core/funding";
+import {
+  planFunding,
+  executeFunding,
+  planEthSweep,
+  executeEthSweep,
+  TRANSFER_GAS,
+} from "../core/funding";
 import { discoverHoldings, sweepNfts, latestBlock } from "../core/holdings";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
 import { earliestMintBlock, mintedContracts, spentSince } from "../core/ledger";
@@ -70,12 +76,30 @@ import {
   simpleConfirm,
   backTo,
   describeFlow,
+  autoFireMenu,
+  walletsPager,
+  targetsKeyboard,
+  setupMenu,
+  setupConfirm,
+  phraseWritten,
+  afterSetupMenu,
 } from "./menu";
 
 loadEnv();
 
 let session: Session;
 let config: ResolvedConfig;
+
+/**
+ * False until a wallet store exists and the session is open.
+ *
+ * Everything below assumes `session` is live, which it is not on a first boot
+ * against an empty state directory. Rather than thread a null check through
+ * forty handlers, one piece of middleware refuses to route anything except the
+ * setup buttons while this is false — so by the time any command runs, the
+ * session is guaranteed.
+ */
+let ready = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -174,6 +198,7 @@ const HELP = `<b>Copymint</b>
 <b>Wallets</b>
 /status — set overview, balances, nonce health
 /wallets [selector] — list matching wallets
+/wallets csv — every wallet, tag and balance as a file
 /generate &lt;n&gt; — derive n more wallets
 /autofire &lt;selector&gt; on|off — autonomous firing per wallet
 /tag &lt;selector&gt; &lt;tag&gt; · /untag &lt;selector&gt; &lt;tag&gt;
@@ -181,6 +206,7 @@ const HELP = `<b>Copymint</b>
 <b>Money</b>
 /fund &lt;selector&gt; &lt;eth&gt; — top wallets up to a target balance
 /sweep [selector] [contract] — move NFTs to the vault, leave gas
+/drain [selector] — send ETH back to the funder, leave nothing
 
 <b>Minting</b>
 /mint &lt;contract&gt; &lt;qty&gt; [selector] [wait] — public SeaDrop mint
@@ -256,14 +282,26 @@ async function cmdStatus(ctx: Context): Promise<void> {
   await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
 }
 
-async function cmdWallets(ctx: Context): Promise<void> {
-  const chain = await chainFor(ctx);
+const PAGE = 25;
+
+/**
+ * One page of wallets.
+ *
+ * Telegram's 4096-character cap is the binding constraint at 500 wallets, so
+ * the list pages rather than truncating and the full set goes out as a CSV
+ * (`/wallets csv`) where every column survives.
+ */
+async function cmdWallets(ctx: Context, offset = 0): Promise<void> {
   const selector = args(ctx)[0] ?? "all";
+  if (selector === "csv") return cmdWalletsCsv(ctx);
+
+  const chain = await chainFor(ctx);
   const matched = await select(selector, ctx, chain.key, true);
   if (!matched) return;
 
-  const balances = await session.balances();
-  const shown = matched.slice(0, 25);
+  const balances = await session.balances(chain.key);
+  const start = Math.min(Math.max(0, offset), Math.max(0, matched.length - 1));
+  const shown = matched.slice(start, start + PAGE);
   const lines = shown.map((w) => {
     const balance = balances.get(w.address) ?? 0n;
     const origin = w.kind === "derived" ? `d${w.index}` : "imp";
@@ -272,17 +310,65 @@ async function cmdWallets(ctx: Context): Promise<void> {
     }`;
   });
 
-  await ctx.reply(
-    [
-      `<b>${matched.length} wallet(s)</b> matching <code>${esc(selector)}</code>`,
-      ``,
-      ...lines,
-      matched.length > shown.length ? `\n…and ${matched.length - shown.length} more` : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    { parse_mode: "HTML" }
-  );
+  const text = [
+    `<b>${matched.length} wallet(s)</b> matching <code>${esc(selector)}</code>`,
+    `<i>${esc(chain.name)} balances · showing ${start + 1}–${start + shown.length}</i>`,
+    ``,
+    ...lines,
+  ].join("\n");
+
+  const keyboard = walletsPager(start, shown.length, matched.length, selector);
+  // A page tap edits in place; a typed command starts a fresh message.
+  if (ctx.callbackQuery) {
+    try {
+      await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: keyboard });
+      return;
+    } catch {
+      // Editing fails when the text is unchanged — fall through and send.
+    }
+  }
+  await ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
+}
+
+/**
+ * Every wallet, every column, as a file.
+ *
+ * Balances are per chain, so each live chain gets its own column — this is the
+ * one view that answers "what do I actually hold" across the whole set.
+ */
+async function cmdWalletsCsv(ctx: Context): Promise<void> {
+  const wallets = session.wallets();
+  if (wallets.length === 0) {
+    await ctx.reply("No wallets yet — generate some first.");
+    return;
+  }
+
+  const status = new StatusCard(bot, ctx.chat!.id);
+  await status.start(`<b>Export</b>\n\nreading ${wallets.length} wallets across ${session.availableChains.length} chain(s)…`);
+
+  const perChain = new Map<string, Map<string, bigint>>();
+  for (const chain of session.availableChains) {
+    perChain.set(chain.key, await session.balances(chain.key, true));
+  }
+
+  const columns = [
+    { header: "index", value: (w: ManagedWallet) => (w.kind === "derived" ? String(w.index) : "") },
+    { header: "kind", value: (w: ManagedWallet) => w.kind },
+    { header: "address", value: (w: ManagedWallet) => w.address },
+    { header: "label", value: (w: ManagedWallet) => w.label ?? "" },
+    { header: "autofire", value: (w: ManagedWallet) => (w.autoFire ? "yes" : "no") },
+    { header: "tags", value: (w: ManagedWallet) => w.tags.join(" ") },
+    ...session.availableChains.map((chain) => ({
+      header: `${chain.key}_eth`,
+      value: (w: ManagedWallet) => eth(perChain.get(chain.key)?.get(w.address) ?? 0n, 8),
+    })),
+  ];
+
+  const csv = toCsv(wallets, columns);
+  await status.finish(`<b>Export</b>\n\n${wallets.length} wallets.`);
+  await ctx.replyWithDocument(new InputFile(csv, `wallets-${Date.now()}.csv`), {
+    caption: "Addresses and balances only — no private keys leave the server.",
+  });
 }
 
 async function cmdGenerate(ctx: Context): Promise<void> {
@@ -522,6 +608,80 @@ async function cmdSweep(ctx: Context): Promise<void> {
     );
   } catch (err) {
     await status.finish(`<b>Sweep failed</b>\n\n${esc((err as Error).message)}`);
+  }
+}
+
+/**
+ * Reclaim ETH from the wallet set back to the funder.
+ *
+ * The counterpart to /fund, for when a campaign is over and the gas is better
+ * off in one place than smeared across 500 wallets. It lands at the funder
+ * address pinned in config.json — like every other outward path here, chat
+ * cannot redirect it.
+ */
+async function cmdDrain(ctx: Context): Promise<void> {
+  const selector = args(ctx)[0] ?? "all";
+  const chain = await chainFor(ctx);
+  const matched = await select(selector, ctx, chain.key, true);
+  if (!matched) return;
+
+  const status = new StatusCard(bot, ctx.chat!.id);
+  await status.start(`<b>Reclaim ETH</b>\n\nreading ${matched.length} balances on ${esc(chain.name)}…`);
+
+  try {
+    const balances = await session.balances(chain.key, true);
+    const plan = planEthSweep(
+      matched.map((w) => ({ id: w.id, address: w.address })),
+      balances,
+      config.maxFeePerGas
+    );
+
+    if (plan.transfers.length === 0) {
+      await status.finish(
+        `<b>Reclaim ETH</b>\n\nNothing to reclaim — no wallet holds more than its own ` +
+          `transfer cost (${eth(BigInt(TRANSFER_GAS) * config.maxFeePerGas)} ETH).`
+      );
+      return;
+    }
+
+    await session.primeNonces(matched, chain.key);
+    status.update(
+      `<b>Reclaim ETH</b>\n\n${plan.transfers.length} wallet(s), ${eth(plan.total)} ETH — signing…`
+    );
+
+    const result = await executeEthSweep(
+      plan,
+      {
+        signerFor: session.signerFor,
+        destination: config.funder,
+        chainId: chain.chainId,
+        endpoints: chain.rpc.endpoints,
+        maxFeePerGas: config.maxFeePerGas,
+        maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        nonceFor: (a: string) => session.nonceFor(a, chain.key),
+      },
+      (done, total) =>
+        status.update(`<b>Reclaim ETH</b>\n\n${bar(done, total)}  signing ${done}/${total}`)
+    );
+
+    await status.finish(
+      [
+        `<b>Reclaim complete</b>`,
+        ``,
+        `${bar(result.accepted, result.dispatched)}  ${result.accepted}/${result.dispatched} accepted`,
+        result.rejected > 0 ? `${result.rejected} rejected` : ``,
+        `${eth(plan.total)} ETH → funder <code>${esc(short(config.funder))}</code>`,
+        plan.skipped.length > 0
+          ? `\n<i>${plan.skipped.length} skipped — balance below its own gas cost.</i>`
+          : ``,
+        ``,
+        `<i>Wallets are now unarmed. Fund them again before minting.</i>`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  } catch (err) {
+    await status.finish(`<b>Reclaim failed</b>\n\n${esc((err as Error).message)}`);
   }
 }
 
@@ -1364,8 +1524,8 @@ async function cmdTargets(ctx: Context): Promise<void> {
   const list = targets.list();
   if (list.length === 0) {
     await ctx.reply(
-      "No targets. Add one with <code>/watch 0xAlpha… high</code>.",
-      { parse_mode: "HTML" }
+      "No targets yet. Watch a wallet and its mints get mirrored.",
+      { parse_mode: "HTML", reply_markup: targetsKeyboard([]) }
     );
     return;
   }
@@ -1389,7 +1549,7 @@ async function cmdTargets(ctx: Context): Promise<void> {
       ``,
       `<i>Cooldown: max ${config.copy.maxFiresPerTargetPerHour}/target/hour · dedup ${config.copy.dedupWindowSec}s</i>`,
     ].join("\n"),
-    { parse_mode: "HTML" }
+    { parse_mode: "HTML", reply_markup: targetsKeyboard(list) }
   );
 }
 
@@ -1556,6 +1716,260 @@ async function cmdImportDocument(ctx: Context): Promise<void> {
 
 // ── Button UI ─────────────────────────────────────────────────────────────
 
+// ── First-run setup ───────────────────────────────────────────────────────
+//
+// The wallet store used to be created over SSH by `wallets.js init`, which put
+// the recovery phrase on the terminal of whoever was deploying the box. Doing it
+// from chat instead puts the phrase in front of the person who actually owns the
+// wallets, and nobody else.
+//
+// The tradeoff is real and worth naming: a phrase shown in Telegram has crossed
+// Telegram's servers, and cloud chats are not end-to-end encrypted. That is why
+// the message carrying it is deleted on confirmation and, failing that, on a
+// timer — and why the warning below is not skippable.
+
+const PHRASE_TTL_MS = 10 * 60_000;
+const pendingBurn = new Map<number, NodeJS.Timeout>();
+
+const SETUP_HEADER = [
+  `<b>Copymint — setup</b>`,
+  ``,
+  `No wallet store exists yet, so there is nothing to mint with.`,
+  ``,
+  `Creating one generates a 12-word recovery phrase and shows it to you <b>once</b>.`,
+  `Have a pen ready before you tap.`,
+].join("\n");
+
+async function showSetup(ctx: Context): Promise<void> {
+  // A store on disk while the session is still down means creation succeeded
+  // but opening it did not — an RPC outage at exactly the wrong moment. The
+  // phrase is already generated, so offering "create" again would only refuse.
+  if (storeExists()) {
+    await ctx.reply(
+      [
+        `<b>Store exists, session down</b>`,
+        ``,
+        `The wallet store was created, but no chain could be reached to bring`,
+        `the bot online. Your recovery phrase is still valid — nothing is lost.`,
+        ``,
+        `Tap retry once the RPC endpoints are reachable.`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("↻ Retry", "s:retry") }
+    );
+    return;
+  }
+  await ctx.reply(SETUP_HEADER, { parse_mode: "HTML", reply_markup: setupMenu() });
+}
+
+async function cmdSetupRetry(ctx: Context): Promise<void> {
+  if (ready) {
+    await ctx.reply("Already running.", {
+      reply_markup: mainMenu(session.copyEnabled, targets.list().length),
+    });
+    return;
+  }
+  await startSession();
+  await ctx.reply(`<b>Back up.</b>\n\n${session.wallets().length} wallets ready.`, {
+    parse_mode: "HTML",
+    reply_markup: afterSetupMenu(),
+  });
+}
+
+async function cmdSetupExplain(ctx: Context): Promise<void> {
+  await ctx.reply(
+    [
+      `<b>What the store is</b>`,
+      ``,
+      `One 12-word BIP-39 phrase, encrypted on the server, from which every`,
+      `wallet is derived. Deriving 500 wallets writes nothing new — they all`,
+      `come out of those same 12 words, so one backup covers the whole set`,
+      `however many you generate later.`,
+      ``,
+      `<b>What the phrase is worth</b>`,
+      ``,
+      `Anyone holding it controls every derived wallet, permanently. It is`,
+      `shown once and is not recoverable from the server — the copy on disk is`,
+      `encrypted and the bot never displays it again.`,
+      ``,
+      `<b>Where it will appear</b>`,
+      ``,
+      `In this chat. Telegram cloud chats are not end-to-end encrypted, so the`,
+      `phrase passes through Telegram's servers on the way to you. The message`,
+      `is deleted once you confirm, and automatically after 10 minutes — but`,
+      `deletion is a cleanup, not a guarantee about what Telegram retained.`,
+      ``,
+      `<i>If that is not acceptable, stop here and create the store over SSH`,
+      `instead: </i><code>wallets.js init</code><i> prints it to a terminal and nothing`,
+      `else.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: setupMenu() }
+  );
+}
+
+async function cmdSetupWarn(ctx: Context): Promise<void> {
+  if (ready) {
+    await ctx.reply("A wallet store already exists — setup is done.", {
+      reply_markup: mainMenu(session.copyEnabled, targets.list().length),
+    });
+    return;
+  }
+  await ctx.reply(
+    [
+      `<b>Before you tap</b>`,
+      ``,
+      `The next message contains your recovery phrase in plain text.`,
+      ``,
+      `· Write it on paper. Not a screenshot, not a note app.`,
+      `· It is shown once and cannot be recovered afterwards.`,
+      `· Anyone who reads it owns every wallet this bot derives.`,
+      ``,
+      `The message is deleted when you confirm, and after 10 minutes if you`,
+      `don't. It still travelled through Telegram to reach you.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: setupConfirm() }
+  );
+}
+
+async function cmdSetupCreate(ctx: Context): Promise<void> {
+  if (ready || storeExists()) {
+    await ctx.reply("A wallet store already exists — refusing to overwrite it.");
+    return;
+  }
+
+  // The service unlocks the store from this variable on every restart, so the
+  // store must be sealed with exactly it. Creating one with a different secret
+  // would produce a store the bot could never open unattended.
+  const secret = (process.env.COPYMINT_PASSPHRASE || "").trim() || passphrase;
+  if (!secret) {
+    await ctx.reply(
+      "No passphrase is configured. Set <code>COPYMINT_PASSPHRASE</code> in " +
+        "<code>/etc/copymint/env</code> and restart the service.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const phrase = initNew(secret);
+  const chatId = ctx.chat!.id;
+
+  const sent = await ctx.reply(
+    [
+      `🔐 <b>RECOVERY PHRASE — write this down now</b>`,
+      ``,
+      `<code>${esc(phrase)}</code>`,
+      ``,
+      `<i>Restores every derived wallet. Shown once. Tap it to copy, but paper`,
+      `is what survives a lost phone.</i>`,
+      ``,
+      `<i>It does not back up imported keys — those live in imported.enc and`,
+      `need their own backup.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: phraseWritten() }
+  );
+
+  // Backstop: an operator who wanders off must not leave the phrase on screen.
+  pendingBurn.set(
+    chatId,
+    setTimeout(() => {
+      pendingBurn.delete(chatId);
+      void bot.api.deleteMessage(chatId, sent.message_id).catch(() => undefined);
+    }, PHRASE_TTL_MS)
+  );
+
+  try {
+    await startSession();
+  } catch (err) {
+    // The store is on disk and the phrase is in front of them; only the chain
+    // resolution failed. Say so plainly rather than letting it read as a
+    // failed creation they should retry from scratch.
+    await ctx.reply(
+      [
+        `<b>Store created — but no chain could be reached.</b>`,
+        ``,
+        esc((err as Error).message),
+        ``,
+        `<i>Your phrase is valid and the store is saved. Fix the RPC endpoints`,
+        `and tap retry — there is nothing to create again.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("↻ Retry", "s:retry") }
+    );
+    return;
+  }
+
+  await ctx.reply(
+    [
+      `<b>Store created.</b>`,
+      ``,
+      `${session.availableChains.length} chain(s) live · ${session.wallets().length} wallets derived`,
+      ``,
+      `Generate the wallet set next. It costs nothing and writes nothing new —`,
+      `the phrase you just wrote down already covers every one of them.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: afterSetupMenu() }
+  );
+}
+
+async function cmdSetupBurn(ctx: Context): Promise<void> {
+  const chatId = ctx.chat!.id;
+  const timer = pendingBurn.get(chatId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingBurn.delete(chatId);
+  }
+  await ctx.deleteMessage().catch(() => undefined);
+}
+
+/**
+ * Open the store and start everything that depends on it.
+ *
+ * Called at boot when a store already exists, and again mid-life the moment
+ * setup creates one — which is what lets the bot go from setup mode to fully
+ * operational without a restart.
+ */
+async function startSession(): Promise<void> {
+  session = await Session.open(config, passphrase);
+  ready = true;
+  console.log(`  ${session.wallets().length} wallets ready.`);
+  for (const chain of session.availableChains) {
+    console.log(
+      `  ${chain.name}: ${chain.rpc.endpoints.map((e) => e.label).join(", ")}` +
+        (chain.rpc.verified ? "" : "  (chain id unverified)")
+    );
+  }
+  await startBackground();
+}
+
+function notify(html: string): void {
+  const chat = config.telegram.allowedChatIds[0];
+  if (chat === undefined) return;
+  void bot.api
+    .sendMessage(chat, html, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })
+    .catch(() => {
+      /* a dropped notification must never break the pipeline */
+    });
+}
+
+/** Nonce hygiene and the copy-mint watcher — both need a live session. */
+async function startBackground(): Promise<void> {
+  session.startReconcile(30_000, (message) => {
+    console.log(`  ${message}`);
+    notify(`🔧 ${esc(message)}`);
+  });
+
+  // Telegram I/O happens only after bytes are on the wire.
+  await session.startCopy(
+    (event, chain) => renderCopyEvent(event, chain, notify),
+    (message, level) => {
+      console.log(`  ${message}`);
+      if (level === "warn") notify(`⚠️ ${esc(message)}`);
+    }
+  );
+
+  console.log(
+    `  Copy-mint: ${targets.list().length} target(s), firing ${session.copyEnabled ? "ON" : "OFF"}.`
+  );
+}
+
 function menuHeader(): string {
   const watched = targets.list().length;
   return [
@@ -1580,8 +1994,15 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
       text: `<b>Wallets</b>\n\n<i>Generating more costs nothing — they come from the same seed phrase you already wrote down.</i>`,
       keyboard: walletsMenu(),
     },
+    autofire: {
+      text:
+        `<b>Auto-fire</b>\n\n` +
+        `<i>Armed wallets spend on a copy signal without asking. Imported wallets ` +
+        `hold real value and stay manual until you say otherwise here.</i>`,
+      keyboard: autoFireMenu(),
+    },
     money: {
-      text: `<b>Money</b>\n\n<i>Funding tops wallets up to a target. Sweeping moves NFTs to the vault and leaves gas in place.</i>`,
+      text: `<b>Money</b>\n\n<i>Funding tops wallets up to a target. Sweeping moves NFTs to the vault and leaves gas in place. Reclaiming pulls the ETH back to the funder when a campaign is done.</i>`,
       keyboard: moneyMenu(),
     },
     copy: {
@@ -1682,6 +2103,8 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
       return runWithArgs(ctx, [flow.selector!, flow.amount!], cmdFund);
     case "sweep":
       return runWithArgs(ctx, ["all"], cmdSweep);
+    case "drain":
+      return runWithArgs(ctx, ["all"], cmdDrain);
     case "watch":
       return runWithArgs(ctx, [flow.contract!, flow.tier ?? "low"], cmdWatch);
   }
@@ -1698,6 +2121,26 @@ async function onCallback(ctx: Context): Promise<void> {
   const [prefix, ...rest] = data.split(":");
   const payload = rest.join(":");
 
+  // Setup buttons are the only ones that work before a store exists, and the
+  // only ones that keep working through the transition.
+  if (prefix === "s") {
+    switch (payload) {
+      case "explain":
+        return cmdSetupExplain(ctx);
+      case "warn":
+        return cmdSetupWarn(ctx);
+      case "create":
+        return cmdSetupCreate(ctx);
+      case "burn":
+        return cmdSetupBurn(ctx);
+      case "retry":
+        return cmdSetupRetry(ctx);
+      case "cancel":
+        return showSetup(ctx);
+    }
+    return;
+  }
+
   switch (prefix) {
     case "m":
       return showMenu(ctx, payload);
@@ -1710,6 +2153,10 @@ async function onCallback(ctx: Context): Promise<void> {
           return runWithArgs(ctx, ["all"], cmdWallets);
         case "balances":
           return runWithArgs(ctx, ["funded"], cmdWallets);
+        case "csv":
+          return cmdWalletsCsv(ctx);
+        case "autofire":
+          return runWithArgs(ctx, ["autofire"], cmdWallets);
         case "targets":
           return cmdTargets(ctx);
         case "caps":
@@ -1726,13 +2173,36 @@ async function onCallback(ctx: Context): Promise<void> {
     case "c":
       return runWithArgs(ctx, [payload], cmdCopy);
 
+    // Page through a wallet list. Stateless — the selector rides in the data.
+    case "wp": {
+      const [offset, ...selector] = rest;
+      return runWithArgs(ctx, [selector.join(":") || "all"], (c) =>
+        cmdWallets(c, Number(offset) || 0)
+      );
+    }
+
+    case "f": {
+      const [selector, state] = rest;
+      return runWithArgs(ctx, [selector, state], cmdAutoFire);
+    }
+
+    case "uw":
+      return runWithArgs(ctx, [payload], cmdUnwatch);
+
     case "i": {
       const kind = payload as Flow["kind"];
-      const flow = startFlow(chatId, kind, kind === "sweep" ? "ready" : "contract");
+      const flow = startFlow(chatId, kind, kind === "sweep" || kind === "drain" ? "ready" : "contract");
       if (kind === "sweep") {
         await ctx.reply(
           `<b>Sweep</b>\n\nMove every NFT found in your wallets to the vault:\n<code>${esc(config.vault)}</code>\n\n<i>ETH is left in place so wallets stay armed.</i>`,
           { parse_mode: "HTML", reply_markup: simpleConfirm("Sweep") }
+        );
+        return;
+      }
+      if (kind === "drain") {
+        await ctx.reply(
+          `<b>Reclaim ETH</b>\n\nSend the ETH in every wallet back to the funder:\n<code>${esc(config.funder)}</code>\n\n<i>Each wallet keeps only its own transfer cost. This leaves the set unarmed — fund again before minting.</i>`,
+          { parse_mode: "HTML", reply_markup: simpleConfirm("Reclaim") }
         );
         return;
       }
@@ -1834,6 +2304,11 @@ let bot: Bot;
 let passphrase: string;
 
 async function main(): Promise<void> {
+  // A fresh box has no config to read. Writing the default first means the
+  // operator can fill in vault and funder straight after setup.sh, without
+  // having to run the wallet tool just to get a file on disk.
+  writeDefaultConfig();
+
   try {
     config = loadConfig();
   } catch (err) {
@@ -1856,16 +2331,6 @@ async function main(): Promise<void> {
     passphrase = await askPassphrase("  Store passphrase: ");
   }
 
-  console.log("  Unlocking store and deriving wallets…");
-  session = await Session.open(config, passphrase);
-  console.log(`  ${session.wallets().length} wallets ready.`);
-  for (const chain of session.availableChains) {
-    console.log(
-      `  ${chain.name}: ${chain.rpc.endpoints.map((e) => e.label).join(", ")}` +
-        (chain.rpc.verified ? "" : "  (chain id unverified)")
-    );
-  }
-
   bot = new Bot(config.telegramToken);
 
   // Whitelist. Everything below this line is unreachable from any other chat.
@@ -1876,6 +2341,18 @@ async function main(): Promise<void> {
       return;
     }
     await next();
+  });
+
+  // Setup gate. Until a store exists there is no session to operate on, so
+  // nothing downstream may run — every route below can assume `session` is
+  // live because this refuses everything except the setup buttons.
+  bot.use(async (ctx, next) => {
+    if (ready) return next();
+    if ((ctx.callbackQuery?.data ?? "").startsWith("s:")) return next();
+    // Only a callback update has a query to answer — asking otherwise throws
+    // synchronously and would swallow the setup screen.
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => undefined);
+    await showSetup(ctx);
   });
 
   bot.command(["start", "menu"], (ctx) =>
@@ -1893,6 +2370,7 @@ async function main(): Promise<void> {
   bot.command("untag", (ctx) => cmdTag(ctx, true).catch((e) => fail(ctx, e)));
   bot.command("fund", (ctx) => cmdFund(ctx).catch((e) => fail(ctx, e)));
   bot.command("sweep", (ctx) => cmdSweep(ctx).catch((e) => fail(ctx, e)));
+  bot.command("drain", (ctx) => cmdDrain(ctx).catch((e) => fail(ctx, e)));
   bot.command("mint", (ctx) => cmdMint(ctx).catch((e) => fail(ctx, e)));
   bot.command("check", (ctx) => cmdCheck(ctx).catch((e) => fail(ctx, e)));
   bot.command("allowlist", (ctx) => cmdAllowList(ctx).catch((e) => fail(ctx, e)));
@@ -1909,34 +2387,16 @@ async function main(): Promise<void> {
 
   bot.catch((err) => console.error("  Bot error:", err.message));
 
-  // Nonce hygiene runs off the critical path and reports to the first allowed chat.
-  const noticeChat = config.telegram.allowedChatIds[0];
-  const notify = (html: string): void => {
-    void bot.api
-      .sendMessage(noticeChat, html, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })
-      .catch(() => {
-        /* a dropped notification must never break the pipeline */
-      });
-  };
-
-  session.startReconcile(30_000, (message) => {
-    console.log(`  ${message}`);
-    notify(`🔧 ${esc(message)}`);
-  });
-
-  // Copy-mint watcher. Telegram I/O happens only after bytes are on the wire.
-  await session.startCopy(
-    (event, chain) => renderCopyEvent(event, chain, notify),
-    (message, level) => {
-      console.log(`  ${message}`);
-      if (level === "warn") notify(`⚠️ ${esc(message)}`);
-    }
-  );
-
-  const watchCount = targets.list().length;
-  console.log(
-    `  Copy-mint: ${watchCount} target(s), firing ${session.copyEnabled ? "ON" : "OFF"}.`
-  );
+  // A store on disk means a normal boot. Without one the bot still comes up,
+  // but in setup mode — the owner creates the store from chat, and startSession
+  // brings everything below online without a restart.
+  if (storeExists()) {
+    console.log("  Unlocking store and deriving wallets…");
+    await startSession();
+  } else {
+    console.log("  No wallet store yet — starting in setup mode.");
+    console.log("  Message the bot and tap “Create wallet store”.");
+  }
 
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());

@@ -94,7 +94,7 @@ three QuickNode URLs.
 ```
 TELEGRAM_BOT_TOKEN=your token
 OPENSEA_API_KEY=your key
-COPYMINT_PASSPHRASE=chosen in step 6
+COPYMINT_PASSPHRASE=any strong passphrase you choose now
 
 RPC_URL_ETHEREUM=https://….ethereum-mainnet.quiknode.pro/…/
 RPC_URL_BASE=https://….base-mainnet.quiknode.pro/…/
@@ -103,8 +103,11 @@ RPC_URL_ROBINHOOD=https://….robinhood-mainnet.quiknode.pro/…/
 RPC_MAX_CALLS_PER_SEC=45
 ```
 
-`Ctrl+O` to save, `Ctrl+X` to exit. Come back for the passphrase line once
-step 6 has set it.
+`Ctrl+O` to save, `Ctrl+X` to exit.
+
+Set `COPYMINT_PASSPHRASE` now, before first start — the wallet store gets sealed
+with whatever is in this variable, and the service unlocks it with the same one
+on every restart.
 
 > **The passphrase tradeoff.** Storing it here is what lets the service restart
 > unattended at 4am. But a passphrase sitting beside the encrypted seed means
@@ -112,44 +115,12 @@ step 6 has set it.
 > against someone who already has root.
 >
 > Leave it blank if you'd rather unlock by hand. The service will start and exit
-> immediately after every reboot until you do.
+> immediately after every reboot until you do — and the Telegram setup flow in
+> step 8 cannot create the store without it.
 
 ---
 
-## 6. Create the wallet store
-
-Run as the `copymint` user so files end up owned by the account the service
-runs as.
-
-```bash
-sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
-  node /opt/copymint/dist/tools/wallets.js init
-
-sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
-  node /opt/copymint/dist/tools/wallets.js generate 500
-```
-
-`init` asks for a passphrase twice, prints a 12-word recovery phrase once, and
-clears the screen when you press Enter.
-
-> **One bot per seed — this one bites.**
->
-> If you restore your desktop mnemonic here and both bots ever run at once, they
-> will each track nonces independently for the same addresses and collide:
-> transactions replacing each other, wallets stuck behind gaps.
->
-> Pick one home. Either create a **fresh** store here and retire the desktop
-> one, or use `wallets.js restore` to bring the desktop seed over and never run
-> the desktop bot again. Your ten desktop wallets hold nothing, so a fresh store
-> costs you nothing.
-
-> **Write the phrase on paper.** It restores every derived wallet and is shown
-> exactly once. It does **not** back up imported keys — those live in
-> `imported.enc` and need their own backup.
-
----
-
-## 7. Point the config at your addresses
+## 6. Point the config at your addresses
 
 ```bash
 nano /var/lib/copymint/config.json
@@ -170,12 +141,15 @@ Leave `copy.enabled` as `false` until you've watched real signals for a while.
 
 ---
 
-## 8. Start it, and claim your chat id
+## 7. Start it, and claim your chat id
 
 ```bash
 systemctl start copymint
 journalctl -u copymint -f
 ```
+
+The log says `No wallet store yet — starting in setup mode.` That's expected —
+there's nothing to mint with until step 8.
 
 Open Telegram, find your bot, send `/start`. The log prints:
 
@@ -184,12 +158,60 @@ Rejected message from chat 123456789
 ```
 
 That's the whitelist working. Put the number in `allowedChatIds`, restart, and
-send `/start` again — this time you get the menu.
+send `/start` again.
 
 ```bash
 nano /var/lib/copymint/config.json
 systemctl restart copymint
 ```
+
+---
+
+## 8. Create the wallet store — from Telegram
+
+This is the step that used to live on this terminal. It doesn't any more.
+
+Send `/start`. With no store on disk the bot answers with a setup screen rather
+than the main menu:
+
+- **❔ What is this?** — what the phrase controls and where it will appear.
+- **🔐 Create wallet store** — warns first, then shows the phrase.
+
+Tapping through generates the 12-word phrase and prints it **in the chat**. Write
+it on paper, then tap **"Written down — delete this message"**. If nobody taps,
+the message deletes itself after ten minutes.
+
+The bot then comes up fully — no restart needed — and offers **➕ Generate 500
+wallets**. Tap it. Deriving costs nothing and writes nothing new: all 500 come
+out of the phrase you just wrote down.
+
+> **The phrase goes through Telegram.** Cloud chats are not end-to-end
+> encrypted, so it passes through Telegram's servers on the way to whoever is
+> reading. Deleting the message is cleanup, not a guarantee about what was
+> retained. The tradeoff buys something real — the phrase is seen by the person
+> who owns the wallets, not by whoever holds the server's SSH session — but it
+> is a tradeoff, not a free win.
+>
+> To avoid it entirely, create the store on the terminal *before* first start
+> and the bot will never enter setup mode:
+> ```bash
+> sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
+>   node /opt/copymint/dist/tools/wallets.js init
+> ```
+
+> **One bot per seed — this one bites.**
+>
+> If you restore your desktop mnemonic here and both bots ever run at once, they
+> will each track nonces independently for the same addresses and collide:
+> transactions replacing each other, wallets stuck behind gaps.
+>
+> Pick one home. Either create a **fresh** store here and retire the desktop
+> one, or use `wallets.js restore` to bring the desktop seed over and never run
+> the desktop bot again. Your ten desktop wallets hold nothing, so a fresh store
+> costs you nothing.
+
+> **The phrase does not back up imported keys.** Those live in `imported.enc`
+> and need their own backup.
 
 ---
 
