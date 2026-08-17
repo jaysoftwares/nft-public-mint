@@ -627,6 +627,23 @@ async function main(): Promise<void> {
   check("backoff is capped", OPEN_POLL.maxBackoffMs >= OPEN_POLL.firstBackoffMs);
   check("the hold gives up eventually", OPEN_POLL.graceMs > 0 && OPEN_POLL.graceMs <= 600_000);
 
+  // Measured at a real open: an 8s default timeout on a hung first probe put
+  // detection 9s past the stage opening. A probe asks a yes/no question and is
+  // cheap to repeat, so it should be abandoned well before that.
+  check(
+    "a probe is abandoned faster than the default request timeout",
+    OPEN_POLL.probeTimeoutMs <= 3_000,
+    `${OPEN_POLL.probeTimeoutMs}ms`
+  );
+  check(
+    "…but escalates so a merely slow endpoint still gets answered",
+    OPEN_POLL.maxProbeTimeoutMs > OPEN_POLL.probeTimeoutMs
+  );
+  check(
+    "a hung probe cannot delay detection by more than its timeout plus the gap",
+    OPEN_POLL.probeTimeoutMs + OPEN_POLL.tightMs < 5_000
+  );
+
   // The worst case that matters: how many requests a full grace period of
   // tight probing would spend if the stage never opened at all.
   const worstCaseProbes = Math.ceil(OPEN_POLL.graceMs / OPEN_POLL.tightMs);

@@ -204,6 +204,20 @@ export const OPEN_POLL = {
   floorMs: 400,
   /** Give up this long after the stage was supposed to open. */
   graceMs: 180_000,
+  /**
+   * Timeout for a probe, and the ceiling it escalates to.
+   *
+   * Measured live at the 16:00Z open: the first probe hung and took the full
+   * 8s default with it, so detection landed 9s after the stage opened rather
+   * than inside a second. A probe is asking a yes/no question and is cheap to
+   * repeat, so a hung one should be abandoned quickly rather than waited on.
+   *
+   * It escalates on consecutive timeouts because the opposite failure is worse:
+   * if the endpoint is merely slow under load, a fixed short timeout would
+   * abandon every attempt and never get an answer at all. Any answer resets it.
+   */
+  probeTimeoutMs: 2_500,
+  maxProbeTimeoutMs: 8_000,
   /** Applied to the interval after a 429, and the ceiling it climbs to. */
   backoffFactor: 2,
   firstBackoffMs: 2_000,
@@ -318,6 +332,7 @@ export async function holdUntilOpen(
 
   let attempts = 0;
   let backoffMs = 0;
+  let probeTimeoutMs = OPEN_POLL.probeTimeoutMs;
   let lastReason = "waiting for the stage to open";
 
   for (;;) {
@@ -349,7 +364,13 @@ export async function holdUntilOpen(
       // Calldata in hand means a stage is live, eligible and priced for this
       // wallet — even if it is not the one that was being waited for. That is a
       // mint the operator asked for, and maxUnitPriceWei still gates the cost.
-      const tx = await fetchMintCalldata(deps.apiKey, req.slug, prober.address, req.quantity);
+      const tx = await fetchMintCalldata(
+        deps.apiKey,
+        req.slug,
+        prober.address,
+        req.quantity,
+        probeTimeoutMs
+      );
       emit({
         type: "open",
         attempts,
@@ -367,6 +388,14 @@ export async function holdUntilOpen(
       if (signal === "open") {
         emit({ type: "open", attempts, waitedMs: Date.now() - startedAt, hadCalldata: false });
         return undefined;
+      }
+
+      // A timeout is not an answer, so the next attempt waits a little longer
+      // for one. Anything the endpoint actually said resets the patience.
+      if (apiError === undefined && /abort|timeout/i.test(lastReason)) {
+        probeTimeoutMs = Math.min(OPEN_POLL.maxProbeTimeoutMs, Math.round(probeTimeoutMs * 1.6));
+      } else {
+        probeTimeoutMs = OPEN_POLL.probeTimeoutMs;
       }
 
       // Only a throttle earns a longer gap. Backing off on "not currently
