@@ -3,6 +3,8 @@ Description=Copymint bot
 Documentation=https://github.com/morsyxbt/nft-public-mint
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -21,8 +23,6 @@ ExecStart=/usr/bin/node dist/bot/index.js
 # stopped unit rather than an infinite crash loop.
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 # The wallet store is the only thing worth protecting on this box, so the
 # process gets no more of the filesystem than it needs.
@@ -38,7 +38,10 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+
+# Node/V8's JIT changes generated code pages from writable to executable.
+# MemoryDenyWriteExecute blocks that transition and makes Node abort with
+# SIGTRAP before the bot can start.
 
 StandardOutput=journal
 StandardError=journal
