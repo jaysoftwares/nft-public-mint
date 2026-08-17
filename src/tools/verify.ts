@@ -9,7 +9,7 @@
 // than against itself, so a wrong derivation path fails loudly instead of being
 // consistently wrong.
 
-import { rmSync, existsSync } from "node:fs";
+import { rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -43,6 +43,8 @@ import {
 } from "../core/allowlist";
 import { id as ethersId, TypedDataEncoder } from "ethers";
 import { inspectCalldata } from "../core/mint-opensea";
+import { writeDefaultConfig, updateOwnerSettings, ConfigError } from "../core/config";
+import { OwnershipClaims } from "../bot/ownership";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 import {
   deriveDigest,
@@ -108,6 +110,45 @@ async function main(): Promise<void> {
       () => unsealJson({ ...envelope, ct: Buffer.from("tampered").toString("base64") }, passphrase),
       DecryptError
     )
+  );
+
+  // ── owner settings ────────────────────────────────────────────────────
+  section("owner settings");
+  const configPath = writeDefaultConfig();
+  const savedSettings = updateOwnerSettings({
+    destination: VECTORS[0].toLowerCase(),
+    allowedChatIds: [12345, 12345],
+  });
+  const savedConfig = JSON.parse(readFileSync(configPath, "utf8"));
+  check("destination is checksummed", savedSettings.destination === VECTORS[0]);
+  check("vault is persisted", savedConfig.vault === VECTORS[0]);
+  check("funder follows the destination", savedConfig.funder === VECTORS[0]);
+  check("owner whitelist is deduplicated", savedConfig.telegram.allowedChatIds.length === 1);
+  check(
+    "invalid destination is rejected",
+    throws(() => updateOwnerSettings({ destination: "not-an-address" }), ConfigError)
+  );
+  check(
+    "empty owner whitelist is rejected",
+    throws(() => updateOwnerSettings({ allowedChatIds: [] }), ConfigError)
+  );
+
+  const claims = new OwnershipClaims(1_000);
+  const claim = claims.issue(12345, 10_000);
+  check(
+    "wrong ownership token is rejected",
+    claims.consumeStart(`/start claim_${"0".repeat(32)}`, 10_100).kind === "invalid"
+  );
+  const accepted = claims.consumeStart(`/start claim_${claim.token}`, 10_100);
+  check("ownership token identifies issuer", accepted.kind === "valid" && accepted.issuedBy === 12345);
+  check(
+    "ownership token is single-use",
+    claims.consumeStart(`/start claim_${claim.token}`, 10_100).kind === "invalid"
+  );
+  const expired = claims.issue(12345, 20_000);
+  check(
+    "ownership token expires",
+    claims.consumeStart(`/start claim_${expired.token}`, 21_001).kind === "expired"
   );
 
   // ── wallet store ──────────────────────────────────────────────────────

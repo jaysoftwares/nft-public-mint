@@ -1,10 +1,8 @@
 // Telegram bot entry point.
 //
-// Access control is two-layered, as designed. The chat-id whitelist keeps
-// strangers out. The pinned vault and funder addresses in config.json keep a
-// *compromised* account from being useful: every command below can move value
-// only toward addresses that are unreachable from chat, so an attacker holding
-// your Telegram session can waste gas and nothing else.
+// The chat-id whitelist keeps strangers out. The authorized owner can change
+// the payout address through a confirmed settings flow, so control of that
+// Telegram account must be treated as control of the bot.
 //
 // The passphrase is never a chat command — it comes from the environment or the
 // console at boot.
@@ -12,7 +10,13 @@
 import { Bot, InputFile, Context, InlineKeyboard } from "grammy";
 import { isAddress, getAddress, parseEther } from "ethers";
 import { config as loadEnv } from "dotenv";
-import { loadConfig, writeDefaultConfig, ResolvedConfig, ConfigError } from "../core/config";
+import {
+  loadConfig,
+  writeDefaultConfig,
+  updateOwnerSettings,
+  ResolvedConfig,
+  ConfigError,
+} from "../core/config";
 import { Session, ChainContext } from "./session";
 import { ManagedWallet } from "../core/wallet-store";
 import { readImportBlob, initNew, storeExists } from "../core/wallet-store";
@@ -58,6 +62,7 @@ import {
 } from "../core/mint-opensea";
 import { StatusCard, esc, eth, bar, short, toCsv, txLink } from "./ui";
 import { askPassphrase } from "../tools/tty";
+import { OwnershipClaims } from "./ownership";
 import {
   Flow,
   startFlow,
@@ -83,6 +88,8 @@ import {
   setupConfirm,
   phraseWritten,
   afterSetupMenu,
+  settingsMenu,
+  destinationConfirm,
 } from "./menu";
 
 loadEnv();
@@ -100,6 +107,7 @@ let config: ResolvedConfig;
  * session is guaranteed.
  */
 let ready = false;
+const ownershipClaims = new OwnershipClaims();
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -223,6 +231,9 @@ whichever you're eligible for. Times are UTC.
 /unwatch &lt;address&gt; · /targets — manage the watch list
 /copy on|off — autonomous firing kill switch
 /caps — spend limits and today's usage
+
+<b>Owner</b>
+/settings — payout address and secure ownership transfer
 
 <b>Selectors</b>
 <code>all</code> <code>derived</code> <code>imported</code> <code>funded</code> <code>stuck</code> <code>autofire</code> <code>manual</code>
@@ -616,8 +627,8 @@ async function cmdSweep(ctx: Context): Promise<void> {
  *
  * The counterpart to /fund, for when a campaign is over and the gas is better
  * off in one place than smeared across 500 wallets. It lands at the funder
- * address pinned in config.json — like every other outward path here, chat
- * cannot redirect it.
+ * address in owner settings. Changing that destination requires the authorized
+ * Telegram owner and an explicit confirmation.
  */
 async function cmdDrain(ctx: Context): Promise<void> {
   const selector = args(ctx)[0] ?? "all";
@@ -1714,6 +1725,131 @@ async function cmdImportDocument(ctx: Context): Promise<void> {
   }
 }
 
+// ── Owner settings ────────────────────────────────────────────────────────
+
+async function showOwnerSettings(ctx: Context): Promise<void> {
+  await ctx.reply(
+    [
+      `<b>Owner settings</b>`,
+      ``,
+      `Payout address`,
+      `<code>${esc(config.vault)}</code>`,
+      ``,
+      `NFT sweeps and reclaimed ETH go here. Funding also uses this address,`,
+      `so its private key must be imported before the Fund action can spend from it.`,
+      ``,
+      `<i>Changing it affects future actions only. Existing assets do not move.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
+  );
+}
+
+async function beginDestinationChange(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+  startFlow(chatId, "destination", "address");
+  await ctx.reply(
+    [
+      `<b>Change payout address</b>`,
+      ``,
+      `Send the Ethereum/Base <code>0x…</code> address that should receive`,
+      `NFT sweeps and reclaimed ETH. You will confirm it before it is saved.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: backTo("cfg:menu", "✕ Cancel") }
+  );
+}
+
+async function saveDestination(ctx: Context, value: string): Promise<void> {
+  if (!isAddress(value)) {
+    await ctx.reply("That payout address is invalid. Start again from Settings.");
+    return;
+  }
+  const destination = getAddress(value);
+  updateOwnerSettings({ destination });
+  config.vault = destination;
+  config.funder = destination;
+  clearFlow(ctx.chat!.id);
+  await ctx.reply(
+    [
+      `<b>Payout address saved</b>`,
+      ``,
+      `<code>${esc(destination)}</code>`,
+      ``,
+      `<i>Future sweeps and reclaimed ETH use this address.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
+  );
+}
+
+async function beginOwnershipTransfer(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+  if (ctx.chat?.type !== "private") {
+    await ctx.reply("Ownership can only be transferred from a private chat with the bot.");
+    return;
+  }
+
+  const claim = ownershipClaims.issue(chatId);
+  const me = await bot.api.getMe();
+  const link = `https://t.me/${me.username}?start=claim_${claim.token}`;
+  await ctx.reply(
+    [
+      `<b>Transfer ownership</b>`,
+      ``,
+      `Forward this one-time link to the new owner:`,
+      `<code>${esc(link)}</code>`,
+      ``,
+      `It expires in 10 minutes, works once, and is cancelled by a bot restart.`,
+      `Opening it makes that private`,
+      `chat the sole authorized owner and removes this chat's access.`,
+      ``,
+      `<i>Anyone holding the link during those 10 minutes can claim the bot.</i>`,
+    ].join("\n"),
+    {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: settingsMenu(!ready),
+    }
+  );
+}
+
+/** Handle an ownership deep link before the normal whitelist rejects it. */
+async function tryOwnershipClaim(ctx: Context): Promise<boolean> {
+  const text = (ctx.message?.text ?? "").trim();
+  const result = ownershipClaims.consumeStart(text);
+  if (result.kind === "none") return false;
+
+  if (ctx.chat?.type !== "private" || ctx.chat.id === undefined) {
+    await ctx.reply("Open the ownership link in a private chat with the bot.");
+    return true;
+  }
+  if (result.kind === "invalid" || result.kind === "expired") {
+    await ctx.reply("That ownership link is invalid or expired. Ask the current owner for a new one.");
+    return true;
+  }
+
+  const newOwner = ctx.chat.id;
+  updateOwnerSettings({ allowedChatIds: [newOwner] });
+  config.telegram.allowedChatIds = [newOwner];
+  console.log(`  Ownership transferred to chat ${newOwner}.`);
+
+  if (result.issuedBy !== newOwner) {
+    void bot.api
+      .sendMessage(result.issuedBy, "Ownership was transferred. This chat no longer controls the bot.")
+      .catch(() => undefined);
+  }
+
+  await ctx.reply(
+    [
+      `<b>You now own this bot.</b>`,
+      ``,
+      `Set the payout address below, then create the wallet store when you are ready.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
+  );
+  return true;
+}
+
 // ── Button UI ─────────────────────────────────────────────────────────────
 
 // ── First-run setup ───────────────────────────────────────────────────────
@@ -2107,6 +2243,8 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
       return runWithArgs(ctx, ["all"], cmdDrain);
     case "watch":
       return runWithArgs(ctx, [flow.contract!, flow.tier ?? "low"], cmdWatch);
+    case "destination":
+      return;
   }
 }
 
@@ -2137,6 +2275,23 @@ async function onCallback(ctx: Context): Promise<void> {
         return cmdSetupRetry(ctx);
       case "cancel":
         return showSetup(ctx);
+    }
+    return;
+  }
+
+  // Owner settings remain available in first-run setup mode, before a wallet
+  // store or Session exists.
+  if (prefix === "cfg") {
+    const [action, ...values] = rest;
+    switch (action) {
+      case "menu":
+        return showOwnerSettings(ctx);
+      case "destination":
+        return beginDestinationChange(ctx);
+      case "save":
+        return saveDestination(ctx, values.join(":"));
+      case "transfer":
+        return beginOwnershipTransfer(ctx);
     }
     return;
   }
@@ -2278,6 +2433,26 @@ async function onText(ctx: Context): Promise<void> {
   const flow = getFlow(chatId);
   if (!flow) return;
 
+  if (flow.kind === "destination" && flow.step === "address") {
+    if (!isAddress(text)) {
+      await ctx.reply("That doesn't look like an address. Send a 0x… address, or tap Cancel.");
+      return;
+    }
+    flow.address = getAddress(text);
+    flow.step = "ready";
+    await ctx.reply(
+      [
+        `<b>Confirm payout address</b>`,
+        ``,
+        `<code>${esc(flow.address)}</code>`,
+        ``,
+        `NFT sweeps and reclaimed ETH will go here.`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: destinationConfirm(flow.address, !ready) }
+    );
+    return;
+  }
+
   if (flow.step === "contract" || flow.step === "address") {
     if (!isAddress(text)) {
       await ctx.reply("That doesn't look like an address. Send a 0x… address, or tap Cancel.");
@@ -2337,6 +2512,7 @@ async function main(): Promise<void> {
   bot.use(async (ctx, next) => {
     const chatId = ctx.chat?.id;
     if (chatId === undefined || !config.telegram.allowedChatIds.includes(chatId)) {
+      if (await tryOwnershipClaim(ctx)) return;
       console.warn(`  Rejected message from chat ${chatId}`);
       return;
     }
@@ -2348,7 +2524,11 @@ async function main(): Promise<void> {
   // live because this refuses everything except the setup buttons.
   bot.use(async (ctx, next) => {
     if (ready) return next();
-    if ((ctx.callbackQuery?.data ?? "").startsWith("s:")) return next();
+    const callback = ctx.callbackQuery?.data ?? "";
+    if (callback.startsWith("s:") || callback.startsWith("cfg:")) return next();
+    if ((ctx.message?.text ?? "").startsWith("/settings")) return next();
+    const chatId = ctx.chat?.id;
+    if (chatId !== undefined && getFlow(chatId)?.kind === "destination") return next();
     // Only a callback update has a query to answer — asking otherwise throws
     // synchronously and would swallow the setup screen.
     if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => undefined);
@@ -2361,6 +2541,7 @@ async function main(): Promise<void> {
       reply_markup: mainMenu(session.copyEnabled, targets.list().length),
     })
   );
+  bot.command("settings", (ctx) => showOwnerSettings(ctx));
   bot.command("help", (ctx) => ctx.reply(HELP, { parse_mode: "HTML" }));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));

@@ -15,7 +15,15 @@
 
 import { InlineKeyboard } from "grammy";
 
-export type FlowKind = "mint" | "fcfs" | "fund" | "watch" | "sweep" | "check" | "drain";
+export type FlowKind =
+  | "mint"
+  | "fcfs"
+  | "fund"
+  | "watch"
+  | "sweep"
+  | "check"
+  | "drain"
+  | "destination";
 
 export interface Flow {
   kind: FlowKind;
@@ -26,6 +34,7 @@ export interface Flow {
   selector?: string;
   amount?: string;
   tier?: string;
+  address?: string;
   waitForOpen?: boolean;
   startedAt: number;
 }
@@ -67,7 +76,25 @@ export function mainMenu(copyOn: boolean, watching: number): InlineKeyboard {
     .text("📊 Status", "a:status")
     .text(copyOn ? `🟢 Copy ON (${watching})` : "🔴 Copy OFF", "m:copy")
     .row()
+    .text("⚙️ Settings", "cfg:menu")
+    .row()
     .text("❔ Command help", "a:help");
+}
+
+export function settingsMenu(duringSetup = false): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🎯 Change payout address", "cfg:destination")
+    .row()
+    .text("👤 Transfer ownership", "cfg:transfer")
+    .row()
+    .text("‹ Back", duringSetup ? "s:cancel" : "m:main");
+}
+
+export function destinationConfirm(address: string, duringSetup = false): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Save payout address", `cfg:save:${address}`)
+    .row()
+    .text("✕ Cancel", duringSetup ? "cfg:menu" : "m:main");
 }
 
 export function mintMenu(): InlineKeyboard {
@@ -256,6 +283,8 @@ export function backTo(target: string, label = "‹ Back"): InlineKeyboard {
 export function setupMenu(): InlineKeyboard {
   return new InlineKeyboard()
     .text("🔐 Create wallet store", "s:warn")
+    .row()
+    .text("⚙️ Owner settings", "cfg:menu")
     .row()
     .text("❔ What is this?", "s:explain");
 }

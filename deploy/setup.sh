@@ -125,6 +125,10 @@ $(printf '\033[1mRemaining steps — these need you\033[0m')
        journalctl -u copymint -n 20
      It logs the id it rejected. Put that in allowedChatIds and restart.
 
+     Deploying for someone else? Once the bot starts, open Owner settings,
+     tap Transfer ownership, and send the one-time link to the real owner.
+     They can set the payout address from Telegram without SSH.
+
   3. Start it:
        systemctl start copymint
        journalctl -u copymint -f

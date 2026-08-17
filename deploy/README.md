@@ -49,16 +49,23 @@ who already has root. If you would rather it never touch the disk, leave it
 blank and unlock by hand after each restart — the service will exit immediately
 on boot until you do.
 
-**2. Config** — `nano /var/lib/copymint/config.json`. Set `vault`, `funder` and
-`telegram.allowedChatIds`.
+**2. Bootstrap config** — `nano /var/lib/copymint/config.json`. Set `vault`,
+`funder` and `telegram.allowedChatIds` once so the service can start. The two
+addresses may be the same temporary address during handoff.
 
 For the chat id: start the service, message the bot, then read
 `journalctl -u copymint -n 20`. It logs the id it rejected. Add that id and
 restart.
 
-The vault and funder addresses are deliberately unreachable from Telegram. A
-compromised Telegram account can make the bot mint and sweep, but everything it
-moves still lands at an address only changeable over SSH.
+After startup, the authorized chat can open **Owner settings** to change the
+payout address or create a one-time, 10-minute ownership-transfer link. The new
+owner opens that link, becomes the sole authorized chat, and can replace the
+temporary payout address without SSH.
+
+That convenience changes the security boundary: control of the authorized
+Telegram account includes the ability to redirect future sweeps. Protect it
+with Telegram two-step verification. Existing assets are never moved by a
+settings change.
 
 **3. Start**
 
@@ -70,10 +77,11 @@ journalctl -u copymint -f
 **4. Wallet store** — created from Telegram, not from here.
 
 With no store on disk the bot boots into **setup mode**: the whitelist still
-applies, but the only buttons that do anything are the setup ones. Whoever owns
-the wallets sends `/start`, taps through the warning, and the 12-word recovery
-phrase is shown in their chat. The message is deleted on confirmation, and after
-ten minutes regardless. The session then comes up in place — no restart.
+applies, and only setup and owner-settings buttons work. Transfer ownership
+first when the installer and wallet owner are different. The owner then taps
+through the wallet warning, and the 12-word recovery phrase is shown in their
+chat. The message is deleted on confirmation, and after ten minutes regardless.
+The session then comes up in place — no restart.
 
 This exists so the phrase is seen by the wallets' owner rather than by whoever is
 holding the SSH session. The cost is that it travels through Telegram, whose

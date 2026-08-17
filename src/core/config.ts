@@ -1,11 +1,8 @@
-// Bot configuration, loaded from disk and never writable from chat.
-//
-// The vault and funder addresses are the security boundary agreed in the design:
-// a fully compromised Telegram account can make the bot mint and sweep, but
-// every wei it moves still lands at an address only reachable over SSH. Nothing
-// in bot/ may write this file.
+// Bot configuration, loaded from disk. Most policy stays SSH-only, while the
+// small owner-settings surface (destination + authorized chat) is persisted by
+// an explicit, confirmed Telegram flow.
 
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
 import { getAddress, parseEther, parseUnits } from "ethers";
 import { CHAINS, resolveChain } from "../chains";
 import { FILES, ensureStateDir } from "./paths";
@@ -64,9 +61,9 @@ export interface SignedConfig {
 
 export interface BotConfig {
   chain: string;
-  /** Sweep destination. Pinned here, unreachable from Telegram. */
+  /** Sweep destination. Changeable only by the authorized owner settings flow. */
   vault: string;
-  /** The wallet permitted to disperse funds. Pinned here. */
+  /** The wallet permitted to disperse funds. Updated with the owner destination. */
   funder: string;
   /** How many derived wallets stay funded for copy-mint. */
   hotSetSize: number;
@@ -183,6 +180,80 @@ export function writeDefaultConfig(): string {
     mode: 0o600,
   });
   return path;
+}
+
+export interface OwnerSettingsUpdate {
+  /** Sets both vault and funder to one deliberately confirmed address. */
+  destination?: string;
+  /** Replaces the whitelist; ownership transfer always supplies exactly one. */
+  allowedChatIds?: number[];
+}
+
+/**
+ * Persist the narrow settings surface that the Telegram owner may change.
+ *
+ * Everything else in config.json remains SSH-only. Writing through a sibling
+ * temporary file keeps a crash from leaving half-written JSON behind.
+ */
+export function updateOwnerSettings(update: OwnerSettingsUpdate): {
+  destination?: string;
+  allowedChatIds?: number[];
+} {
+  const path = FILES.config();
+  if (!existsSync(path)) {
+    throw new ConfigError(`No config at ${path}.`);
+  }
+
+  let raw: BotConfig;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8")) as BotConfig;
+  } catch (err) {
+    throw new ConfigError(`config.json is not valid JSON: ${(err as Error).message}`);
+  }
+
+  const result: { destination?: string; allowedChatIds?: number[] } = {};
+
+  if (update.destination !== undefined) {
+    try {
+      const destination = getAddress(update.destination.trim());
+      raw.vault = destination;
+      raw.funder = destination;
+      result.destination = destination;
+    } catch {
+      throw new ConfigError(`That is not a valid Ethereum address: ${update.destination}`);
+    }
+  }
+
+  if (update.allowedChatIds !== undefined) {
+    const ids = [...new Set(update.allowedChatIds)];
+    if (
+      ids.length === 0 ||
+      ids.some((id) => !Number.isSafeInteger(id) || id === 0)
+    ) {
+      throw new ConfigError("At least one valid Telegram chat id is required.");
+    }
+    raw.telegram = { ...(raw.telegram ?? {}), allowedChatIds: ids };
+    result.allowedChatIds = ids;
+  }
+
+  if (result.destination === undefined && result.allowedChatIds === undefined) {
+    throw new ConfigError("No owner setting was supplied.");
+  }
+
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(raw, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch (err) {
+    if (existsSync(temporary)) unlinkSync(temporary);
+    throw err;
+  }
+
+  return result;
 }
 
 export function loadConfig(): ResolvedConfig {

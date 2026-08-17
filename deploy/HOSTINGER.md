@@ -132,9 +132,12 @@ nano /var/lib/copymint/config.json
 "telegram": { "allowedChatIds": [ your id — next step ] }
 ```
 
-Both addresses are deliberately unreachable from Telegram. A fully compromised
-Telegram account can make the bot mint and sweep, but everything it moves still
-lands at an address changeable only over SSH.
+These are bootstrap values. After startup, **Owner settings** in Telegram can
+change both to one confirmed payout address. The installer can also create a
+one-time, 10-minute transfer link; opening it makes the recipient the sole
+authorized chat. Protect that Telegram account with two-step verification,
+because it can redirect future sweeps. A settings change never moves assets
+that were already sent.
 
 Leave `copy.enabled` as `false` until you've watched real signals for a while.
 `/copy on` in chat is deliberately temporary and does not survive a restart.
@@ -158,7 +161,9 @@ Rejected message from chat 123456789
 ```
 
 That's the whitelist working. Put the number in `allowedChatIds`, restart, and
-send `/start` again.
+send `/start` again. If this VPS is for someone else, open **Owner settings →
+Transfer ownership**, then forward the one-time link to them before creating
+the wallet store.
 
 ```bash
 nano /var/lib/copymint/config.json
