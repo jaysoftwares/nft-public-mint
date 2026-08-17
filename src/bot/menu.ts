@@ -30,10 +30,17 @@ export type FlowKind =
 export interface Flow {
   kind: FlowKind;
   /** What the flow is currently waiting for. */
-  step: "contract" | "amount" | "address" | "secret" | "ready";
+  step: "contract" | "amount" | "address" | "secret" | "chain" | "ready";
   contract?: string;
   quantity?: number;
   selector?: string;
+  /**
+   * Which chain this flow acts on.
+   *
+   * Only the flows with no contract to infer it from need this. Everything else
+   * detects the chain from the contract, which is why the field is optional.
+   */
+  chain?: string;
   amount?: string;
   tier?: string;
   mintMode?: string;
@@ -252,6 +259,30 @@ export function selectorKeyboard(): InlineKeyboard {
     .text("✕ Cancel", "x");
 }
 
+/**
+ * Which chain does this act on?
+ *
+ * Asked only where there is no contract to infer it from — funding and
+ * draining. Those used to fall through to the configured default silently,
+ * which meant money moved on whichever chain `config.chain` happened to name
+ * rather than the one the operator had in mind. A funder holding 0.0317 ETH on
+ * Robinhood and nothing on Base produced exactly the failure you would expect,
+ * with no indication that the chain was the reason.
+ *
+ * The balance rides on the button because it is the fact that settles the
+ * choice: a chain with nothing on it is visibly not the one you meant.
+ */
+export function chainKeyboard(
+  chains: { key: string; name: string; balanceLabel?: string }[]
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const chain of chains) {
+    const label = chain.balanceLabel ? `${chain.name} — ${chain.balanceLabel}` : chain.name;
+    keyboard.text(label, `ch:${chain.key}`).row();
+  }
+  return keyboard.text("✕ Cancel", "x");
+}
+
 export function tierKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
     .text("🔥 High", "t:high")
@@ -365,9 +396,12 @@ export function afterSetupMenu(): InlineKeyboard {
 }
 
 /** Human summary of a flow, shown above the confirm buttons. */
-export function describeFlow(flow: Flow): string {
+export function describeFlow(flow: Flow, chainName?: string): string {
   const rows: string[] = [];
   if (flow.contract) rows.push(`contract  <code>${flow.contract}</code>`);
+  // Stated on every confirmation, because with several chains live the network
+  // is part of what is being agreed to, not background.
+  if (chainName) rows.push(`network   <b>${chainName}</b>`);
   if (flow.quantity !== undefined) rows.push(`quantity  ${flow.quantity}`);
   if (flow.selector) rows.push(`wallets   <code>${flow.selector}</code>`);
   if (flow.amount) rows.push(`amount    ${flow.amount} ETH each`);

@@ -69,6 +69,7 @@ import {
   OpenSeaApiError,
 } from "../core/opensea-api";
 import { resolveCollectionInput } from "../core/collection-input";
+import { rpcCall } from "../core/rpc";
 import {
   executeOpenSeaMint,
   OpenSeaMintEvent,
@@ -93,6 +94,7 @@ import {
   tierKeyboard,
   mintModeKeyboard,
   amountKeyboard,
+  chainKeyboard,
   confirmKeyboard,
   simpleConfirm,
   backTo,
@@ -302,14 +304,25 @@ async function runWithArgs(
   }
 }
 
+/**
+ * Resolve a selector to wallets.
+ *
+ * `chainKey` undefined means "no chain was named" — balances then come from
+ * every chain at once rather than from a configured favourite, so `funded`
+ * means funded somewhere. Only callers that move money pass a real key, and
+ * those obtain it by asking or by detecting it from a contract.
+ */
 async function select(
   selector: string,
   ctx: Context,
-  chainKey: string,
+  chainKey: string | undefined,
   force = false
 ): Promise<ManagedWallet[] | null> {
   try {
-    const tagCtx = await session.tagContext(chainKey, force);
+    const tagCtx =
+      chainKey === undefined
+        ? await session.tagContextAnyChain(force)
+        : await session.tagContext(chainKey, force);
     const matched = resolveWallets(selector, session.wallets(), tagCtx);
     if (matched.length === 0) {
       await ctx.reply(`No wallets match <code>${esc(selector)}</code>.`, { parse_mode: "HTML" });
@@ -346,14 +359,21 @@ async function chainFor(ctx: Context, contract?: string): Promise<ChainContext> 
     return session.chain(parts[onIndex + 1]);
   }
   if (contract && isAddress(contract)) {
-    try {
-      return (await session.detectChain(contract)).chain;
-    } catch {
-      // No code anywhere, or every probe failed — fall back to the default so
-      // the command can report a more specific error than "unknown chain".
-    }
+    // Detection is authoritative: the chain with code at that address is the
+    // chain the contract is on. It is not a default — it is an answer.
+    return (await session.detectChain(contract)).chain;
   }
-  return session.chain();
+
+  // Nothing to detect from. This used to return the configured chain, which
+  // reads as a decision the operator made and is not one: with three chains
+  // live, a fund whose funder held nothing on the configured chain failed for
+  // a reason nothing on screen mentioned. Commands that reach here must say
+  // which chain they mean.
+  throw new Error(
+    `This command needs a chain. Add <code>on ${session.availableChains
+      .map((c) => c.key)
+      .join("</code> / <code>on ")}</code>, or run it from the menu, which asks.`
+  );
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────
@@ -566,13 +586,13 @@ async function cmdGenerate(ctx: Context): Promise<void> {
 }
 
 async function cmdAutoFire(ctx: Context): Promise<void> {
-  const chain = await chainFor(ctx);
   const [selector, state] = args(ctx);
   if (!selector || (state !== "on" && state !== "off")) {
     await ctx.reply("Usage: <code>/autofire imported on</code>", { parse_mode: "HTML" });
     return;
   }
-  const matched = await select(selector, ctx, chain.key);
+  // No chain named: `funded` means funded on any chain, not on a favourite one.
+  const matched = await select(selector, ctx, undefined);
   if (!matched) return;
 
   for (const wallet of matched) session.store.setAutoFire(wallet.id, state === "on");
@@ -588,7 +608,6 @@ async function cmdAutoFire(ctx: Context): Promise<void> {
 }
 
 async function cmdTag(ctx: Context, remove: boolean): Promise<void> {
-  const chain = await chainFor(ctx);
   const [selector, tag] = args(ctx);
   if (!selector || !tag) {
     await ctx.reply(
@@ -597,7 +616,8 @@ async function cmdTag(ctx: Context, remove: boolean): Promise<void> {
     );
     return;
   }
-  const matched = await select(selector, ctx, chain.key);
+  // No chain named: `funded` means funded on any chain, not on a favourite one.
+  const matched = await select(selector, ctx, undefined);
   if (!matched) return;
 
   for (const wallet of matched) {
@@ -1500,7 +1520,12 @@ async function cmdFcfs(ctx: Context): Promise<void> {
         (part, i, rest) =>
           part !== "at" &&
           part !== "wait" &&
+          part !== "on" &&
+          // The token after "at" is a time and the one after "on" is a chain —
+          // neither is a wallet selector, and treating one as such would
+          // silently mint from the wrong set.
           rest[i - 1] !== "at" &&
+          rest[i - 1] !== "on" &&
           !/^\d{1,2}:\d{2}$/.test(part)
       ) ?? "derived+funded";
 
@@ -2526,10 +2551,79 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
   }
 }
 
+/**
+ * Ask which chain, showing what the funder actually holds on each.
+ *
+ * Reading three balances costs three calls on a button press, which is cheap
+ * against the alternative: these flows move money, and picking the chain by
+ * default rather than by choice is how a transfer ends up on one where the
+ * funder has nothing.
+ */
+async function askChain(ctx: Context, flow: Flow, title: string): Promise<void> {
+  flow.step = "chain";
+
+  const rows = await Promise.all(
+    session.availableChains.map(async (chain) => {
+      let balanceLabel: string | undefined;
+      try {
+        const wei = await rpcCall<string>(
+          chain.rpc.readUrl,
+          "eth_getBalance",
+          [config.funder, "latest"],
+          6_000
+        );
+        balanceLabel = `${eth(BigInt(wei))} ${chain.profile.nativeSymbol}`;
+      } catch {
+        // A chain that will not answer is still selectable; the command itself
+        // reports the failure in more detail than a button label could.
+        balanceLabel = "unreadable";
+      }
+      return { key: chain.key, name: chain.name, balanceLabel };
+    })
+  );
+
+  await ctx.reply(
+    [
+      `<b>${title}</b>`,
+      ``,
+      `Which chain?`,
+      ``,
+      `<i>Balances shown are the funder's</i>`,
+      `<code>${esc(short(config.funder))}</code>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: chainKeyboard(rows) }
+  );
+}
+
 /** Move a flow to its next step, asking for whatever is still missing. */
 async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
   const label =
     flow.kind === "mint" ? "Public mint" : flow.kind === "fcfs" ? "FCFS mint" : flow.kind;
+
+  // Funding and draining carry no contract, so nothing else can tell them which
+  // chain they are for. Asked first: the amount only means something once the
+  // chain is known.
+  if ((flow.kind === "fund" || flow.kind === "drain") && !flow.chain) {
+    return askChain(ctx, flow, flow.kind === "fund" ? "Fund wallets" : "Reclaim ETH");
+  }
+
+  // Draining has nothing else to collect — the chain was the missing piece.
+  if (flow.kind === "drain") {
+    flow.step = "ready";
+    await ctx.reply(
+      [
+        `<b>Reclaim ETH</b>  ·  ${esc(session.chain(flow.chain).name)}`,
+        ``,
+        `Send the ETH in every wallet back to the funder:`,
+        `<code>${esc(config.funder)}</code>`,
+        ``,
+        `<i>Each wallet keeps only its own transfer cost. This leaves the set`,
+        `unarmed — fund again before minting.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: simpleConfirm("Reclaim") }
+    );
+    return;
+  }
 
   if (flow.kind === "watch") {
     if (!flow.contract) return;
@@ -2582,8 +2676,9 @@ async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
 
   // Everything gathered — state the cost and wait for a deliberate tap.
   flow.step = "ready";
+  const chainName = flow.chain ? session.chain(flow.chain).name : undefined;
   await ctx.reply(
-    [`<b>${label}</b>`, ``, describeFlow(flow), ``, `<i>Nothing is sent until you confirm.</i>`].join("\n"),
+    [`<b>${label}</b>`, ``, describeFlow(flow, chainName), ``, `<i>Nothing is sent until you confirm.</i>`].join("\n"),
     {
       parse_mode: "HTML",
       reply_markup:
@@ -2600,7 +2695,13 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
     case "mint":
       return runWithArgs(
         ctx,
-        [flow.contract!, String(flow.quantity), flow.selector!, ...(waitForOpen ? ["wait"] : [])],
+        [
+          flow.contract!,
+          String(flow.quantity),
+          flow.selector!,
+          ...(waitForOpen ? ["wait"] : []),
+          ...(flow.chain ? ["on", flow.chain] : []),
+        ],
         cmdMint
       );
     case "fcfs":
@@ -2608,17 +2709,33 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
       // a stage that had not opened yet refused every wallet at once.
       return runWithArgs(
         ctx,
-        [flow.contract!, String(flow.quantity), flow.selector!, ...(waitForOpen ? ["wait"] : [])],
+        [
+          flow.contract!,
+          String(flow.quantity),
+          flow.selector!,
+          ...(waitForOpen ? ["wait"] : []),
+          ...(flow.chain ? ["on", flow.chain] : []),
+        ],
         cmdFcfs
       );
     case "check":
       return runWithArgs(ctx, [flow.contract!], cmdProbe);
+    // `on <chain>` is the override chainFor already understands, so the chosen
+    // chain reaches the command the same way a typed one would.
     case "fund":
-      return runWithArgs(ctx, [flow.selector!, flow.amount!], cmdFund);
+      return runWithArgs(
+        ctx,
+        [flow.selector!, flow.amount!, ...(flow.chain ? ["on", flow.chain] : [])],
+        cmdFund
+      );
     case "sweep":
       return runWithArgs(ctx, ["all"], cmdSweep);
     case "drain":
-      return runWithArgs(ctx, ["all"], cmdDrain);
+      return runWithArgs(
+        ctx,
+        ["all", ...(flow.chain ? ["on", flow.chain] : [])],
+        cmdDrain
+      );
     case "watch":
       return runWithArgs(
         ctx,
@@ -2749,7 +2866,7 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "i": {
       const kind = payload as Flow["kind"];
-      const flow = startFlow(chatId, kind, kind === "sweep" || kind === "drain" ? "ready" : "contract");
+      const flow = startFlow(chatId, kind, kind === "sweep" ? "ready" : "contract");
       if (kind === "sweep") {
         await ctx.reply(
           `<b>Sweep</b>\n\nMove every NFT found in your wallets to the vault:\n<code>${esc(config.vault)}</code>\n\n<i>ETH is left in place so wallets stay armed.</i>`,
@@ -2757,15 +2874,9 @@ async function onCallback(ctx: Context): Promise<void> {
         );
         return;
       }
-      if (kind === "drain") {
-        await ctx.reply(
-          `<b>Reclaim ETH</b>\n\nSend the ETH in every wallet back to the funder:\n<code>${esc(config.funder)}</code>\n\n<i>Each wallet keeps only its own transfer cost. This leaves the set unarmed — fund again before minting.</i>`,
-          { parse_mode: "HTML", reply_markup: simpleConfirm("Reclaim") }
-        );
-        return;
-      }
-      if (kind === "fund") {
-        flow.step = "amount";
+      // Both move money and neither has a contract to infer a chain from, so
+      // both start by asking which one.
+      if (kind === "drain" || kind === "fund") {
         return advanceFlow(ctx, flow);
       }
       if (kind === "watch") {
@@ -2787,6 +2898,23 @@ async function onCallback(ctx: Context): Promise<void> {
         { parse_mode: "HTML", reply_markup: backTo("m:mint", "✕ Cancel") }
       );
       return;
+    }
+
+    case "ch": {
+      const flow = getFlow(chatId);
+      if (!flow) {
+        await ctx.reply("That selection expired — start again from the menu.");
+        return;
+      }
+      try {
+        // Validates the key and fails loudly if that chain never resolved,
+        // rather than carrying an unusable name into the command.
+        flow.chain = session.chain(payload).key;
+      } catch (err) {
+        await fail(ctx, err);
+        return;
+      }
+      return advanceFlow(ctx, flow);
     }
 
     case "q": {
@@ -2940,21 +3068,40 @@ async function onText(ctx: Context): Promise<void> {
     flow.contract = resolved.address;
     flow.step = "ready";
 
-    // Say what the link turned into. A slug lookup is the one step where the
-    // operator cannot see what the bot decided, and confirming the wrong
-    // collection is the expensive mistake.
-    if (resolved.slug) {
-      await ctx.reply(
-        [
-          `🔗 <b>${esc(resolved.name ?? resolved.slug)}</b>`,
-          `<code>${esc(resolved.address)}</code>`,
-          resolved.chain ? `<i>on ${esc(resolved.chain)}</i>` : ``,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        { parse_mode: "HTML" }
-      );
+    // Work out the chain from where the code actually lives, and say so. The
+    // same address deployed on two chains via CREATE2 is genuinely ambiguous,
+    // and picking one silently is how a mint lands on the wrong network — so
+    // that case asks instead.
+    let detected: ChainContext | undefined;
+    try {
+      const found = await session.detectChain(resolved.address);
+      if (found.ambiguous) {
+        await ctx.reply(
+          [
+            `🔗 <b>${esc(resolved.name ?? short(resolved.address))}</b>`,
+            `<code>${esc(resolved.address)}</code>`,
+            ``,
+            `<i>This address has code on more than one chain.</i>`,
+          ].join("\n"),
+          { parse_mode: "HTML" }
+        );
+        return askChain(ctx, flow, "Which network?");
+      }
+      detected = found.chain;
+      flow.chain = found.chain.key;
+    } catch (err) {
+      await fail(ctx, err);
+      return;
     }
+
+    await ctx.reply(
+      [
+        `🔗 <b>${esc(resolved.name ?? resolved.slug ?? short(resolved.address))}</b>`,
+        `<code>${esc(resolved.address)}</code>`,
+        `<i>on ${esc(detected.name)}</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML" }
+    );
     return advanceFlow(ctx, flow);
   }
 

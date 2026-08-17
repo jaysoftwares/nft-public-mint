@@ -235,6 +235,61 @@ export class Session {
     return ctx;
   }
 
+  /**
+   * A tag context spanning every chain, for commands that name none.
+   *
+   * `/wallets`, `/tag` and `/autofire` have no contract to detect a chain from
+   * and move no money, so forcing a choice on them is friction — but silently
+   * resolving `funded` against one chain is worse: a wallet holding ETH on
+   * Robinhood read as unfunded because the configured chain was Base.
+   *
+   * A wallet is counted funded here if it can cover the reservation on at
+   * least one chain, which is what "is this wallet usable?" actually means
+   * when three chains are live at once. A wallet is stuck only if it is stuck
+   * everywhere — a gap on one chain does not disqualify it on the others.
+   */
+  async tagContextAnyChain(force = false): Promise<TagContext> {
+    const ctx: TagContext = {
+      minFundedWei: gasReservation(this.config.gasLimit, this.config.maxFeePerGas),
+      state: new Map(),
+    };
+
+    const perChain = await Promise.all(
+      this.availableChains.map(async (chain) => {
+        try {
+          return {
+            balances: await this.balances(chain.key, force),
+            stuck: chain.nonces.stuckAddresses(),
+          };
+        } catch {
+          // An unreachable chain contributes nothing rather than zeroing a
+          // wallet that may well be funded on it.
+          return undefined;
+        }
+      })
+    );
+
+    for (const wallet of this.wallets()) {
+      let best = 0n;
+      let seen = false;
+      let stuckEverywhere = true;
+      for (const entry of perChain) {
+        if (!entry) continue;
+        const balance = entry.balances.get(wallet.address);
+        if (balance !== undefined) {
+          seen = true;
+          if (balance > best) best = balance;
+        }
+        if (!entry.stuck.has(wallet.address)) stuckEverywhere = false;
+      }
+      ctx.state.set(wallet.id, {
+        balanceWei: seen ? best : undefined,
+        nonceGap: stuckEverywhere && perChain.some((e) => e !== undefined),
+      });
+    }
+    return ctx;
+  }
+
   async primeNonces(wallets: ManagedWallet[], chainKey?: string): Promise<void> {
     const chain = this.chain(chainKey);
     const missing = wallets
