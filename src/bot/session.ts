@@ -1,9 +1,8 @@
 // Bot runtime state.
 //
-// The store is unlocked once, at boot, with a passphrase supplied by the
-// environment or typed at the console — never over Telegram. A chat message
-// carrying the passphrase would put it on Telegram's servers and in message
-// history, which defeats encrypting the seed at rest in the first place.
+// One Session exists per private Telegram chat after that user creates a store.
+// Its encryption key is derived from the server master secret and chat id — no
+// passphrase ever travels through Telegram.
 //
 // Every configured chain is resolved and held live at the same time. There is no
 // "current chain" to switch: nonces, balances and endpoints are tracked per
@@ -57,6 +56,10 @@ export class Session {
   private balanceCache = new Map<string, { at: number; balances: Map<string, bigint> }>();
   private watchers = new Map<string, LogWatcher>();
   private engines = new Map<string, CopyEngine>();
+  private copyHandlers?: {
+    onCopyEvent: (event: CopyEvent, chain: ChainContext) => void;
+    onStatus: (message: string, level: "info" | "warn") => void;
+  };
   private codeCache = new Map<string, string[]>();
   /** Where the rolling reconcile got to on each chain. */
   private reconcileCursors = new Map<string, number>();
@@ -331,6 +334,13 @@ export class Session {
     onCopyEvent: (event: CopyEvent, chain: ChainContext) => void,
     onStatus: (message: string, level: "info" | "warn") => void
   ): Promise<void> {
+    this.copyHandlers = { onCopyEvent, onStatus };
+    this.stopCopyResources();
+
+    // A multi-user bot must not hold one WebSocket per chain per idle user.
+    // The first /watch call starts them through retargetWatchers().
+    if (targets.addresses().length === 0) return;
+
     const sessionRef = this;
 
     for (const chain of this.availableChains) {
@@ -393,12 +403,25 @@ export class Session {
 
   async retargetWatchers(): Promise<void> {
     const list = targets.addresses();
+    if (list.length === 0) {
+      this.stopCopyResources();
+      return;
+    }
+    if (this.watchers.size === 0 && this.copyHandlers) {
+      await this.startCopy(this.copyHandlers.onCopyEvent, this.copyHandlers.onStatus);
+      return;
+    }
     for (const watcher of this.watchers.values()) {
       await watcher.retarget(list);
     }
   }
 
   stopCopy(): void {
+    this.stopCopyResources();
+    this.copyHandlers = undefined;
+  }
+
+  private stopCopyResources(): void {
     for (const watcher of this.watchers.values()) watcher.stop();
     this.watchers.clear();
     this.engines.clear();

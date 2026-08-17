@@ -1,25 +1,30 @@
 // Telegram bot entry point.
 //
-// The chat-id whitelist keeps strangers out. The authorized owner can change
-// the payout address through a confirmed settings flow, so control of that
-// Telegram account must be treated as control of the bot.
+// Every private Telegram chat is an isolated user: config, encrypted seed,
+// wallets, ledger and targets live under that chat's own state directory.
 //
 // The passphrase is never a chat command — it comes from the environment or the
 // console at boot.
 
 import { Bot, InputFile, Context, InlineKeyboard } from "grammy";
-import { isAddress, getAddress, parseEther } from "ethers";
+import { isAddress, getAddress, parseEther, ZeroAddress } from "ethers";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { config as loadEnv } from "dotenv";
 import {
   loadConfig,
   writeDefaultConfig,
-  updateOwnerSettings,
+  writeConfigIfMissing,
+  updateUserSettings,
+  BotConfig,
   ResolvedConfig,
   ConfigError,
 } from "../core/config";
+import { storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
+import { deriveUserPassphrase } from "../core/user-key";
 import { Session, ChainContext } from "./session";
 import { ManagedWallet } from "../core/wallet-store";
 import { readImportBlob, initNew, storeExists } from "../core/wallet-store";
+import { ensureUserFundingWallet } from "./user-wallet";
 import { resolve as resolveWallets, summarise, SelectorError } from "../core/tags";
 import { gasReservation, shortfalls } from "../core/balances";
 import {
@@ -62,7 +67,6 @@ import {
 } from "../core/mint-opensea";
 import { StatusCard, esc, eth, bar, short, toCsv, txLink } from "./ui";
 import { askPassphrase } from "../tools/tty";
-import { OwnershipClaims } from "./ownership";
 import {
   Flow,
   startFlow,
@@ -97,17 +101,146 @@ loadEnv();
 let session: Session;
 let config: ResolvedConfig;
 
-/**
- * False until a wallet store exists and the session is open.
- *
- * Everything below assumes `session` is live, which it is not on a first boot
- * against an empty state directory. Rather than thread a null check through
- * forty handlers, one piece of middleware refuses to route anything except the
- * setup buttons while this is false — so by the time any command runs, the
- * session is guaranteed.
- */
-let ready = false;
-const ownershipClaims = new OwnershipClaims();
+interface UserRuntime {
+  chatId: number;
+  stateDir: string;
+  config: ResolvedConfig;
+  passphrase: string;
+  session?: Session;
+}
+
+const runtimeContext = new AsyncLocalStorage<UserRuntime>();
+const runtimePromises = new Map<number, Promise<UserRuntime>>();
+let bootstrapConfig: ResolvedConfig;
+let masterPassphrase: string;
+
+function currentRuntime(): UserRuntime {
+  const runtime = runtimeContext.getStore();
+  if (!runtime) throw new Error("No Telegram user runtime is active.");
+  return runtime;
+}
+
+function contextual<T extends object>(target: () => T): T {
+  return new Proxy({} as T, {
+    get(_unused, property) {
+      const value = Reflect.get(target(), property);
+      return typeof value === "function" ? value.bind(target()) : value;
+    },
+    set(_unused, property, value) {
+      return Reflect.set(target(), property, value);
+    },
+  });
+}
+
+config = contextual(() => currentRuntime().config);
+session = contextual(() => {
+  const active = currentRuntime().session;
+  if (!active) throw new Error("This user has not created a wallet store yet.");
+  return active;
+});
+
+function isReady(): boolean {
+  return currentRuntime().session !== undefined;
+}
+
+function initialUserConfig(): BotConfig {
+  return {
+    chain: bootstrapConfig.chain,
+    // A zero destination is a non-spendable setup sentinel. Wallet creation is
+    // blocked until the user confirms a real NFT vault in Settings.
+    vault: ZeroAddress,
+    funder: ZeroAddress,
+    hotSetSize: bootstrapConfig.hotSetSize,
+    reconcileBatch: bootstrapConfig.reconcileBatch,
+    gas: { ...bootstrapConfig.gas },
+    caps: { ...bootstrapConfig.caps },
+    copy: {
+      ...bootstrapConfig.copy,
+      enabled: false,
+      tiers: { ...bootstrapConfig.copy.tiers },
+    },
+    signed: {
+      ...bootstrapConfig.signed,
+      api: {
+        ...bootstrapConfig.signed.api,
+        headers: { ...bootstrapConfig.signed.api.headers },
+      },
+      siwe: { ...bootstrapConfig.signed.siwe },
+    },
+    rpc: {
+      read: [...bootstrapConfig.rpc.read],
+      send: [...bootstrapConfig.rpc.send],
+    },
+  };
+}
+
+function userPassphrase(chatId: number): string {
+  return deriveUserPassphrase(masterPassphrase, chatId);
+}
+
+async function createUserRuntime(chatId: number): Promise<UserRuntime> {
+  const dir = userStateDir(chatId);
+  return withStateDir(dir, async () => {
+    writeConfigIfMissing(initialUserConfig());
+    const runtime: UserRuntime = {
+      chatId,
+      stateDir: dir,
+      config: loadConfig(),
+      passphrase: userPassphrase(chatId),
+    };
+    return runtimeContext.run(runtime, async () => {
+      if (storeExists()) await startSession();
+      return runtime;
+    });
+  });
+}
+
+function userRuntime(chatId: number): Promise<UserRuntime> {
+  const existing = runtimePromises.get(chatId);
+  if (existing) return existing;
+  const creating = createUserRuntime(chatId).catch((err) => {
+    runtimePromises.delete(chatId);
+    throw err;
+  });
+  runtimePromises.set(chatId, creating);
+  return creating;
+}
+
+async function runForUser(ctx: Context, next: () => Promise<void>): Promise<void> {
+  const chat = ctx.chat;
+  if (!chat) return;
+  if (chat.type !== "private") {
+    await ctx.reply("Use this bot in a private chat so wallets cannot be shared by a group.");
+    return;
+  }
+  const pending = userRuntime(chat.id);
+  const runtime = await pending;
+  try {
+    await withStateDir(runtime.stateDir, () => runtimeContext.run(runtime, next));
+  } finally {
+    // Setup-only visitors have no timers or live resources. Reload their tiny
+    // config on the next message instead of retaining an unbounded public-user
+    // cache. A created Session stays resident for background automation.
+    if (!runtime.session && runtimePromises.get(chat.id) === pending) {
+      runtimePromises.delete(chat.id);
+    }
+  }
+}
+
+async function resumeStoredUsers(): Promise<void> {
+  const ids = storedUserChatIds();
+  for (let offset = 0; offset < ids.length; offset += 3) {
+    const batch = ids.slice(offset, offset + 3);
+    await Promise.all(
+      batch.map((chatId) =>
+        userRuntime(chatId).catch((err) => {
+          console.error(`  chat ${chatId}: could not resume — ${(err as Error).message}`);
+        })
+      )
+    );
+  }
+  if (ids.length > 0) console.log(`  Resumed ${ids.length} stored user session(s).`);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -232,14 +365,14 @@ whichever you're eligible for. Times are UTC.
 /copy on|off — autonomous firing kill switch
 /caps — spend limits and today's usage
 
-<b>Owner</b>
-/settings — payout address and secure ownership transfer
+<b>Settings</b>
+/settings — change your NFT vault
 
 <b>Selectors</b>
 <code>all</code> <code>derived</code> <code>imported</code> <code>funded</code> <code>stuck</code> <code>autofire</code> <code>manual</code>
 <code>0-99</code> index range · <code>0x…</code> address · <code>+</code> and · <code>,</code> or · <code>!</code> not
 
-Import keys by uploading a <code>keys.enc</code> file made with <code>npm run encrypt-keys</code>.`;
+Your funding wallet is created automatically and kept out of autonomous minting.`;
 
 async function cmdStatus(ctx: Context): Promise<void> {
   const wallets = session.wallets();
@@ -283,7 +416,7 @@ async function cmdStatus(ctx: Context): Promise<void> {
     `armed threshold ${eth(reservation)} ETH/wallet`,
     `<i>(gasLimit ${config.gasLimit} × ${config.gas.maxFeeGwei} gwei)</i>`,
     ``,
-    `<b>Destinations</b> <i>(config only, not settable here)</i>`,
+    `<b>Your addresses</b> <i>(change NFT vault in Settings)</i>`,
     `  vault  <code>${esc(config.vault)}</code>`,
     `  funder <code>${esc(config.funder)}</code>`,
     ``,
@@ -627,8 +760,8 @@ async function cmdSweep(ctx: Context): Promise<void> {
  *
  * The counterpart to /fund, for when a campaign is over and the gas is better
  * off in one place than smeared across 500 wallets. It lands at the funder
- * address in owner settings. Changing that destination requires the authorized
- * Telegram owner and an explicit confirmation.
+ * address in that user's settings. Changing it requires an explicit
+ * confirmation in the same private chat.
  */
 async function cmdDrain(ctx: Context): Promise<void> {
   const selector = args(ctx)[0] ?? "all";
@@ -1702,7 +1835,7 @@ async function cmdImportDocument(ctx: Context): Promise<void> {
     if (!response.ok) throw new Error(`Could not download the file (HTTP ${response.status}).`);
     const contents = await response.text();
 
-    const entries = readImportBlob(contents, passphrase);
+    const entries = readImportBlob(contents, currentRuntime().passphrase);
     const result = session.store.importKeys(entries);
 
     await ctx.reply(
@@ -1725,22 +1858,25 @@ async function cmdImportDocument(ctx: Context): Promise<void> {
   }
 }
 
-// ── Owner settings ────────────────────────────────────────────────────────
+// ── Per-user settings ─────────────────────────────────────────────────────
 
-async function showOwnerSettings(ctx: Context): Promise<void> {
+async function showUserSettings(ctx: Context): Promise<void> {
   await ctx.reply(
     [
-      `<b>Owner settings</b>`,
+      `<b>Your settings</b>`,
       ``,
-      `Payout address`,
-      `<code>${esc(config.vault)}</code>`,
+      `NFT vault`,
+      config.vault === ZeroAddress ? `<i>Not set yet</i>` : `<code>${esc(config.vault)}</code>`,
       ``,
-      `NFT sweeps and reclaimed ETH go here. Funding also uses this address,`,
-      `so its private key must be imported before the Fund action can spend from it.`,
+      `Funding wallet`,
+      config.funder === ZeroAddress
+        ? `<i>Created automatically with your wallet store</i>`
+        : `<code>${esc(config.funder)}</code>`,
       ``,
-      `<i>Changing it affects future actions only. Existing assets do not move.</i>`,
+      `<i>NFT sweeps go to the vault. ETH is funded from and reclaimed to your`,
+      `derived funding wallet. Changing the vault never moves existing assets.</i>`,
     ].join("\n"),
-    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
+    { parse_mode: "HTML", reply_markup: settingsMenu(!isReady()) }
   );
 }
 
@@ -1750,10 +1886,10 @@ async function beginDestinationChange(ctx: Context): Promise<void> {
   startFlow(chatId, "destination", "address");
   await ctx.reply(
     [
-      `<b>Change payout address</b>`,
+      `<b>Change NFT vault</b>`,
       ``,
       `Send the Ethereum/Base <code>0x…</code> address that should receive`,
-      `NFT sweeps and reclaimed ETH. You will confirm it before it is saved.`,
+      `your NFT sweeps. You will confirm it before it is saved.`,
     ].join("\n"),
     { parse_mode: "HTML", reply_markup: backTo("cfg:menu", "✕ Cancel") }
   );
@@ -1761,93 +1897,23 @@ async function beginDestinationChange(ctx: Context): Promise<void> {
 
 async function saveDestination(ctx: Context, value: string): Promise<void> {
   if (!isAddress(value)) {
-    await ctx.reply("That payout address is invalid. Start again from Settings.");
+    await ctx.reply("That NFT vault is invalid. Start again from Settings.");
     return;
   }
   const destination = getAddress(value);
-  updateOwnerSettings({ destination });
+  updateUserSettings({ destination });
   config.vault = destination;
-  config.funder = destination;
   clearFlow(ctx.chat!.id);
   await ctx.reply(
     [
-      `<b>Payout address saved</b>`,
+      `<b>NFT vault saved</b>`,
       ``,
       `<code>${esc(destination)}</code>`,
       ``,
-      `<i>Future sweeps and reclaimed ETH use this address.</i>`,
+      `<i>Future NFT sweeps use this address.</i>`,
     ].join("\n"),
-    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
+    { parse_mode: "HTML", reply_markup: settingsMenu(!isReady()) }
   );
-}
-
-async function beginOwnershipTransfer(ctx: Context): Promise<void> {
-  const chatId = ctx.chat?.id;
-  if (chatId === undefined) return;
-  if (ctx.chat?.type !== "private") {
-    await ctx.reply("Ownership can only be transferred from a private chat with the bot.");
-    return;
-  }
-
-  const claim = ownershipClaims.issue(chatId);
-  const me = await bot.api.getMe();
-  const link = `https://t.me/${me.username}?start=claim_${claim.token}`;
-  await ctx.reply(
-    [
-      `<b>Transfer ownership</b>`,
-      ``,
-      `Forward this one-time link to the new owner:`,
-      `<code>${esc(link)}</code>`,
-      ``,
-      `It expires in 10 minutes, works once, and is cancelled by a bot restart.`,
-      `Opening it makes that private`,
-      `chat the sole authorized owner and removes this chat's access.`,
-      ``,
-      `<i>Anyone holding the link during those 10 minutes can claim the bot.</i>`,
-    ].join("\n"),
-    {
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-      reply_markup: settingsMenu(!ready),
-    }
-  );
-}
-
-/** Handle an ownership deep link before the normal whitelist rejects it. */
-async function tryOwnershipClaim(ctx: Context): Promise<boolean> {
-  const text = (ctx.message?.text ?? "").trim();
-  const result = ownershipClaims.consumeStart(text);
-  if (result.kind === "none") return false;
-
-  if (ctx.chat?.type !== "private" || ctx.chat.id === undefined) {
-    await ctx.reply("Open the ownership link in a private chat with the bot.");
-    return true;
-  }
-  if (result.kind === "invalid" || result.kind === "expired") {
-    await ctx.reply("That ownership link is invalid or expired. Ask the current owner for a new one.");
-    return true;
-  }
-
-  const newOwner = ctx.chat.id;
-  updateOwnerSettings({ allowedChatIds: [newOwner] });
-  config.telegram.allowedChatIds = [newOwner];
-  console.log(`  Ownership transferred to chat ${newOwner}.`);
-
-  if (result.issuedBy !== newOwner) {
-    void bot.api
-      .sendMessage(result.issuedBy, "Ownership was transferred. This chat no longer controls the bot.")
-      .catch(() => undefined);
-  }
-
-  await ctx.reply(
-    [
-      `<b>You now own this bot.</b>`,
-      ``,
-      `Set the payout address below, then create the wallet store when you are ready.`,
-    ].join("\n"),
-    { parse_mode: "HTML", reply_markup: settingsMenu(!ready) }
-  );
-  return true;
 }
 
 // ── Button UI ─────────────────────────────────────────────────────────────
@@ -1871,6 +1937,9 @@ const SETUP_HEADER = [
   `<b>Copymint — setup</b>`,
   ``,
   `No wallet store exists yet, so there is nothing to mint with.`,
+  ``,
+  `First set your NFT vault in Settings. Then create your own`,
+  `encrypted wallet store and write down its recovery phrase.`,
   ``,
   `Creating one generates a 12-word recovery phrase and shows it to you <b>once</b>.`,
   `Have a pen ready before you tap.`,
@@ -1898,7 +1967,7 @@ async function showSetup(ctx: Context): Promise<void> {
 }
 
 async function cmdSetupRetry(ctx: Context): Promise<void> {
-  if (ready) {
+  if (isReady()) {
     await ctx.reply("Already running.", {
       reply_markup: mainMenu(session.copyEnabled, targets.list().length),
     });
@@ -1924,8 +1993,9 @@ async function cmdSetupExplain(ctx: Context): Promise<void> {
       `<b>What the phrase is worth</b>`,
       ``,
       `Anyone holding it controls every derived wallet, permanently. It is`,
-      `shown once and is not recoverable from the server — the copy on disk is`,
-      `encrypted and the bot never displays it again.`,
+      `shown once and the bot never displays it again. The encrypted server`,
+      `copy can be opened by the running service or a server administrator who`,
+      `has the master secret — this is a hosted, custodial bot.`,
       ``,
       `<b>Where it will appear</b>`,
       ``,
@@ -1943,9 +2013,15 @@ async function cmdSetupExplain(ctx: Context): Promise<void> {
 }
 
 async function cmdSetupWarn(ctx: Context): Promise<void> {
-  if (ready) {
+  if (isReady()) {
     await ctx.reply("A wallet store already exists — setup is done.", {
       reply_markup: mainMenu(session.copyEnabled, targets.list().length),
+    });
+    return;
+  }
+  if (config.vault === ZeroAddress) {
+    await ctx.reply("Set your NFT vault before creating wallets.", {
+      reply_markup: settingsMenu(true),
     });
     return;
   }
@@ -1967,15 +2043,20 @@ async function cmdSetupWarn(ctx: Context): Promise<void> {
 }
 
 async function cmdSetupCreate(ctx: Context): Promise<void> {
-  if (ready || storeExists()) {
+  if (isReady() || storeExists()) {
     await ctx.reply("A wallet store already exists — refusing to overwrite it.");
     return;
   }
+  if (config.vault === ZeroAddress) {
+    await ctx.reply("Set your NFT vault before creating wallets.", {
+      reply_markup: settingsMenu(true),
+    });
+    return;
+  }
 
-  // The service unlocks the store from this variable on every restart, so the
-  // store must be sealed with exactly it. Creating one with a different secret
-  // would produce a store the bot could never open unattended.
-  const secret = (process.env.COPYMINT_PASSPHRASE || "").trim() || passphrase;
+  // Each chat gets a key derived from the server master secret and its chat id,
+  // so one user's encrypted files cannot be opened as another user's store.
+  const secret = currentRuntime().passphrase;
   if (!secret) {
     await ctx.reply(
       "No passphrase is configured. Set <code>COPYMINT_PASSPHRASE</code> in " +
@@ -2036,10 +2117,14 @@ async function cmdSetupCreate(ctx: Context): Promise<void> {
     [
       `<b>Store created.</b>`,
       ``,
-      `${session.availableChains.length} chain(s) live · ${session.wallets().length} wallets derived`,
+      `${session.availableChains.length} chain(s) live`,
       ``,
-      `Generate the wallet set next. It costs nothing and writes nothing new —`,
-      `the phrase you just wrote down already covers every one of them.`,
+      `Your funding wallet`,
+      `<code>${esc(config.funder)}</code>`,
+      `<i>Send campaign ETH here; the bot disperses it to your mint wallets.</i>`,
+      ``,
+      `Generate the mint-wallet set next. It costs nothing and writes nothing`,
+      `new — your phrase already covers the funding wallet and every mint wallet.`,
     ].join("\n"),
     { parse_mode: "HTML", reply_markup: afterSetupMenu() }
   );
@@ -2063,9 +2148,10 @@ async function cmdSetupBurn(ctx: Context): Promise<void> {
  * operational without a restart.
  */
 async function startSession(): Promise<void> {
-  session = await Session.open(config, passphrase);
-  ready = true;
-  console.log(`  ${session.wallets().length} wallets ready.`);
+  const runtime = currentRuntime();
+  runtime.session = await Session.open(runtime.config, runtime.passphrase);
+  ensureFundingWallet();
+  console.log(`  chat ${runtime.chatId}: ${session.wallets().length} wallets ready.`);
   for (const chain of session.availableChains) {
     console.log(
       `  ${chain.name}: ${chain.rpc.endpoints.map((e) => e.label).join(", ")}` +
@@ -2075,9 +2161,17 @@ async function startSession(): Promise<void> {
   await startBackground();
 }
 
+function ensureFundingWallet(): ManagedWallet {
+  const result = ensureUserFundingWallet(session.store, config.funder);
+  if (result.needsConfigUpdate) {
+    updateUserSettings({ funder: result.wallet.address });
+    config.funder = result.wallet.address;
+  }
+  return result.wallet;
+}
+
 function notify(html: string): void {
-  const chat = config.telegram.allowedChatIds[0];
-  if (chat === undefined) return;
+  const chat = currentRuntime().chatId;
   void bot.api
     .sendMessage(chat, html, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })
     .catch(() => {
@@ -2279,19 +2373,17 @@ async function onCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  // Owner settings remain available in first-run setup mode, before a wallet
+  // User settings remain available in first-run setup mode, before a wallet
   // store or Session exists.
   if (prefix === "cfg") {
     const [action, ...values] = rest;
     switch (action) {
       case "menu":
-        return showOwnerSettings(ctx);
+        return showUserSettings(ctx);
       case "destination":
         return beginDestinationChange(ctx);
       case "save":
         return saveDestination(ctx, values.join(":"));
-      case "transfer":
-        return beginOwnershipTransfer(ctx);
     }
     return;
   }
@@ -2442,13 +2534,13 @@ async function onText(ctx: Context): Promise<void> {
     flow.step = "ready";
     await ctx.reply(
       [
-        `<b>Confirm payout address</b>`,
+        `<b>Confirm NFT vault</b>`,
         ``,
         `<code>${esc(flow.address)}</code>`,
         ``,
-        `NFT sweeps and reclaimed ETH will go here.`,
+        `Future NFT sweeps will go here.`,
       ].join("\n"),
-      { parse_mode: "HTML", reply_markup: destinationConfirm(flow.address, !ready) }
+      { parse_mode: "HTML", reply_markup: destinationConfirm(flow.address, !isReady()) }
     );
     return;
   }
@@ -2476,16 +2568,14 @@ async function onText(ctx: Context): Promise<void> {
 // ── Boot ──────────────────────────────────────────────────────────────────
 
 let bot: Bot;
-let passphrase: string;
 
 async function main(): Promise<void> {
-  // A fresh box has no config to read. Writing the default first means the
-  // operator can fill in vault and funder straight after setup.sh, without
-  // having to run the wallet tool just to get a file on disk.
+  // The root config supplies shared RPC, gas and policy defaults. Each private
+  // chat receives a separate copy under users/<chatId>/ and changes only that.
   writeDefaultConfig();
 
   try {
-    config = loadConfig();
+    bootstrapConfig = loadConfig();
   } catch (err) {
     if (err instanceof ConfigError) {
       console.error(`\n  ${err.message}\n`);
@@ -2495,35 +2585,28 @@ async function main(): Promise<void> {
   }
 
   // Environment first so systemd can start unattended; console otherwise.
-  passphrase = (process.env.COPYMINT_PASSPHRASE || "").trim();
-  if (!passphrase) {
+  masterPassphrase = (process.env.COPYMINT_PASSPHRASE || "").trim();
+  if (!masterPassphrase) {
     if (!process.stdin.isTTY) {
       console.error(
         "\n  No passphrase. Set COPYMINT_PASSPHRASE, or start with a terminal attached.\n"
       );
       process.exit(1);
     }
-    passphrase = await askPassphrase("  Store passphrase: ");
+    masterPassphrase = await askPassphrase("  Store passphrase: ");
   }
 
-  bot = new Bot(config.telegramToken);
+  bot = new Bot(bootstrapConfig.telegramToken);
 
-  // Whitelist. Everything below this line is unreachable from any other chat.
-  bot.use(async (ctx, next) => {
-    const chatId = ctx.chat?.id;
-    if (chatId === undefined || !config.telegram.allowedChatIds.includes(chatId)) {
-      if (await tryOwnershipClaim(ctx)) return;
-      console.warn(`  Rejected message from chat ${chatId}`);
-      return;
-    }
-    await next();
-  });
+  // Every private chat is a user boundary. The state-path and runtime contexts
+  // wrap the entire update, including timers and background work it creates.
+  bot.use((ctx, next) => runForUser(ctx, next));
 
   // Setup gate. Until a store exists there is no session to operate on, so
   // nothing downstream may run — every route below can assume `session` is
   // live because this refuses everything except the setup buttons.
   bot.use(async (ctx, next) => {
-    if (ready) return next();
+    if (isReady()) return next();
     const callback = ctx.callbackQuery?.data ?? "";
     if (callback.startsWith("s:") || callback.startsWith("cfg:")) return next();
     if ((ctx.message?.text ?? "").startsWith("/settings")) return next();
@@ -2541,7 +2624,7 @@ async function main(): Promise<void> {
       reply_markup: mainMenu(session.copyEnabled, targets.list().length),
     })
   );
-  bot.command("settings", (ctx) => showOwnerSettings(ctx));
+  bot.command("settings", (ctx) => showUserSettings(ctx));
   bot.command("help", (ctx) => ctx.reply(HELP, { parse_mode: "HTML" }));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));
@@ -2568,28 +2651,27 @@ async function main(): Promise<void> {
 
   bot.catch((err) => console.error("  Bot error:", err.message));
 
-  // A store on disk means a normal boot. Without one the bot still comes up,
-  // but in setup mode — the owner creates the store from chat, and startSession
-  // brings everything below online without a restart.
-  if (storeExists()) {
-    console.log("  Unlocking store and deriving wallets…");
-    await startSession();
-  } else {
-    console.log("  No wallet store yet — starting in setup mode.");
-    console.log("  Message the bot and tap “Create wallet store”.");
-  }
-
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
 
-  console.log("  Bot running.\n");
+  console.log("  Multi-user bot running. Each private chat has isolated state.\n");
+  void resumeStoredUsers().catch((err) =>
+    console.error(`  Stored-user resume failed: ${(err as Error).message}`)
+  );
   await bot.start();
 }
 
 async function shutdown(): Promise<void> {
   console.log("\n  Shutting down…");
-  session?.stopCopy();
-  session?.stopReconcile();
+  for (const pending of runtimePromises.values()) {
+    try {
+      const runtime = await pending;
+      runtime.session?.stopCopy();
+      runtime.session?.stopReconcile();
+    } catch {
+      // A runtime that never opened has no background work to stop.
+    }
+  }
   await bot?.stop();
   process.exit(0);
 }

@@ -83,16 +83,14 @@ export function mainMenu(copyOn: boolean, watching: number): InlineKeyboard {
 
 export function settingsMenu(duringSetup = false): InlineKeyboard {
   return new InlineKeyboard()
-    .text("🎯 Change payout address", "cfg:destination")
-    .row()
-    .text("👤 Transfer ownership", "cfg:transfer")
+    .text("🎯 Change NFT vault", "cfg:destination")
     .row()
     .text("‹ Back", duringSetup ? "s:cancel" : "m:main");
 }
 
 export function destinationConfirm(address: string, duringSetup = false): InlineKeyboard {
   return new InlineKeyboard()
-    .text("✅ Save payout address", `cfg:save:${address}`)
+    .text("✅ Save NFT vault", `cfg:save:${address}`)
     .row()
     .text("✕ Cancel", duringSetup ? "cfg:menu" : "m:main");
 }
@@ -284,7 +282,7 @@ export function setupMenu(): InlineKeyboard {
   return new InlineKeyboard()
     .text("🔐 Create wallet store", "s:warn")
     .row()
-    .text("⚙️ Owner settings", "cfg:menu")
+    .text("⚙️ Your settings", "cfg:menu")
     .row()
     .text("❔ What is this?", "s:explain");
 }

@@ -51,7 +51,7 @@ async function cmdInit(): Promise<void> {
     console.log("\n  Stored.\n");
   }
 
-  console.log("  Next: edit the config and set `vault`, `funder` and `telegram.allowedChatIds`.");
+  console.log("  Next: start the Telegram bot and set your NFT vault in /settings.");
   console.log("  Those addresses are intentionally not settable from Telegram.\n");
 }
 

@@ -47,7 +47,7 @@ else
 fi
 
 install -d -m 0755 -o root -g root "$APP_DIR"
-# 0700: the wallet store lives here and nothing else needs to read it.
+# 0700: every user's isolated wallet store lives below here.
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR"
 install -d -m 0750 -o root -g "$SERVICE_USER" "$SECRET_DIR"
 note "$APP_DIR (code)  $STATE_DIR (wallet store, 0700)  $SECRET_DIR (secrets, 0750)"
@@ -69,9 +69,8 @@ npx tsc
 chown -R root:root "$APP_DIR"
 note "built to $APP_DIR/dist"
 
-# Write a starter config now so there is a file to edit before first start.
-# The bot writes this itself at boot too, but it then refuses to run until
-# vault and funder are set — better to have it on disk while you are still here.
+# Write shared RPC, gas and policy defaults. Per-user config is created beneath
+# users/<chatId>/ when that private chat first messages the bot.
 sudo -u "$SERVICE_USER" COPYMINT_HOME="$STATE_DIR" \
   node -e 'require("'"$APP_DIR"'/dist/core/config.js").writeDefaultConfig()'
 note "starter config at $STATE_DIR/config.json"
@@ -118,30 +117,15 @@ $(printf '\033[1mRemaining steps — these need you\033[0m')
   1. Fill in the secrets:
        nano $SECRET_DIR/env
 
-  2. Set vault, funder and telegram.allowedChatIds:
-       nano $STATE_DIR/config.json
-
-     For the chat id: start the service, message the bot, then read
-       journalctl -u copymint -n 20
-     It logs the id it rejected. Put that in allowedChatIds and restart.
-
-     Deploying for someone else? Once the bot starts, open Owner settings,
-     tap Transfer ownership, and send the one-time link to the real owner.
-     They can set the payout address from Telegram without SSH.
-
-  3. Start it:
+  2. Start it:
        systemctl start copymint
        journalctl -u copymint -f
 
-  4. Create the wallet store from Telegram.
+  3. Open the bot from each user's private Telegram chat.
 
-     With no store on disk the bot boots into setup mode. Whoever owns
-     the wallets messages it, taps "Create wallet store", and the
-     recovery phrase is shown in their chat rather than on this terminal.
-
-     Prefer it on a terminal instead? Do this before first start:
-       sudo -u $SERVICE_USER COPYMINT_HOME=$STATE_DIR \\
-         node $APP_DIR/dist/tools/wallets.js init
+     /start creates an isolated state directory for that chat. Each user sets
+     an NFT vault, creates their own wallet store, and receives their own
+     recovery phrase. Users cannot see or operate one another's wallets.
 
 $(printf '\033[90mNo inbound ports are needed — the bot uses long polling, so\033[0m')
 $(printf '\033[90mthe firewall can stay closed to everything but SSH.\033[0m')

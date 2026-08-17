@@ -30,71 +30,44 @@ that needs a decision from you.
 | Path | Contents | Mode |
 |---|---|---|
 | `/opt/copymint` | code and `dist/` | `0755 root` |
-| `/var/lib/copymint` | wallet store, config, ledger | `0700 copymint` |
+| `/var/lib/copymint/users/<chatId>` | one user's config, wallet store, ledger and targets | `0700 copymint` |
 | `/etc/copymint/env` | secrets read by systemd | `0640 root:copymint` |
 
-## The four steps setup.sh leaves to you
+## The three steps setup.sh leaves to you
 
 **1. Secrets** — `nano /etc/copymint/env`. Bot token, OpenSea key, RPC URLs, and
 `COPYMINT_PASSPHRASE`.
 
-Set the passphrase before first start: the wallet store is sealed with whatever
-is in that variable, and the service unlocks it with the same one on every
-restart.
+Set the passphrase before first start. It is the server master secret: the bot
+derives a different encryption key for each Telegram chat, so one user's
+encrypted files cannot be opened as another user's store.
 
-That passphrase is the honest tradeoff of unattended restart. The seed is
+That passphrase is the honest tradeoff of unattended restart. The seeds are
 encrypted at rest, but a passphrase sitting beside it on the same disk means the
 encryption protects against a stolen backup or a snapshot, not against someone
 who already has root. If you would rather it never touch the disk, leave it
 blank and unlock by hand after each restart — the service will exit immediately
 on boot until you do.
 
-**2. Bootstrap config** — `nano /var/lib/copymint/config.json`. Set `vault`,
-`funder` and `telegram.allowedChatIds` once so the service can start. The two
-addresses may be the same temporary address during handoff.
-
-For the chat id: start the service, message the bot, then read
-`journalctl -u copymint -n 20`. It logs the id it rejected. Add that id and
-restart.
-
-After startup, the authorized chat can open **Owner settings** to change the
-payout address or create a one-time, 10-minute ownership-transfer link. The new
-owner opens that link, becomes the sole authorized chat, and can replace the
-temporary payout address without SSH.
-
-That convenience changes the security boundary: control of the authorized
-Telegram account includes the ability to redirect future sweeps. Protect it
-with Telegram two-step verification. Existing assets are never moved by a
-settings change.
-
-**3. Start**
+**2. Start**
 
 ```bash
 systemctl start copymint
 journalctl -u copymint -f
 ```
 
-**4. Wallet store** — created from Telegram, not from here.
+**3. Each user starts privately in Telegram.**
 
-With no store on disk the bot boots into **setup mode**: the whitelist still
-applies, and only setup and owner-settings buttons work. Transfer ownership
-first when the installer and wallet owner are different. The owner then taps
-through the wallet warning, and the 12-word recovery phrase is shown in their
-chat. The message is deleted on confirmation, and after ten minutes regardless.
-The session then comes up in place — no restart.
+Every private chat gets an isolated directory and setup flow. The user sends
+`/start`, sets their NFT vault, then creates their wallet store. Their
+12-word recovery phrase is shown only in their chat, deleted on confirmation,
+and deleted after ten minutes regardless. Their session comes up without a
+service restart; other users' sessions keep running.
 
-This exists so the phrase is seen by the wallets' owner rather than by whoever is
-holding the SSH session. The cost is that it travels through Telegram, whose
-cloud chats are not end-to-end encrypted. To keep it off Telegram entirely,
-create the store on the terminal before first start:
-
-```bash
-sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
-  node /opt/copymint/dist/tools/wallets.js init
-```
-
-Either way the phrase restores every derived wallet — but **not** imported keys,
-which live in `imported.enc` and need their own backup.
+The phrase travels through Telegram, whose cloud chats are not end-to-end
+encrypted. Users should enable Telegram two-step verification and write the
+phrase on paper. It restores every derived wallet, but **not** imported keys,
+which need a separate backup.
 
 ## Operating
 
@@ -107,8 +80,8 @@ journalctl -u copymint -p err      # errors only
 
 `Restart=always` brings it back after a crash; `StartLimitBurst=10` means a
 genuine config error stops the unit instead of looping forever. If it will not
-start, `journalctl -u copymint -n 50` almost always names the reason — a missing
-secret, or `vault`/`funder` unset.
+start, `journalctl -u copymint -n 50` almost always names the missing secret or
+configuration error.
 
 **`copy.enabled` is `false` by default, and `/copy on` does not survive a
 restart.** Autonomous spending resumes after a reboot only because
@@ -122,7 +95,7 @@ npm install --omit=dev && npx tsc
 systemctl restart copymint
 ```
 
-The wallet store lives in `/var/lib/copymint` and is untouched by any of that.
+User stores live under `/var/lib/copymint/users/` and are untouched by any of that.
 
 ## Sanity checks before trusting it
 

@@ -7,10 +7,45 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readdirSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const stateContext = new AsyncLocalStorage<string>();
+
+export function rootStateDir(): string {
+  return process.env.COPYMINT_HOME || join(homedir(), ".copymint");
+}
 
 export function stateDir(): string {
-  return process.env.COPYMINT_HOME || join(homedir(), ".copymint");
+  return stateContext.getStore() || rootStateDir();
+}
+
+export function userStateDir(chatId: number): string {
+  if (!Number.isSafeInteger(chatId) || chatId <= 0) {
+    throw new Error(`Invalid private Telegram chat id: ${chatId}`);
+  }
+  return join(rootStateDir(), "users", String(chatId));
+}
+
+/** Users whose encrypted stores should resume background work after a reboot. */
+export function storedUserChatIds(): number[] {
+  const users = join(rootStateDir(), "users");
+  if (!existsSync(users)) return [];
+  return readdirSync(users, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+    .map((entry) => Number(entry.name))
+    .filter(
+      (chatId) =>
+        Number.isSafeInteger(chatId) &&
+        chatId > 0 &&
+        existsSync(join(users, String(chatId), "seed.enc"))
+    )
+    .sort((a, b) => a - b);
+}
+
+/** Keep every path lookup inside one Telegram user's isolated state tree. */
+export function withStateDir<T>(dir: string, work: () => T): T {
+  return stateContext.run(dir, work);
 }
 
 export function ensureStateDir(): string {

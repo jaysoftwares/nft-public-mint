@@ -1,9 +1,9 @@
-// Bot configuration, loaded from disk. Most policy stays SSH-only, while the
-// small owner-settings surface (destination + authorized chat) is persisted by
-// an explicit, confirmed Telegram flow.
+// Bot configuration, loaded from disk. Shared policy comes from the root
+// config; each private chat gets its own copy and can persist its destination
+// through an explicit, confirmed Telegram flow.
 
 import { readFileSync, existsSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
-import { getAddress, parseEther, parseUnits } from "ethers";
+import { getAddress, parseEther, parseUnits, ZeroAddress } from "ethers";
 import { CHAINS, resolveChain } from "../chains";
 import { FILES, ensureStateDir } from "./paths";
 
@@ -61,9 +61,9 @@ export interface SignedConfig {
 
 export interface BotConfig {
   chain: string;
-  /** Sweep destination. Changeable only by the authorized owner settings flow. */
+  /** Sweep destination. Changeable by this user's confirmed settings flow. */
   vault: string;
-  /** The wallet permitted to disperse funds. Updated with the owner destination. */
+  /** The user's derived wallet that disperses and reclaims campaign funds. */
   funder: string;
   /** How many derived wallets stay funded for copy-mint. */
   hotSetSize: number;
@@ -79,7 +79,6 @@ export interface BotConfig {
   caps: CapsConfig;
   copy: CopyConfig;
   signed: SignedConfig;
-  telegram: { allowedChatIds: number[] };
   /** Optional endpoint overrides; empty falls back to chains.ts + .env. */
   rpc: { read: string[]; send: string[] };
 }
@@ -104,8 +103,10 @@ export class ConfigError extends Error {
 
 export const DEFAULT_CONFIG: BotConfig = {
   chain: "base",
-  vault: "",
-  funder: "",
+  // Setup sentinel. The Telegram flow refuses wallet creation until each user
+  // confirms a real destination in their isolated settings.
+  vault: ZeroAddress,
+  funder: ZeroAddress,
   hotSetSize: 50,
   reconcileBatch: 100,
   gas: { limit: 250_000, maxFeeGwei: "2", priorityGwei: "0.05" },
@@ -134,15 +135,13 @@ export const DEFAULT_CONFIG: BotConfig = {
     minDelayMs: 400,
     maxRetries: 3,
   },
-  telegram: { allowedChatIds: [] },
   rpc: { read: [], send: [] },
 };
 
 function requireAddress(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new ConfigError(
-      `config.json: "${field}" is required. Set it to an address you control — ` +
-        `it cannot be changed from Telegram, which is the point.`
+      `config.json: "${field}" is required. Set it to an address you control.`
     );
   }
   try {
@@ -172,32 +171,36 @@ function requireGwei(value: unknown, field: string): bigint {
 }
 
 export function writeDefaultConfig(): string {
+  return writeConfigIfMissing(DEFAULT_CONFIG);
+}
+
+export function writeConfigIfMissing(config: BotConfig): string {
   ensureStateDir();
   const path = FILES.config();
   if (existsSync(path)) return path;
-  writeFileSync(path, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", {
+  writeFileSync(path, JSON.stringify(config, null, 2) + "\n", {
     encoding: "utf8",
     mode: 0o600,
   });
   return path;
 }
 
-export interface OwnerSettingsUpdate {
-  /** Sets both vault and funder to one deliberately confirmed address. */
+export interface UserSettingsUpdate {
+  /** User-controlled NFT sweep destination. */
   destination?: string;
-  /** Replaces the whitelist; ownership transfer always supplies exactly one. */
-  allowedChatIds?: number[];
+  /** Bot-controlled derived wallet used to disperse and reclaim ETH. */
+  funder?: string;
 }
 
 /**
- * Persist the narrow settings surface that the Telegram owner may change.
+ * Persist the narrow settings surface that one Telegram user may change.
  *
  * Everything else in config.json remains SSH-only. Writing through a sibling
  * temporary file keeps a crash from leaving half-written JSON behind.
  */
-export function updateOwnerSettings(update: OwnerSettingsUpdate): {
+export function updateUserSettings(update: UserSettingsUpdate): {
   destination?: string;
-  allowedChatIds?: number[];
+  funder?: string;
 } {
   const path = FILES.config();
   if (!existsSync(path)) {
@@ -211,33 +214,30 @@ export function updateOwnerSettings(update: OwnerSettingsUpdate): {
     throw new ConfigError(`config.json is not valid JSON: ${(err as Error).message}`);
   }
 
-  const result: { destination?: string; allowedChatIds?: number[] } = {};
+  const result: { destination?: string; funder?: string } = {};
 
   if (update.destination !== undefined) {
     try {
       const destination = getAddress(update.destination.trim());
       raw.vault = destination;
-      raw.funder = destination;
       result.destination = destination;
     } catch {
       throw new ConfigError(`That is not a valid Ethereum address: ${update.destination}`);
     }
   }
 
-  if (update.allowedChatIds !== undefined) {
-    const ids = [...new Set(update.allowedChatIds)];
-    if (
-      ids.length === 0 ||
-      ids.some((id) => !Number.isSafeInteger(id) || id === 0)
-    ) {
-      throw new ConfigError("At least one valid Telegram chat id is required.");
+  if (update.funder !== undefined) {
+    try {
+      const funder = getAddress(update.funder.trim());
+      raw.funder = funder;
+      result.funder = funder;
+    } catch {
+      throw new ConfigError(`That is not a valid funding-wallet address: ${update.funder}`);
     }
-    raw.telegram = { ...(raw.telegram ?? {}), allowedChatIds: ids };
-    result.allowedChatIds = ids;
   }
 
-  if (result.destination === undefined && result.allowedChatIds === undefined) {
-    throw new ConfigError("No owner setting was supplied.");
+  if (result.destination === undefined && result.funder === undefined) {
+    throw new ConfigError("No user setting was supplied.");
   }
 
   const temporary = `${path}.${process.pid}.tmp`;
@@ -260,7 +260,7 @@ export function loadConfig(): ResolvedConfig {
   const path = FILES.config();
   if (!existsSync(path)) {
     throw new ConfigError(
-      `No config at ${path}.\nRun \`npm run wallets -- init\` to write a starter config, then fill in vault and funder.`
+      `No config at ${path}. Run the deployment setup to write shared defaults.`
     );
   }
 
@@ -287,7 +287,6 @@ export function loadConfig(): ResolvedConfig {
       api: { ...DEFAULT_CONFIG.signed.api, ...(raw.signed?.api ?? {}) },
       siwe: { ...DEFAULT_CONFIG.signed.siwe, ...(raw.signed?.siwe ?? {}) },
     },
-    telegram: { ...DEFAULT_CONFIG.telegram, ...(raw.telegram ?? {}) },
     rpc: { ...DEFAULT_CONFIG.rpc, ...(raw.rpc ?? {}) },
   };
 
@@ -304,13 +303,6 @@ export function loadConfig(): ResolvedConfig {
   if (!telegramToken) {
     throw new ConfigError(
       "TELEGRAM_BOT_TOKEN is not set. Export it in the bot's environment — it does not belong in config.json."
-    );
-  }
-
-  if (!Array.isArray(merged.telegram.allowedChatIds) || merged.telegram.allowedChatIds.length === 0) {
-    throw new ConfigError(
-      'config.json: "telegram.allowedChatIds" is empty. With no whitelist the bot would accept commands from anyone who finds it.\n' +
-        "Message the bot once and check its log for your chat id, then add it."
     );
   }
 

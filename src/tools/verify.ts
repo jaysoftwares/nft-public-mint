@@ -43,8 +43,10 @@ import {
 } from "../core/allowlist";
 import { id as ethersId, TypedDataEncoder } from "ethers";
 import { inspectCalldata } from "../core/mint-opensea";
-import { writeDefaultConfig, updateOwnerSettings, ConfigError } from "../core/config";
-import { OwnershipClaims } from "../bot/ownership";
+import { writeDefaultConfig, updateUserSettings, ConfigError } from "../core/config";
+import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
+import { deriveUserPassphrase } from "../core/user-key";
+import { ensureUserFundingWallet } from "../bot/user-wallet";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 import {
   deriveDigest,
@@ -113,43 +115,95 @@ async function main(): Promise<void> {
   );
 
   // ── owner settings ────────────────────────────────────────────────────
-  section("owner settings");
+  section("user settings");
   const configPath = writeDefaultConfig();
-  const savedSettings = updateOwnerSettings({
+  const savedSettings = updateUserSettings({
     destination: VECTORS[0].toLowerCase(),
-    allowedChatIds: [12345, 12345],
   });
   const savedConfig = JSON.parse(readFileSync(configPath, "utf8"));
   check("destination is checksummed", savedSettings.destination === VECTORS[0]);
   check("vault is persisted", savedConfig.vault === VECTORS[0]);
-  check("funder follows the destination", savedConfig.funder === VECTORS[0]);
-  check("owner whitelist is deduplicated", savedConfig.telegram.allowedChatIds.length === 1);
+  check("destination does not overwrite funder", savedConfig.funder !== VECTORS[0]);
+  updateUserSettings({ funder: VECTORS[1] });
+  const configWithFunder = JSON.parse(readFileSync(configPath, "utf8"));
+  check("derived funder is persisted separately", configWithFunder.funder === VECTORS[1]);
   check(
     "invalid destination is rejected",
-    throws(() => updateOwnerSettings({ destination: "not-an-address" }), ConfigError)
-  );
-  check(
-    "empty owner whitelist is rejected",
-    throws(() => updateOwnerSettings({ allowedChatIds: [] }), ConfigError)
+    throws(() => updateUserSettings({ destination: "not-an-address" }), ConfigError)
   );
 
-  const claims = new OwnershipClaims(1_000);
-  const claim = claims.issue(12345, 10_000);
+  // ── per-user isolation ────────────────────────────────────────────────
+  section("per-user isolation");
+  const firstKey = deriveUserPassphrase("server-master", 11111);
+  const secondKey = deriveUserPassphrase("server-master", 22222);
+  check("user encryption keys are distinct", firstKey !== secondKey);
+  check("user encryption key is stable", firstKey === deriveUserPassphrase("server-master", 11111));
+  const firstUserDir = userStateDir(11111);
+  const secondUserDir = userStateDir(22222);
+  const [firstUser, secondUser] = await Promise.all([
+    withStateDir(firstUserDir, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      writeDefaultConfig();
+      updateUserSettings({ destination: VECTORS[0] });
+      initFromMnemonic(TEST_MNEMONIC, "first-user-passphrase");
+      const userStore = unlock("first-user-passphrase");
+      const funding = ensureUserFundingWallet(userStore, ZERO_ADDRESS);
+      updateUserSettings({ funder: funding.wallet.address });
+      const repeated = ensureUserFundingWallet(userStore, funding.wallet.address);
+      return {
+        state: stateDir(),
+        seed: FILES.seed(),
+        walletCount: userStore.all().length,
+        funding: funding.wallet,
+        repeatedFunding: repeated.wallet,
+        config: JSON.parse(readFileSync(FILES.config(), "utf8")),
+      };
+    }),
+    withStateDir(secondUserDir, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      writeDefaultConfig();
+      updateUserSettings({ destination: VECTORS[1] });
+      initFromMnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "second-user-passphrase"
+      );
+      const userStore = unlock("second-user-passphrase");
+      const funding = ensureUserFundingWallet(userStore, ZERO_ADDRESS);
+      updateUserSettings({ funder: funding.wallet.address });
+      userStore.generate(1);
+      return {
+        state: stateDir(),
+        seed: FILES.seed(),
+        walletCount: userStore.all().length,
+        funding: funding.wallet,
+        config: JSON.parse(readFileSync(FILES.config(), "utf8")),
+      };
+    }),
+  ]);
+  check("user state directories are distinct", firstUser.state !== secondUser.state);
+  check("async state context survives timers", firstUser.state === firstUserDir);
+  check("wallet-store paths are isolated", firstUser.seed !== secondUser.seed);
+  check("first user's wallet count is isolated", firstUser.walletCount === 1);
+  check("second user's wallet count is isolated", secondUser.walletCount === 2);
   check(
-    "wrong ownership token is rejected",
-    claims.consumeStart(`/start claim_${"0".repeat(32)}`, 10_100).kind === "invalid"
+    "users receive different funding wallets",
+    firstUser.funding.address !== secondUser.funding.address
   );
-  const accepted = claims.consumeStart(`/start claim_${claim.token}`, 10_100);
-  check("ownership token identifies issuer", accepted.kind === "valid" && accepted.issuedBy === 12345);
+  check("funding wallet is manual-only", firstUser.funding.autoFire === false);
+  check("funding wallet is tagged", firstUser.funding.tags.includes("funder"));
   check(
-    "ownership token is single-use",
-    claims.consumeStart(`/start claim_${claim.token}`, 10_100).kind === "invalid"
+    "funding wallet creation is idempotent",
+    firstUser.repeatedFunding.address === firstUser.funding.address
   );
-  const expired = claims.issue(12345, 20_000);
+  check("first user's funder is persisted", firstUser.config.funder === firstUser.funding.address);
+  check("second user's funder is persisted", secondUser.config.funder === secondUser.funding.address);
+  check("first user keeps its destination", firstUser.config.vault === VECTORS[0]);
+  check("second user keeps its destination", secondUser.config.vault === VECTORS[1]);
   check(
-    "ownership token expires",
-    claims.consumeStart(`/start claim_${expired.token}`, 21_001).kind === "expired"
+    "stored users are discoverable after restart",
+    storedUserChatIds().join(",") === "11111,22222"
   );
+  check("state context returns to root", stateDir() === SCRATCH);
 
   // ── wallet store ──────────────────────────────────────────────────────
   section("wallet store");

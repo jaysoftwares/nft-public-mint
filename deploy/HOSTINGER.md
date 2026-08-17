@@ -73,7 +73,7 @@ TypeScript, installs the systemd unit. Three or four minutes.
 | Path | Holds | Mode |
 |---|---|---|
 | `/opt/copymint` | code and compiled `dist/` | `0755 root` |
-| `/var/lib/copymint` | wallet store, config, ledger | `0700 copymint` |
+| `/var/lib/copymint/users/<chatId>` | isolated config, wallet store, ledger and targets | `0700 copymint` |
 | `/etc/copymint/env` | secrets, read by systemd | `0640 root:copymint` |
 
 Node 22 specifically: the copy-mint watcher needs a global `WebSocket`, which
@@ -105,80 +105,40 @@ RPC_MAX_CALLS_PER_SEC=45
 
 `Ctrl+O` to save, `Ctrl+X` to exit.
 
-Set `COPYMINT_PASSPHRASE` now, before first start — the wallet store gets sealed
-with whatever is in this variable, and the service unlocks it with the same one
-on every restart.
+Set `COPYMINT_PASSPHRASE` now, before first start. It is the server master
+secret; the bot derives a different encryption key for every Telegram chat.
 
 > **The passphrase tradeoff.** Storing it here is what lets the service restart
-> unattended at 4am. But a passphrase sitting beside the encrypted seed means
+> unattended at 4am. But a passphrase sitting beside the encrypted seeds means
 > the encryption protects you against a stolen backup or snapshot — **not**
 > against someone who already has root.
 >
 > Leave it blank if you'd rather unlock by hand. The service will start and exit
 > immediately after every reboot until you do — and the Telegram setup flow in
-> step 8 cannot create the store without it.
+> the Telegram setup flow cannot create stores without it.
 
 ---
 
-## 6. Point the config at your addresses
-
-```bash
-nano /var/lib/copymint/config.json
-```
-
-```json
-"vault":  "0x… where swept NFTs go",
-"funder": "0x… the wallet that disperses gas",
-"telegram": { "allowedChatIds": [ your id — next step ] }
-```
-
-These are bootstrap values. After startup, **Owner settings** in Telegram can
-change both to one confirmed payout address. The installer can also create a
-one-time, 10-minute transfer link; opening it makes the recipient the sole
-authorized chat. Protect that Telegram account with two-step verification,
-because it can redirect future sweeps. A settings change never moves assets
-that were already sent.
-
-Leave `copy.enabled` as `false` until you've watched real signals for a while.
-`/copy on` in chat is deliberately temporary and does not survive a restart.
-
----
-
-## 7. Start it, and claim your chat id
+## 6. Start it
 
 ```bash
 systemctl start copymint
 journalctl -u copymint -f
 ```
 
-The log says `No wallet store yet — starting in setup mode.` That's expected —
-there's nothing to mint with until step 8.
-
-Open Telegram, find your bot, send `/start`. The log prints:
-
-```
-Rejected message from chat 123456789
-```
-
-That's the whitelist working. Put the number in `allowedChatIds`, restart, and
-send `/start` again. If this VPS is for someone else, open **Owner settings →
-Transfer ownership**, then forward the one-time link to them before creating
-the wallet store.
-
-```bash
-nano /var/lib/copymint/config.json
-systemctl restart copymint
-```
+The log says `Multi-user bot running.` No whitelist or chat-id editing is
+needed. Group chats are refused; every private chat is a separate user.
 
 ---
 
-## 8. Create the wallet store — from Telegram
+## 7. Each user creates their own wallet store in Telegram
 
 This is the step that used to live on this terminal. It doesn't any more.
 
-Send `/start`. With no store on disk the bot answers with a setup screen rather
-than the main menu:
+Each user opens a private chat with the bot and sends `/start`. Their isolated
+setup screen asks them to set an NFT vault before creating wallets:
 
+- **⚙️ Your settings** — set that user's NFT vault and view their funding wallet.
 - **❔ What is this?** — what the phrase controls and where it will appear.
 - **🔐 Create wallet store** — warns first, then shows the phrase.
 
@@ -186,9 +146,8 @@ Tapping through generates the 12-word phrase and prints it **in the chat**. Writ
 it on paper, then tap **"Written down — delete this message"**. If nobody taps,
 the message deletes itself after ten minutes.
 
-The bot then comes up fully — no restart needed — and offers **➕ Generate 500
-wallets**. Tap it. Deriving costs nothing and writes nothing new: all 500 come
-out of the phrase you just wrote down.
+That user's bot session then comes up fully — no service restart needed — and
+offers **➕ Generate 500 wallets**. Other users' sessions keep running.
 
 > **The phrase goes through Telegram.** Cloud chats are not end-to-end
 > encrypted, so it passes through Telegram's servers on the way to whoever is
@@ -197,13 +156,6 @@ out of the phrase you just wrote down.
 > who owns the wallets, not by whoever holds the server's SSH session — but it
 > is a tradeoff, not a free win.
 >
-> To avoid it entirely, create the store on the terminal *before* first start
-> and the bot will never enter setup mode:
-> ```bash
-> sudo -u copymint COPYMINT_HOME=/var/lib/copymint \
->   node /opt/copymint/dist/tools/wallets.js init
-> ```
-
 > **One bot per seed — this one bites.**
 >
 > If you restore your desktop mnemonic here and both bots ever run at once, they
@@ -220,7 +172,7 @@ out of the phrase you just wrote down.
 
 ---
 
-## 9. Measure from the server
+## 8. Measure from the server
 
 Latency and provider limits from Hostinger's network are not the numbers you
 measured from your desk.
@@ -230,7 +182,7 @@ measured from your desk.
 set -a; . /etc/copymint/env; set +a
 cd /opt/copymint
 
-node dist/tools/verify.js                    # 121 offline checks
+node dist/tools/verify.js                    # 150 offline checks
 node dist/tools/shakedown.js --chain base    # live, read-only
 ```
 
@@ -259,10 +211,10 @@ npm install --omit=dev && npx tsc
 systemctl restart copymint
 ```
 
-The wallet store lives in `/var/lib/copymint`; none of that touches it.
+User stores live in `/var/lib/copymint/users/<chatId>`; none of that touches them.
 
 **If it won't start** — `journalctl -u copymint -n 50` almost always names the
-reason outright: a missing secret, or `vault`/`funder` still unset. The unit
+missing secret or configuration error. The unit
 retries ten times in five minutes then stops, so a genuine config error surfaces
 as a stopped service rather than an endless crash loop.
 
