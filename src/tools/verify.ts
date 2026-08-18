@@ -78,6 +78,7 @@ import {
 } from "../core/nonce-manager";
 import { isBenign, classifyEndpoints } from "../core/dispatcher";
 import { isFundingRevert } from "../core/calldata";
+import { LogWatcher, deriveWsUrl, ERC721_TRANSFER } from "../core/log-watcher";
 import { record as recordLedger, spentSince as ledgerSpentSince } from "../core/ledger";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 import {
@@ -354,6 +355,149 @@ async function main(): Promise<void> {
     !isFundingRevert("NotActive()")
   );
   check("…nor is a missing reason", !isFundingRevert(undefined));
+
+
+  // ── copy-mint detection without WebSocket ─────────────────────────────
+  //
+  // deriveWsUrl only rewrites a scheme, so it returns a wss:// URL for hosts
+  // that do not serve WebSocket at all — mainnet.base.org answers the upgrade
+  // with 405 and both Robinhood endpoints with 400. The watcher looped on
+  // those forever and never reached the polling branch, so copy-mint reported
+  // "Watching 1 target" and detected nothing. Polling has to actually deliver.
+  section("copy-mint detection without WebSocket");
+
+  check("a scheme rewrite is not proof of WebSocket support", deriveWsUrl("https://x.io/") === "wss://x.io/");
+  check("a non-http endpoint yields none", deriveWsUrl("ipc:///tmp/geth.ipc") === undefined);
+
+  const WATCHED = VECTORS[1];
+  const MINT_CONTRACT = "0x1111111111111111111111111111111111111111";
+  const MINT_TX = `0x${"ab".repeat(32)}`;
+  let logsServed = 0;
+  let headCalls = 0;
+
+  const chainServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const reply = (result: unknown): string =>
+        JSON.stringify({ jsonrpc: "2.0", id: body.id, result });
+      response.setHeader("content-type", "application/json");
+
+      if (body.method === "eth_blockNumber") {
+        // The startup read sees block 100; every poll after it sees 101, so
+        // there is exactly one new block to scan and one log to find in it.
+        headCalls += 1;
+        response.end(reply(headCalls === 1 ? "0x64" : "0x65"));
+        return;
+      }
+      if (body.method === "eth_getLogs") {
+        const isErc721 = body.params[0].topics[0] === ERC721_TRANSFER;
+        logsServed += 1;
+        response.end(
+          reply(
+            isErc721
+              ? [
+                  {
+                    address: MINT_CONTRACT,
+                    topics: [
+                      ERC721_TRANSFER,
+                      `0x${"0".repeat(64)}`,
+                      `0x${"0".repeat(24)}${WATCHED.slice(2).toLowerCase()}`,
+                      `0x${"0".repeat(63)}1`,
+                    ],
+                    transactionHash: MINT_TX,
+                    blockNumber: "0x65",
+                  },
+                ]
+              : []
+          )
+        );
+        return;
+      }
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { message: "no" } }));
+    });
+  });
+  await new Promise<void>((resolve) => chainServer.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const chainUrl = `http://127.0.0.1:${(chainServer.address() as { port: number }).port}`;
+    const detected: { contract: string; recipient: string; tx: string }[] = [];
+
+    const watcher = new LogWatcher({
+      wsUrl: undefined, // the state a non-WebSocket endpoint must end up in
+      httpUrl: chainUrl,
+      targets: [WATCHED],
+      onMint: (event) =>
+        detected.push({
+          contract: event.contract,
+          recipient: event.recipient,
+          tx: event.transactionHash,
+        }),
+      onStatus: () => undefined,
+      pollIntervalMs: 20,
+    });
+
+    await watcher.start();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    watcher.stop();
+
+    check("polling detects a mint", detected.length >= 1);
+    check("…on the right contract", detected[0]?.contract === MINT_CONTRACT);
+    check(
+      "…credited to the watched address",
+      detected[0]?.recipient?.toLowerCase() === WATCHED.toLowerCase()
+    );
+    check("…and carries the source transaction", detected[0]?.tx === MINT_TX);
+    check("a replayed log is not signalled twice", detected.length === 1, `saw ${detected.length}`);
+
+    // Stopping must actually stop: a tick that was mid-request used to re-arm
+    // itself after stopPolling(), leaving two loops reporting different gaps.
+    const servedAtStop = logsServed;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    check("a stopped watcher issues no further polls", logsServed === servedAtStop);
+
+    // The regression itself: a wsUrl the runtime cannot open must end in
+    // polling, not in an endless reconnect. Before this, the watcher retried
+    // forever and copy-mint never saw a single mint.
+    headCalls = 0;
+    logsServed = 0;
+    const fellBack: string[] = [];
+    const detectedAfterFallback: string[] = [];
+
+    const wedged = new LogWatcher({
+      // Not a WebSocket scheme, so the constructor rejects it every time —
+      // standing in for a host that answers the upgrade with 400 or 405.
+      wsUrl: "https://not-a-websocket.invalid/",
+      httpUrl: chainUrl,
+      targets: [WATCHED],
+      onMint: (event) => detectedAfterFallback.push(event.transactionHash),
+      onStatus: (message) => fellBack.push(message),
+      pollIntervalMs: 20,
+    });
+
+    await wedged.start();
+    // 1s + 2s of backoff between the three attempts, then polling.
+    await new Promise((resolve) => setTimeout(resolve, 3_800));
+    wedged.stop();
+
+    check(
+      "an unusable WebSocket endpoint gives up and polls",
+      fellBack.some((m) => m.includes("Switching to polling"))
+    );
+    check(
+      "…saying which host and why",
+      fellBack.some((m) => m.includes("does not serve WebSocket"))
+    );
+    check(
+      "…and the backoff grows instead of pinning at retry 1",
+      fellBack.some((m) => m.includes("retry 2")),
+      fellBack.join(" | ")
+    );
+    check("…and mints are detected after the switch", detectedAfterFallback.length === 1);
+  } finally {
+    await new Promise<void>((resolve) => chainServer.close(() => resolve()));
+  }
 
   section("user settings");
   const configPath = writeDefaultConfig();

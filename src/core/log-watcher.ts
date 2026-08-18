@@ -18,8 +18,18 @@
 //   nothing. A lightweight eth_blockNumber request probes that same socket, so
 //   silence is only treated as a disconnect when the provider also ignores the
 //   health checks.
+//
+// The fallback to polling has to be real, not just intended. deriveWsUrl only
+// rewrites a scheme, so it hands back a wss:// URL for any https:// RPC whether
+// or not that host speaks WebSocket — and most public ones do not:
+// mainnet.base.org answers the upgrade with 405, and both Robinhood endpoints
+// answer 400. The watcher therefore connected, was closed, and reconnected
+// forever, never once reaching the polling branch that exists for exactly this
+// case. Copy-mint sat there reporting "Watching 1 target" and detecting
+// nothing. An endpoint that closes without ever confirming a subscription is
+// now treated as one that cannot do this, and polling takes over for good.
 
-import { rpcCall } from "./rpc";
+import { rpcCall, hostOf } from "./rpc";
 
 /** ERC-721 Transfer(address,address,uint256) — tokenId indexed, so 4 topics. */
 export const ERC721_TRANSFER =
@@ -30,6 +40,26 @@ export const ERC1155_TRANSFER_SINGLE =
   "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 
 const ZERO_TOPIC = `0x${"0".repeat(64)}`;
+
+/**
+ * Failed connections tolerated before concluding the host cannot serve
+ * WebSocket. Three is enough to ride out a restart or a brief outage without
+ * spending days reconnecting to an endpoint that will never answer.
+ */
+const MAX_DEAD_CONNECTS = 3;
+
+/** Polling cadence when push delivery is unavailable. */
+const DEFAULT_POLL_MS = 750;
+
+/**
+ * How long a connection gets to produce a confirmed subscription.
+ *
+ * Without this a socket that neither opens nor errors — a host that accepts the
+ * TCP connection and then says nothing — left the watcher permanently silent,
+ * with no reconnect and not one status message to say so. The heartbeat cannot
+ * cover it because the heartbeat only starts once the socket opens.
+ */
+const SUBSCRIBE_TIMEOUT_MS = 15_000;
 
 export interface LogEvent {
   /** The token contract that emitted the Transfer. */
@@ -95,6 +125,18 @@ export class LogWatcher {
   private subscriptionIds = new Set<string>();
   private nextRequestId = 1;
   private seenTx = new Set<string>();
+  /** A subscription was confirmed on the current socket. */
+  private subscribed = false;
+  /** A subscription was confirmed at least once, ever, on this endpoint. */
+  private wsEverWorked = false;
+  /** Connections that closed without ever confirming a subscription. */
+  private deadConnects = 0;
+  /** Set once this endpoint has proved it cannot serve WebSocket. */
+  private wsUnavailable = false;
+  private polling = false;
+  private connectTimer?: NodeJS.Timeout;
+  /** Retires in-flight polling ticks when the loop is stopped or restarted. */
+  private pollGeneration = 0;
 
   constructor(opts: WatcherOptions) {
     this.opts = opts;
@@ -128,15 +170,17 @@ export class LogWatcher {
       return;
     }
 
-    if (this.opts.wsUrl && typeof WebSocket !== "undefined") {
+    if (this.opts.wsUrl && typeof WebSocket !== "undefined" && !this.wsUnavailable) {
       this.connect();
     } else {
-      this.opts.onStatus(
-        this.opts.wsUrl
-          ? "No WebSocket support in this runtime — falling back to polling."
-          : "No WebSocket endpoint — falling back to polling.",
-        "warn"
-      );
+      if (!this.wsUnavailable) {
+        this.opts.onStatus(
+          this.opts.wsUrl
+            ? "No WebSocket support in this runtime — falling back to polling."
+            : "No WebSocket endpoint — falling back to polling.",
+          "warn"
+        );
+      }
       this.startPolling();
     }
   }
@@ -162,24 +206,51 @@ export class LogWatcher {
   // ── WebSocket path ──────────────────────────────────────────────────
 
   private connect(): void {
-    if (!this.running || !this.opts.wsUrl) return;
+    if (!this.running || !this.opts.wsUrl || this.wsUnavailable) return;
 
+    this.subscribed = false;
+    // Whichever of error/close arrives first owns the failure; the other is
+    // ignored. They are not reliably paired — a rejected upgrade fires `error`
+    // and never fires `close` at all.
+    let settled = false;
     let socket: WebSocket;
     try {
       socket = new WebSocket(this.opts.wsUrl);
       this.socket = socket;
     } catch (err) {
+      // A constructor that throws is as dead as one that closes — count it the
+      // same way, or a malformed endpoint loops forever at the backoff ceiling.
+      this.deadConnects += 1;
+      if (!this.wsEverWorked && this.deadConnects >= MAX_DEAD_CONNECTS) {
+        this.fallBackToPolling(`${this.opts.wsUrl} could not be opened (${(err as Error).message})`);
+        return;
+      }
       this.scheduleReconnect((err as Error).message);
       return;
     }
 
+    this.connectTimer = setTimeout(() => {
+      if (!this.running || this.socket !== socket || this.subscribed) return;
+      this.socket = undefined;
+      try {
+        socket.close();
+      } catch {
+        /* already gone */
+      }
+      this.onDeadConnection(`no subscription within ${SUBSCRIBE_TIMEOUT_MS / 1000}s`);
+    }, SUBSCRIBE_TIMEOUT_MS);
+    this.connectTimer.unref?.();
+
     socket.addEventListener("open", () => {
       if (!this.running || this.socket !== socket) return;
-      this.reconnectAttempt = 0;
+      // Deliberately not resetting reconnectAttempt here. A host that rejects
+      // the upgrade still opens and closes, so resetting on `open` pinned the
+      // backoff at "retry 1 in 1s" forever and hammered the endpoint once a
+      // second. The counter resets when a subscription is confirmed, which is
+      // the first point the connection has proved it is worth anything.
       this.lastMessageAt = Date.now();
       this.subscribe();
       void this.replayMissed();
-      this.opts.onStatus(`Watching ${this.opts.targets.length} target(s).`, "info");
       this.startHeartbeat();
     });
 
@@ -192,14 +263,22 @@ export class LogWatcher {
     socket.addEventListener("close", () => {
       // Closing a socket intentionally during retarget/heartbeat recovery must
       // not schedule a second reconnect from its later close event.
-      if (this.running && this.socket === socket) {
-        this.socket = undefined;
-        this.scheduleReconnect("socket closed");
-      }
+      if (!this.running || this.socket !== socket || settled) return;
+      settled = true;
+      this.socket = undefined;
+      this.onDeadConnection("socket closed");
     });
 
     socket.addEventListener("error", () => {
-      // 'close' always follows; reconnect is handled there to avoid doubling up.
+      // A rejected upgrade — 400 or 405, which is what every non-WebSocket RPC
+      // answers — fires this and then nothing at all. Waiting for a `close`
+      // that never comes is what left the watcher silently dead: no reconnect,
+      // no fallback, no status message, and copy-mint detecting nothing while
+      // still reporting itself as watching.
+      if (!this.running || this.socket !== socket || settled) return;
+      settled = true;
+      this.socket = undefined;
+      this.onDeadConnection("connection refused by the endpoint");
     });
   }
 
@@ -247,6 +326,16 @@ export class LogWatcher {
 
     if (typeof message.result === "string" && message.id !== undefined) {
       this.subscriptionIds.add(message.result);
+      // This is the point the connection has proved itself: the provider
+      // accepted a log subscription and will deliver events on it.
+      if (!this.subscribed) {
+        this.subscribed = true;
+        this.wsEverWorked = true;
+        this.clearConnectTimer();
+        this.reconnectAttempt = 0;
+        this.deadConnects = 0;
+        this.opts.onStatus(`Watching ${this.opts.targets.length} target(s).`, "info");
+      }
       return;
     }
 
@@ -279,6 +368,55 @@ export class LogWatcher {
     this.heartbeat.unref?.();
   }
 
+  /**
+   * A connection ended without becoming useful.
+   *
+   * Once that has happened a few times running and the endpoint has never once
+   * worked, it is not a flaky connection — the host does not serve WebSocket,
+   * and reconnecting to it forever is what left copy-mint detecting nothing.
+   */
+  private onDeadConnection(reason: string): void {
+    this.clearConnectTimer();
+
+    if (!this.subscribed && !this.wsEverWorked) {
+      this.deadConnects += 1;
+      if (this.deadConnects >= MAX_DEAD_CONNECTS) {
+        this.fallBackToPolling(
+          `${hostOf(this.opts.wsUrl!)} failed ${this.deadConnects} connections without ever ` +
+            `accepting a log subscription (${reason}), so it does not serve WebSocket`
+        );
+        return;
+      }
+    }
+
+    this.scheduleReconnect(reason);
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = undefined;
+  }
+
+  /**
+   * Give up on WebSocket for this endpoint and poll instead.
+   *
+   * Permanent for the life of the watcher, including across retarget: whether
+   * a host serves WebSocket is a property of the host, not of this connection,
+   * so retrying it on every watch-list change would restore the same loop.
+   */
+  private fallBackToPolling(reason: string): void {
+    this.wsUnavailable = true;
+    this.clearReconnect();
+    this.teardownSocket();
+    this.opts.onStatus(
+      `${reason}. Switching to polling every ${this.opts.pollIntervalMs ?? DEFAULT_POLL_MS}ms — ` +
+        `copy-mint keeps working. Set WS_URL_<CHAIN> to a provider that does (Alchemy, ` +
+        `QuickNode, publicnode) to get back to push delivery.`,
+      "warn"
+    );
+    this.startPolling();
+  }
+
   private scheduleReconnect(reason: string): void {
     if (!this.running || this.reconnectTimer) return;
     this.teardownSocket();
@@ -302,6 +440,7 @@ export class LogWatcher {
   }
 
   private teardownSocket(): void {
+    this.clearConnectTimer();
     if (this.heartbeat) {
       clearInterval(this.heartbeat);
       this.heartbeat = undefined;
@@ -320,15 +459,24 @@ export class LogWatcher {
   // ── Polling fallback ────────────────────────────────────────────────
 
   private startPolling(): void {
-    const interval = this.opts.pollIntervalMs ?? 750;
+    // One loop per watcher. Without this guard a retarget landing while a tick
+    // was awaiting its eth_getLogs left the old loop running alongside the new
+    // one, and each reported its own view of the gap — which is how the same
+    // chain announced two different stale-block counts in the same minute.
+    if (this.polling) return;
+    this.polling = true;
+
+    const interval = this.opts.pollIntervalMs ?? DEFAULT_POLL_MS;
+    const generation = ++this.pollGeneration;
+
     const tick = async (): Promise<void> => {
-      if (!this.running) return;
+      if (!this.running || generation !== this.pollGeneration) return;
       try {
         await this.replayMissed();
       } catch (err) {
         this.opts.onStatus(`Poll failed: ${(err as Error).message}`, "warn");
       }
-      if (this.running) {
+      if (this.running && generation === this.pollGeneration) {
         this.pollTimer = setTimeout(() => void tick(), interval);
         this.pollTimer.unref?.();
       }
@@ -339,6 +487,10 @@ export class LogWatcher {
   private stopPolling(): void {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = undefined;
+    // Retires any tick already awaiting a response, so it cannot re-arm itself
+    // after the loop was told to stop.
+    this.pollGeneration += 1;
+    this.polling = false;
   }
 
   // ── Gap recovery ────────────────────────────────────────────────────
