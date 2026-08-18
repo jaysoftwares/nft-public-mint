@@ -97,11 +97,25 @@ restart.** Autonomous spending resumes after a reboot only because
 
 ## Updating
 
+One command, from anywhere on the box:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jaysoftwares/nft-public-mint/main/deploy/update.sh | sudo bash
+```
+
+`update.sh` pulls the latest `main`, rebuilds, restarts, and then **checks that
+the running process is actually the new build** before reporting success. It is
+safe to re-run, and it never overwrites a value already in `/etc/copymint/env` —
+it only appends keys that are missing.
+
+<details>
+<summary>By hand, if you prefer</summary>
+
 `/opt/copymint` is **not** a git checkout — `setup.sh` rsyncs into it from
 wherever you cloned. So the update runs from the clone, not from the install:
 
 ```bash
-cd /tmp/copymint && git pull    # wherever you cloned it
+cd /opt/copymint-src && git pull    # wherever you cloned it
 bash deploy/setup.sh
 systemctl restart copymint
 ```
@@ -114,6 +128,26 @@ Confirm the restart actually took:
 ```bash
 systemctl show copymint -p ActiveEnterTimestamp --value   # must be AFTER
 stat -c %y /opt/copymint/dist/bot/index.js                # this
+```
+
+</details>
+
+### WebSocket endpoints for copy-mint
+
+The watcher subscribes to mint logs over WebSocket and polls when it cannot.
+Most public RPCs cannot serve one — `mainnet.base.org` answers the upgrade with
+405, and both Robinhood endpoints answer 400 — so the watcher detects that,
+says so, and switches to polling rather than reconnecting forever.
+
+Polling works; it is one poll behind push. To get push delivery back, set a
+per-chain endpoint in `/etc/copymint/env` (`update.sh` adds the first two for
+you):
+
+```
+WS_URL_BASE=wss://base-rpc.publicnode.com
+WS_URL_ETHEREUM=wss://ethereum-rpc.publicnode.com
+# Robinhood publishes no public WebSocket — needs a provider key.
+# WS_URL_ROBINHOOD=wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY
 ```
 
 User stores live under `/var/lib/copymint/users/` and are untouched by any of that.
