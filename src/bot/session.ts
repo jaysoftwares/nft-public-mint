@@ -427,10 +427,7 @@ export class Session {
       await this.primeCopyPool(chain.key);
 
       const watcher = new LogWatcher({
-        wsUrl:
-          process.env[`WS_URL_${chain.key.toUpperCase()}`] ||
-          this.config.copy.wsUrl ||
-          deriveWsUrl(chain.rpc.readUrl),
+        wsUrl: this.wsUrlFor(chain),
         httpUrl: chain.rpc.readUrl,
         targets: targets.addresses(),
         onMint: (event: LogEvent) => {
@@ -442,8 +439,43 @@ export class Session {
       });
 
       this.watchers.set(chain.key, watcher);
-      await watcher.start();
+      try {
+        await watcher.start();
+      } catch (err) {
+        // One chain failing to come up is not a reason to leave the others
+        // unwatched — that turned a single bad RPC into copy-mint seeing
+        // nothing at all, with no message saying which chain was at fault.
+        this.watchers.delete(chain.key);
+        this.engines.delete(chain.key);
+        onStatus(
+          `[${chain.name}] watcher could not start: ${(err as Error).message}. ` +
+            `Copy-mint is not covering this chain.`,
+          "warn"
+        );
+      }
     }
+
+    if (this.watchers.size === 0) {
+      onStatus("No chain could be watched — copy-mint is not running.", "warn");
+    }
+  }
+
+  /**
+   * Which WebSocket this chain's watcher should use.
+   *
+   * `copy.wsUrl` is a single setting and three chains are watched at once, so
+   * applying it everywhere pointed the Ethereum and Robinhood watchers at
+   * whichever chain the URL actually belonged to. Every signal they then saw
+   * was looked up on the wrong chain and skipped as "Transaction unavailable",
+   * which is copy-mint appearing to run while detecting nothing. It is honoured
+   * only for the chain it was configured alongside; the rest derive theirs from
+   * their own RPC, and a per-chain WS_URL_<CHAIN> still overrides everything.
+   */
+  private wsUrlFor(chain: ChainContext): string | undefined {
+    const perChain = process.env[`WS_URL_${chain.key.toUpperCase()}`];
+    if (perChain) return perChain;
+    if (this.config.copy.wsUrl && chain.key === this.config.chain) return this.config.copy.wsUrl;
+    return deriveWsUrl(chain.rpc.readUrl);
   }
 
   /** Prime nonces for every wallet copy-mint could draw on, on one chain. */

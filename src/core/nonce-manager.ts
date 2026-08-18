@@ -16,9 +16,18 @@
 //   pending > latest  something is genuinely stuck in the pool. Only a
 //                     replacement at the same nonce with a higher tip clears it.
 //
-// Healing waits for a fault to survive two consecutive reconciles. A tx that is
-// merely in flight looks identical to a stuck one for a moment, and replacing a
-// healthy transaction wastes gas and can double-mint.
+// The second comparison is the delicate one. `pending > latest` is not by itself
+// evidence of a stuck transaction — it is the ordinary state of every mint that
+// has been accepted and not yet mined. Treating it as a fault is what made the
+// reconciler replace healthy mints with 0-value self-sends at twice the tip,
+// cancelling the very transaction it was asked to protect, and then tag the
+// wallet `stuck` so copy-mint dropped it from the pool.
+//
+// What actually distinguishes the two is whether the queue is draining. A live
+// transaction moves `latest` forward within a block or two; a stuck one leaves
+// it pinned. So a stuck verdict needs three things: the gap persists across
+// several reconciles, `latest` has not advanced once in that time, and enough
+// wall-clock has passed that no ordinary inclusion delay could explain it.
 
 import { Wallet, HDNodeWallet } from "ethers";
 import { BatchCall, rpcBatchChunked } from "./rpc";
@@ -62,14 +71,42 @@ export interface HealResult {
   detail: string;
 }
 
+/**
+ * A dropped counter is cheap to be wrong about — rewinding costs nothing and is
+ * reversed by the next reconcile — so two sightings is enough.
+ */
+export const DROPPED_MIN_OBSERVATIONS = 2;
+
+/**
+ * A stuck verdict is expensive to be wrong about: it spends gas and cancels
+ * whatever occupies the nonce. It needs the gap to survive several reconciles
+ * *and* a wall-clock floor, so a slow block or a busy sequencer cannot look
+ * like a wedged pool.
+ */
+export const STUCK_MIN_OBSERVATIONS = 3;
+export const STUCK_MIN_DWELL_MS = 90_000;
+
+interface FaultObservation {
+  kind: FaultKind;
+  /** Consecutive reconciles this same fault has been seen on. */
+  streak: number;
+  firstSeenAt: number;
+  /** `latest` when the fault was first seen — if it moves, the queue is draining. */
+  latestWhenFirstSeen: number;
+}
+
 export class NonceManager {
   private readonly readUrl: string;
+  private readonly now: () => number;
   private local = new Map<string, number>();
-  /** Address → number of consecutive reconciles a fault has persisted. */
-  private faultStreak = new Map<string, number>();
+  /** Address → the fault currently being observed, if any. */
+  private faults = new Map<string, FaultObservation>();
+  /** Addresses whose fault has cleared every confirmation bar. */
+  private confirmed = new Set<string>();
 
-  constructor(readUrl: string) {
+  constructor(readUrl: string, now: () => number = Date.now) {
     this.readUrl = readUrl;
+    this.now = now;
   }
 
   /** Fetch the starting nonce for every wallet in one batched request. */
@@ -139,22 +176,59 @@ export class NonceManager {
       else if (pending > latest) kind = "stuck";
 
       if (!kind) {
-        this.faultStreak.delete(target.address);
+        this.clearFault(target.address);
         // Chain moved ahead of us (a tx we didn't send, or a restart) — trust it.
         if (pending > local) this.local.set(target.address, pending);
         return;
       }
 
-      const fault: NonceFault = { id: target.id, address: target.address, kind, local, latest, pending };
-      const streak = (this.faultStreak.get(target.address) ?? 0) + 1;
-      this.faultStreak.set(target.address, streak);
+      const previous = this.faults.get(target.address);
+      const continuing = previous !== undefined && previous.kind === kind;
 
-      // One sighting can just be a tx still in flight. Two is a fault.
-      if (streak >= 2) faults.push(fault);
-      else provisional.push(fault);
+      // The pool is draining: a transaction we were watching got mined, so
+      // whatever is left in it is in flight, not wedged. This is the check that
+      // keeps an ordinary pending mint from being "healed" out of existence.
+      if (kind === "stuck" && continuing && latest > previous.latestWhenFirstSeen) {
+        this.clearFault(target.address);
+        return;
+      }
+
+      const observation: FaultObservation = continuing
+        ? { ...previous, streak: previous.streak + 1 }
+        : { kind, streak: 1, firstSeenAt: this.now(), latestWhenFirstSeen: latest };
+      this.faults.set(target.address, observation);
+
+      const fault: NonceFault = { id: target.id, address: target.address, kind, local, latest, pending };
+
+      if (this.isConfirmed(observation)) {
+        this.confirmed.add(target.address);
+        faults.push(fault);
+      } else {
+        // Still could be a transaction merely in flight. Report it so an
+        // operator can see it building, but do not act on it and do not let it
+        // disqualify the wallet from firing.
+        this.confirmed.delete(target.address);
+        provisional.push(fault);
+      }
     });
 
     return { checked: targets.length, faults, provisional };
+  }
+
+  /** Has this fault cleared every bar for acting on it? */
+  private isConfirmed(observation: FaultObservation): boolean {
+    if (observation.kind === "dropped") {
+      return observation.streak >= DROPPED_MIN_OBSERVATIONS;
+    }
+    return (
+      observation.streak >= STUCK_MIN_OBSERVATIONS &&
+      this.now() - observation.firstSeenAt >= STUCK_MIN_DWELL_MS
+    );
+  }
+
+  private clearFault(address: string): void {
+    this.faults.delete(address);
+    this.confirmed.delete(address);
   }
 
   /**
@@ -168,7 +242,7 @@ export class NonceManager {
     for (const fault of faults) {
       if (fault.kind === "dropped") {
         this.local.set(fault.address, fault.pending);
-        this.faultStreak.delete(fault.address);
+        this.clearFault(fault.address);
         results.push({
           id: fault.id,
           address: fault.address,
@@ -214,8 +288,14 @@ export class NonceManager {
       for (const outcome of report.outcomes) {
         const fault = replacements.find((r) => r.fault.id === outcome.id)!.fault;
         if (outcome.accepted) {
-          this.local.set(fault.address, fault.latest + 1);
-          this.faultStreak.delete(fault.address);
+          // The replacement only occupies the blocked nonce. Anything we had
+          // already signed above it is still queued and will mine once the
+          // blockage clears, so the counter moves forward — never backwards.
+          // Clobbering it to latest + 1 handed already-spent nonces back out,
+          // and every transaction signed with one came back "nonce too low".
+          const current = this.local.get(fault.address) ?? 0;
+          this.local.set(fault.address, Math.max(current, fault.latest + 1));
+          this.clearFault(fault.address);
           results.push({
             id: fault.id,
             address: fault.address,
@@ -236,12 +316,15 @@ export class NonceManager {
     return results;
   }
 
-  /** Addresses currently considered unusable, for the `stuck` tag. */
+  /**
+   * Addresses currently considered unusable, for the `stuck` tag.
+   *
+   * Only confirmed faults count. A wallet with a transaction merely in flight
+   * is perfectly able to sign the next one, and excluding it here is what took
+   * healthy wallets out of the copy-mint pool and reported "no eligible
+   * wallets" moments after a successful mint.
+   */
   stuckAddresses(): Set<string> {
-    const out = new Set<string>();
-    for (const [address, streak] of this.faultStreak) {
-      if (streak >= 2) out.add(address);
-    }
-    return out;
+    return new Set(this.confirmed);
   }
 }

@@ -71,6 +71,14 @@ import { deriveUserPassphrase } from "../core/user-key";
 import { ensureUserFundingWallet } from "../bot/user-wallet";
 import * as watchTargets from "../core/targets";
 import { rpcBatchChunked } from "../core/rpc";
+import {
+  NonceManager,
+  STUCK_MIN_OBSERVATIONS,
+  STUCK_MIN_DWELL_MS,
+} from "../core/nonce-manager";
+import { isBenign, classifyEndpoints } from "../core/dispatcher";
+import { isFundingRevert } from "../core/calldata";
+import { record as recordLedger, spentSince as ledgerSpentSince } from "../core/ledger";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 import {
   deriveDigest,
@@ -101,6 +109,8 @@ function section(name: string): void {
 // Hardhat's published test mnemonic. These addresses are fixed BIP-44 vectors,
 // so matching them proves m/44'/60'/0'/0/i is being derived correctly.
 const TEST_MNEMONIC = "test test test test test test test test test test test junk";
+/** Hardhat account 0's key — the private half of VECTORS[0]. */
+const TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const VECTORS = [
   "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -184,6 +194,166 @@ async function main(): Promise<void> {
   } finally {
     await new Promise<void>((resolve) => batchServer.close(() => resolve()));
   }
+
+
+  // ── nonce reconciliation ──────────────────────────────────────────────
+  //
+  // The regression this guards is the expensive one. `pending > latest` is the
+  // ordinary state of an accepted-but-unmined mint, and treating it as a stuck
+  // pool entry made the reconciler cancel healthy mints with a 0-value
+  // self-send and then tag the wallet `stuck`, which took it out of the
+  // copy-mint pool. Both halves are checked here.
+  section("nonce reconciliation");
+
+  const ADDR = VECTORS[0];
+  const nonceState = { latest: 5, pending: 5, accepted: [] as string[] };
+  let clock = 1_000_000;
+
+  const nodeServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const answer = (entry: { id: number; method: string; params: unknown[] }): unknown => {
+        if (entry.method === "eth_getTransactionCount") {
+          const block = entry.params[1];
+          const value = block === "latest" ? nonceState.latest : nonceState.pending;
+          return { jsonrpc: "2.0", id: entry.id, result: `0x${value.toString(16)}` };
+        }
+        if (entry.method === "eth_sendRawTransaction") {
+          nonceState.accepted.push(entry.params[0] as string);
+          return { jsonrpc: "2.0", id: entry.id, result: `0x${"11".repeat(32)}` };
+        }
+        return { jsonrpc: "2.0", id: entry.id, error: { message: `unexpected ${entry.method}` } };
+      };
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify(Array.isArray(body) ? body.map(answer) : answer(body))
+      );
+    });
+  });
+  await new Promise<void>((resolve) => nodeServer.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const nodeUrl = `http://127.0.0.1:${(nodeServer.address() as { port: number }).port}`;
+    const targetsToCheck = [{ id: "d:0", address: ADDR }];
+
+    // A live mint: one transaction accepted and waiting, and the chain moving
+    // under it. However many times this is reconciled, nothing is wrong.
+    const healthy = new NonceManager(nodeUrl, () => clock);
+    await healthy.prime(targetsToCheck);
+    let healedHealthy = 0;
+    for (let round = 0; round < STUCK_MIN_OBSERVATIONS + 3; round++) {
+      nonceState.pending = nonceState.latest + 1; // one tx in flight
+      const report = await healthy.reconcile(targetsToCheck);
+      healedHealthy += report.faults.length;
+      nonceState.latest += 1; // …and it mines, as a healthy one does
+      clock += 30_000;
+    }
+    check("an in-flight mint is never healed", healedHealthy === 0);
+    check("…and its wallet stays usable", healthy.stuckAddresses().size === 0);
+
+    // A wedged pool: the gap persists and `latest` never moves.
+    nonceState.latest = 20;
+    nonceState.pending = 21;
+    clock = 2_000_000;
+    const wedged = new NonceManager(nodeUrl, () => clock);
+    await wedged.prime(targetsToCheck);
+
+    const first = await wedged.reconcile(targetsToCheck);
+    check("a first sighting is provisional, not a fault", first.faults.length === 0);
+    check("…and is still reported", first.provisional.length === 1);
+
+    // Enough sightings, but not enough wall clock: still not actionable.
+    clock += 1_000;
+    await wedged.reconcile(targetsToCheck);
+    clock += 1_000;
+    const tooSoon = await wedged.reconcile(targetsToCheck);
+    check("the dwell floor holds back an early verdict", tooSoon.faults.length === 0);
+    check("…and the wallet is not yet disqualified", wedged.stuckAddresses().size === 0);
+
+    // Past the dwell, with `latest` still pinned: now it is genuinely stuck.
+    clock += STUCK_MIN_DWELL_MS;
+    const confirmed = await wedged.reconcile(targetsToCheck);
+    check("a pinned gap past the dwell is a fault", confirmed.faults.length === 1);
+    check("…classified as stuck", confirmed.faults[0]?.kind === "stuck");
+    check("…and the wallet is disqualified", wedged.stuckAddresses().has(ADDR));
+
+    // Healing must not hand back nonces that were already spent.
+    const queued = new NonceManager(nodeUrl, () => clock);
+    await queued.prime(targetsToCheck); // local = pending = 21
+    queued.next(ADDR);
+    queued.next(ADDR); // local = 23: two more signed above the blockage
+    const healResults = await queued.heal(
+      [{ id: "d:0", address: ADDR, kind: "stuck", local: 23, latest: 20, pending: 21 }],
+      {
+        signerFor: () => new Wallet(TEST_KEY),
+        chainId: 8453,
+        endpoints: classifyEndpoints([nodeUrl]),
+        maxFeePerGas: 2_000_000_000n,
+        maxPriorityFeePerGas: 50_000_000n,
+      }
+    );
+    check("a stuck nonce is replaced", healResults[0]?.action === "replaced");
+    check(
+      "…without discarding the nonces queued above it",
+      queued.peek(ADDR) === 23,
+      `counter is ${queued.peek(ADDR)}, expected 23`
+    );
+  } finally {
+    await new Promise<void>((resolve) => nodeServer.close(() => resolve()));
+  }
+
+  // ── dispatch acceptance ───────────────────────────────────────────────
+  section("dispatch acceptance");
+  check("a duplicate submission counts as accepted", isBenign("already known"));
+  check("…however the node words it", isBenign("known transaction: 0xabc"));
+  check(
+    "a rejected nonce does NOT count as accepted",
+    !isBenign("nonce too low: next nonce 12, tx nonce 11")
+  );
+  check("an underpriced replacement does not either", !isBenign("replacement transaction underpriced"));
+
+  // ── autonomous spend cap ──────────────────────────────────────────────
+  //
+  // The cap bounds what copy-mint spends on its own. A mint the operator ran by
+  // hand used to count against it, so one /mint could silence copy-mint for a
+  // day with "Daily budget exhausted".
+  section("autonomous spend cap");
+  recordLedger({
+    kind: "mint",
+    chainId: 8453,
+    walletIds: ["d:0"],
+    valueWei: "1000000000000000000",
+  });
+  recordLedger({
+    kind: "mint",
+    auto: true,
+    chainId: 8453,
+    walletIds: ["d:1"],
+    valueWei: "2000000000000000000",
+  });
+  check(
+    "the cap counts only autonomous spending",
+    ledgerSpentSince(24, ["mint"], { autoOnly: true }) === 2_000_000_000_000_000_000n
+  );
+  check(
+    "…while total spend still reports everything",
+    ledgerSpentSince(24, ["mint"]) === 3_000_000_000_000_000_000n
+  );
+
+  // ── replay probe ──────────────────────────────────────────────────────
+  section("replay probe");
+  check(
+    "an empty probe wallet is a funding problem",
+    isFundingRevert("insufficient funds for gas * price + value")
+  );
+  check("…however the node words it", isFundingRevert("insufficient balance for transfer"));
+  check(
+    "a real revert is not mistaken for one",
+    !isFundingRevert("NotActive()")
+  );
+  check("…nor is a missing reason", !isFundingRevert(undefined));
 
   section("user settings");
   const configPath = writeDefaultConfig();

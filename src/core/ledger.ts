@@ -19,6 +19,16 @@ export interface LedgerEntry {
   walletIds: string[];
   /** Total ETH committed, as a decimal-free wei string. */
   valueWei: string;
+  /**
+   * True when the bot spent this without a human in the loop.
+   *
+   * The rolling cap exists to bound what copy-mint can spend on its own. It
+   * used to count every `mint` entry, so a single hand-driven /mint could
+   * exhaust the day's autonomous allowance and copy-mint would go quiet with
+   * "Daily budget exhausted" — a limit the operator never asked to be measured
+   * against their own deliberate spending.
+   */
+  auto?: boolean;
   /** Earliest block a resulting transfer could appear in. */
   fromBlock?: number;
   note?: string;
@@ -62,11 +72,25 @@ export function entries(): LedgerEntry[] {
   return read().entries;
 }
 
+export interface SpendFilter {
+  /**
+   * Count only spending the bot decided on by itself. This is what the caps
+   * govern; a mint the operator typed is their own decision and is not charged
+   * against the autonomous allowance.
+   */
+  autoOnly?: boolean;
+}
+
 /** Total committed in the last `hours`, for the rolling autonomous spend cap. */
-export function spentSince(hours: number, kinds: LedgerKind[] = ["mint"]): bigint {
+export function spentSince(
+  hours: number,
+  kinds: LedgerKind[] = ["mint"],
+  filter: SpendFilter = {}
+): bigint {
   const cutoff = Date.now() - hours * 3_600_000;
   return read()
     .entries.filter((e) => e.ts >= cutoff && kinds.includes(e.kind))
+    .filter((e) => !filter.autoOnly || e.auto === true)
     .reduce((sum, e) => sum + BigInt(e.valueWei), 0n);
 }
 

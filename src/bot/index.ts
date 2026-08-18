@@ -1864,7 +1864,9 @@ async function cmdCopy(ctx: Context): Promise<void> {
 }
 
 async function cmdCaps(ctx: Context): Promise<void> {
-  const spent = spentSince(24, ["mint"]);
+  // The cap governs autonomous spending, so that is what this reports against.
+  const spent = spentSince(24, ["mint"], { autoOnly: true });
+  const spentByHand = spentSince(24, ["mint"]) - spent;
   const remaining = config.capDailyWei > spent ? config.capDailyWei - spent : 0n;
   const reservation = gasReservation(config.gasLimit, config.maxFeePerGas);
 
@@ -1878,7 +1880,11 @@ async function cmdCaps(ctx: Context): Promise<void> {
       ``,
       `<b>Last 24h</b>`,
       `${bar(Number(spent), Number(config.capDailyWei))}  ${eth(spent)} / ${eth(config.capDailyWei)} ETH`,
-      `remaining   ${eth(remaining)} ETH`,
+      `remaining   ${eth(remaining)} ETH` +
+        (spentByHand > 0n
+          ? `\n\n<i>Plus ${eth(spentByHand)} ETH you minted by hand, which is not` +
+            `\ncharged against this cap.</i>`
+          : ``),
       ``,
       `<i>Cost per wallet counts the ${eth(reservation)} ETH gas reservation as well as`,
       `the mint price — otherwise a free mint would look free and fire unbounded.</i>`,

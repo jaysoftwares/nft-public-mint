@@ -148,6 +148,19 @@ export interface BuildReplayArgs {
   configuredGasLimit: number;
 }
 
+/**
+ * How many wallets to try before concluding the pool, not the calldata, is the
+ * problem. Each attempt is one eth_estimateGas and only happens on a failure,
+ * so the happy path still costs exactly one call.
+ */
+const MAX_PROBES = 3;
+
+/** A revert that is about the caller's balance, not about the call. */
+export function isFundingRevert(reason: string | undefined): boolean {
+  if (!reason) return false;
+  return /insufficient funds|insufficient balance|gas required exceeds allowance/i.test(reason);
+}
+
 export class ReplayError extends Error {
   constructor(message: string) {
     super(message);
@@ -180,17 +193,39 @@ export async function buildReplay(args: BuildReplayArgs): Promise<ReplayPlan> {
     dataFor.set(wallet.address, data);
   }
 
-  const probe = args.wallets[0];
-  const outcome = await simulate(args.readUrl, {
-    from: probe.address,
-    to: args.to,
-    data: dataFor.get(probe.address)!,
-    value: args.value,
-  });
+  // Simulate from a wallet that can actually pay.
+  //
+  // eth_estimateGas charges the caller, so a probe wallet short of value + gas
+  // reverts with "insufficient funds" no matter how replayable the call is —
+  // and that used to abort the whole event as "not replayable" on the strength
+  // of one empty wallet sitting first in the pool. A funding failure says
+  // nothing about the calldata, so it moves on to the next candidate and is
+  // only reported once every candidate gives the same answer.
+  const probes = args.wallets.slice(0, MAX_PROBES);
+  let outcome: SimulationOutcome | undefined;
+  let fundingFailures = 0;
 
-  if (!outcome.ok) {
+  for (const probe of probes) {
+    outcome = await simulate(args.readUrl, {
+      from: probe.address,
+      to: args.to,
+      data: dataFor.get(probe.address)!,
+      value: args.value,
+    });
+    if (outcome.ok) break;
+    if (!isFundingRevert(outcome.reason)) break;
+    fundingFailures += 1;
+  }
+
+  if (!outcome || !outcome.ok) {
+    if (fundingFailures === probes.length) {
+      throw new ReplayError(
+        `Every wallet tried is short of the ${args.value} wei mint price plus gas, so the ` +
+          `simulation could not run. Top them up with /fund — the calldata itself was not rejected.`
+      );
+    }
     throw new ReplayError(
-      `Simulation reverted — not firing. ${outcome.reason ?? "no reason given"}` +
+      `Simulation reverted — not firing. ${outcome?.reason ?? "no reason given"}` +
         (addressBound
           ? "\nThe call is bound to the target's address (allowlist proof or signature), which cannot be replayed."
           : "")

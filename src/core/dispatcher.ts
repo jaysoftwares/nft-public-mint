@@ -87,9 +87,19 @@ export function prepareTx(id: string, address: string, rawTx: string): PreparedT
   };
 }
 
-/** A node that already holds the tx is a success, not a failure. */
-function isBenign(message: string): boolean {
-  return /already known|already exists|nonce too low|known transaction/i.test(message);
+/**
+ * A node that already holds *this* transaction is a success, not a failure —
+ * it is the same bytes arriving twice, which is exactly what fanning out to a
+ * sequencer and a backup provider produces.
+ *
+ * "nonce too low" is a different animal and was wrongly counted here. It does
+ * not mean the node has this transaction; it means that nonce was already
+ * consumed by a *different* one, so ours was rejected and will never mine.
+ * Counting it as accepted reported successful mints that never happened, and
+ * skipped the nonce rollback that would have resynced the wallet.
+ */
+export function isBenign(message: string): boolean {
+  return /already known|already exists|known transaction/i.test(message);
 }
 
 function targetsFor(index: number, sequencers: Endpoint[], providers: Endpoint[]): Endpoint[] {

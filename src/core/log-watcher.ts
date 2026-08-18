@@ -106,7 +106,22 @@ export class LogWatcher {
 
   async start(): Promise<void> {
     this.running = true;
-    this.lastSeenBlock = await this.currentBlock();
+
+    // A failed head read must not stop the watcher from coming up. The socket
+    // and the polling loop both recover on their own, and gap recovery re-reads
+    // the head every tick — whereas throwing here aborted startCopy() partway
+    // through its chain loop, so one unreachable RPC left every chain after it
+    // with no watcher at all and copy-mint silently watching nothing.
+    try {
+      this.lastSeenBlock = await this.currentBlock();
+    } catch (err) {
+      this.lastSeenBlock = 0;
+      this.opts.onStatus(
+        `Could not read the chain head at startup (${(err as Error).message}) — ` +
+          `starting anyway and recovering on the first tick.`,
+        "warn"
+      );
+    }
 
     if (this.opts.targets.length === 0) {
       this.opts.onStatus("Watcher idle — no targets. Add one with /watch.", "info");
@@ -337,7 +352,9 @@ export class LogWatcher {
     const head = await this.currentBlock();
     if (head <= this.lastSeenBlock) return;
 
-    const from = this.lastSeenBlock + 1;
+    // A zero here means the startup head read failed, not that the chain is at
+    // block zero — start from the head rather than replaying all of history.
+    const from = this.lastSeenBlock === 0 ? head : this.lastSeenBlock + 1;
     // A long outage could span thousands of blocks; anything older than a few
     // hundred is far too stale to act on, so cap the catch-up.
     const start = Math.max(from, head - 500);

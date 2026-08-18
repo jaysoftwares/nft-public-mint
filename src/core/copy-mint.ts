@@ -245,7 +245,9 @@ export class CopyEngine {
         gasReservationWei: gasReservation,
         requestedWallets: candidates.length,
         caps: this.deps.caps,
-        spentLast24hWei: spentSince(24, ["mint"]),
+        // Autonomous spend only. A mint the operator ran by hand is their own
+        // decision and must not eat the budget copy-mint fires from.
+        spentLast24hWei: spentSince(24, ["mint"], { autoOnly: true }),
         targetFiresInWindow: firesInWindow,
         maxFiresPerWindow: this.deps.copy.maxFiresPerTargetPerHour,
         duplicateContract: duplicate,
@@ -297,6 +299,7 @@ export class CopyEngine {
       if (report.accepted > 0) {
         record({
           kind: "mint",
+          auto: true,
           chainId: this.deps.chainId,
           contract,
           walletIds: report.outcomes.filter((o) => o.accepted).map((o) => o.id),

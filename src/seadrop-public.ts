@@ -44,9 +44,56 @@ export interface LocalMintPlan {
   feeRecipient: string;
 }
 
+/**
+ * A read that failed for transport reasons rather than for anything about the
+ * collection. Worth its own type because the two used to be indistinguishable:
+ * every error here became `null`, and `null` is reported to the operator as
+ * "this isn't a SeaDrop collection". A rate-limited or misconfigured RPC
+ * therefore told them their contract was wrong, which is the least useful thing
+ * it could have said and sends them looking in entirely the wrong place.
+ */
+export class DropReadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DropReadError";
+  }
+}
+
+/**
+ * The drop enforces an allowed-fee-recipient list and nothing is on it. A
+ * legitimate, actionable answer that used to collapse into the same `null` as
+ * "not a SeaDrop collection".
+ */
+export class NoFeeRecipientError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NoFeeRecipientError";
+  }
+}
+
+/** Is this the node failing to answer, rather than the contract answering "no"? */
+function isTransportFailure(err: unknown): boolean {
+  const code = (err as { code?: string })?.code;
+  if (
+    code === "NETWORK_ERROR" ||
+    code === "TIMEOUT" ||
+    code === "SERVER_ERROR" ||
+    code === "UNSUPPORTED_OPERATION"
+  ) {
+    return true;
+  }
+  // A revert or an undecodable return is the contract speaking, not the wire.
+  if (code === "CALL_EXCEPTION" || code === "BAD_DATA") return false;
+  const message = (err as Error)?.message ?? "";
+  return /rate limit|too many requests|429|econnrefused|enotfound|etimedout|socket hang up|timed out/i.test(
+    message
+  );
+}
+
 // Returns null when this contract has no public drop on the SeaDrop singleton —
 // either it isn't a SeaDrop collection at all, or it uses a newer variant that
-// keeps drop config on the token contract itself.
+// keeps drop config on the token contract itself. Throws DropReadError when the
+// node could not be reached, which is a different problem with a different fix.
 export async function fetchPublicDrop(
   rpcUrl: string,
   nftContract: string
@@ -69,7 +116,13 @@ export async function fetchPublicDrop(
       return null;
     }
     return drop;
-  } catch {
+  } catch (err) {
+    if (isTransportFailure(err)) {
+      throw new DropReadError(
+        `Could not read the drop from ${new URL(rpcUrl).hostname}: ${(err as Error).message}. ` +
+          `This says nothing about the collection — check the RPC before the contract.`
+      );
+    }
     return null;
   }
 }
@@ -117,6 +170,13 @@ export function encodeMintPublic(
   ]);
 }
 
+/**
+ * Returns null only when there is no public drop to read. The other way this
+ * used to return null — a drop that restricts fee recipients and allows none —
+ * is a different problem with a different fix, and reporting it as "not a
+ * SeaDrop collection" sent operators to check a contract address that was
+ * perfectly correct.
+ */
 export async function buildLocalMintPlan(
   rpcUrl: string,
   nftContract: string,
@@ -126,7 +186,13 @@ export async function buildLocalMintPlan(
   if (!drop) return null;
 
   const fee = await resolveFeeRecipient(rpcUrl, nftContract, drop.restrictFeeRecipients);
-  if (!fee) return null;
+  if (!fee) {
+    throw new NoFeeRecipientError(
+      `${nftContract} has a public stage, but it restricts fee recipients and the SeaDrop ` +
+        `singleton lists none as allowed — so no public mint transaction can be built for it. ` +
+        `The contract address is not the problem.`
+    );
+  }
 
   return {
     to: SEADROP_ADDRESS,
