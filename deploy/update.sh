@@ -40,7 +40,12 @@ fi
 # Prefer the clone this script was run from, when it is one. Otherwise keep a
 # checkout of our own under /opt so a cleared /tmp cannot lose it.
 say "Source"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+# Piped from curl there is no script file, and BASH_SOURCE is unset — which
+# under `set -u` is an error, not an empty string. Guard before reading it.
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]:-}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+fi
 if [[ -n "$SCRIPT_DIR" && -d "$SCRIPT_DIR/.git" ]]; then
   CLONE_DIR="$SCRIPT_DIR"
   note "using the clone this script came from: $CLONE_DIR"
@@ -111,11 +116,19 @@ bash "$CLONE_DIR/deploy/setup.sh"
 say "Restart"
 systemctl restart "$SERVICE"
 
+if [[ ! -f "$APP_DIR/dist/bot/index.js" ]]; then
+  warn "no build at $APP_DIR/dist/bot/index.js — setup.sh did not produce one"
+  exit 1
+fi
 BUILT_AT=$(stat -c %Y "$APP_DIR/dist/bot/index.js")
 STARTED_RAW=$(systemctl show "$SERVICE" -p ActiveEnterTimestamp --value)
 STARTED_AT=$(date -d "$STARTED_RAW" +%s 2>/dev/null || echo 0)
 
-if [[ "$STARTED_AT" -ge "$BUILT_AT" ]]; then
+if [[ "$STARTED_AT" -eq 0 ]]; then
+  # An unreadable timestamp is not evidence of a bad deploy, so do not claim one.
+  warn "could not read the unit's start time (got '$STARTED_RAW')"
+  warn "check by hand: systemctl status $SERVICE"
+elif [[ "$STARTED_AT" -ge "$BUILT_AT" ]]; then
   note "running code built $(date -d "@$BUILT_AT" '+%H:%M:%S'), started $(date -d "@$STARTED_AT" '+%H:%M:%S')"
 else
   warn "the service started BEFORE the current build — it is running old code."
