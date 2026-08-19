@@ -146,6 +146,22 @@ export interface BuildReplayArgs {
   wallets: { id: string; address: string }[];
   /** Floor for the gas limit; the estimate wins when it is higher. */
   configuredGasLimit: number;
+  /**
+   * Refuse calldata that never mentions the target.
+   *
+   * Set when copying a mint somebody *else* paid for. In that case the NFT
+   * reached the target because the calldata named it — as SeaDrop's
+   * `minterIfNotPayer`, or a plain `mintTo(address)` — and rewriting that field
+   * to our own wallet is the entire mechanism. If no occurrence is found, the
+   * recipient is decided somewhere we cannot see, and replaying the bytes
+   * unchanged would mint into *their* wallet with *our* money.
+   *
+   * Simulation cannot catch this: that call succeeds. It is the "middle case"
+   * at the top of this file, and it is only reachable once the payer and the
+   * recipient are allowed to differ — which is why the check lives behind a
+   * flag rather than being on for everyone.
+   */
+  requireAddressBound?: boolean;
 }
 
 /**
@@ -191,6 +207,15 @@ export async function buildReplay(args: BuildReplayArgs): Promise<ReplayPlan> {
       );
     }
     dataFor.set(wallet.address, data);
+  }
+
+  // Checked before simulating, because simulation would pass. Nothing about
+  // this call is broken — it just buys the NFT for somebody else.
+  if (args.requireAddressBound && !addressBound) {
+    throw new ReplayError(
+      "Another wallet paid for this mint and the calldata never names the target, so there is " +
+        "nothing to rewrite. Replaying it as-is would mint into their wallet at our expense."
+    );
   }
 
   // Simulate from a wallet that can actually pay.

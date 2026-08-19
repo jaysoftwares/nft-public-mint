@@ -15,6 +15,7 @@ import { NonceManager } from "./nonce-manager";
 import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
 import { buildReplay, ReplayError } from "./calldata";
+import { inspectCalldata } from "./mint-opensea";
 import { evaluate, PolicyCaps, PolicyVerdict } from "./policy";
 import { rpcCall } from "./rpc";
 import { record, spentSince } from "./ledger";
@@ -65,7 +66,14 @@ export type CopyEvent =
   | { type: "signal"; target: string; contract: string; txHash: string; block: number }
   | { type: "skipped"; target: string; contract: string; reason: string; detail?: string }
   | { type: "simulated"; gasLimit: number; addressBound: boolean; selector: string }
-  | { type: "firing"; walletCount: number; totalCommitWei: bigint; trimReason?: string }
+  | {
+      type: "firing";
+      walletCount: number;
+      totalCommitWei: bigint;
+      trimReason?: string;
+      /** Set when somebody other than the target paid for the source mint. */
+      paidBy?: string;
+    }
   | { type: "result"; result: CopyResult };
 
 /**
@@ -170,16 +178,6 @@ export class CopyEngine {
         return;
       }
 
-      // A mint credited to the target but paid for by someone else is an airdrop
-      // or a gift, not a decision the target made. Copying it copies nothing.
-      if (tx.from.toLowerCase() !== target.toLowerCase()) {
-        skip(
-          "Not the target's own transaction",
-          `Sent by ${tx.from.slice(0, 10)}… — an airdrop or third-party mint.`
-        );
-        return;
-      }
-
       // ── Cheap rejections, before any work ──
       const dedupWindowMs = this.deps.copy.dedupWindowSec * 1000;
       const lastFire = this.recentContracts.get(contract.toLowerCase());
@@ -188,6 +186,23 @@ export class CopyEngine {
       const watch = targets.find(target);
       if (!watch) {
         skip("Target no longer watched");
+        return;
+      }
+
+      // Who sent it, and does this target accept that?
+      //
+      // Under `self` a mint credited to the target but paid for by someone else
+      // is an airdrop, not a decision the target made. Under `any` it is the
+      // whole point: the address worth watching is often a vault that never
+      // sends a transaction of its own, and every mint reaching it was paid for
+      // by a rotating hot wallet. See PayerMode in targets.ts.
+      const paidByOther = tx.from.toLowerCase() !== target.toLowerCase();
+      if (paidByOther && !targets.allowsPayer(watch, tx.from)) {
+        skip(
+          "Not the target's own transaction",
+          `Paid by ${tx.from.slice(0, 10)}… — set this target to "any payer" to copy mints ` +
+            `credited to it that somebody else paid for.`
+        );
         return;
       }
       const value = BigInt(tx.value);
@@ -223,6 +238,9 @@ export class CopyEngine {
           value,
           wallets: candidates.map((w) => ({ id: w.id, address: w.address })),
           configuredGasLimit: this.deps.gasLimit,
+          // Only meaningful when the payer and the recipient differ; harmless
+          // otherwise, since a self-paid mint has nothing to rewrite anyway.
+          requireAddressBound: paidByOther,
         });
       } catch (err) {
         if (err instanceof ReplayError) {
@@ -231,6 +249,27 @@ export class CopyEngine {
         }
         throw err;
       }
+
+      // Who does the rewritten calldata actually credit?
+      //
+      // Substitution fixes the shape and eth_estimateGas proves the call works,
+      // but neither says the NFT lands with us — a mint into someone else's
+      // wallet simulates perfectly. On SeaDrop the calldata decodes, so this is
+      // answerable rather than inferred; anywhere else it defers to simulation
+      // exactly as the FCFS path does. Every wallet is checked, because each one
+      // carries its own rewritten bytes.
+      for (const wallet of candidates) {
+        const check = inspectCalldata(
+          { to: replay.to, data: replay.dataFor.get(wallet.address)!, value: replay.value },
+          contract,
+          wallet.address
+        );
+        if (!check.ok) {
+          skip("Would not credit our wallet", check.reason);
+          return;
+        }
+      }
+
       this.emit({
         type: "simulated",
         gasLimit: replay.gasLimit,
@@ -264,6 +303,7 @@ export class CopyEngine {
         walletCount: firing.length,
         totalCommitWei: verdict.totalCommitWei,
         trimReason: verdict.trimReason,
+        paidBy: paidByOther ? tx.from : undefined,
       });
 
       // ── Sign and fire ──

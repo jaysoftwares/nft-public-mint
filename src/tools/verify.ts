@@ -9,7 +9,7 @@
 // than against itself, so a wrong derivation path fails loudly instead of being
 // consistently wrong.
 
-import { rmSync, existsSync, readFileSync } from "node:fs";
+import { rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
@@ -41,7 +41,7 @@ import {
   TRANSFER_GAS,
 } from "../core/funding";
 import { requiredPerWallet, shortfalls } from "../core/balances";
-import { substituteAddress, contains, selectorOf } from "../core/calldata";
+import { substituteAddress, contains, selectorOf, buildReplay, ReplayError } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
 import { explainEmptyPool } from "../core/copy-mint";
 import { parseCollectionInput } from "../core/collection-input";
@@ -58,7 +58,7 @@ import {
   AllowListEntry,
   ALLOWLIST_UPDATED_TOPIC,
 } from "../core/allowlist";
-import { id as ethersId, TypedDataEncoder } from "ethers";
+import { id as ethersId, TypedDataEncoder, Interface as ethersInterface } from "ethers";
 import { inspectCalldata, openSignal, OPEN_POLL } from "../core/mint-opensea";
 import {
   writeDefaultConfig,
@@ -644,6 +644,161 @@ async function main(): Promise<void> {
       watchTargets.allowsMint(bothTarget, 0n) && watchTargets.allowsMint(bothTarget, 1n)
     );
   });
+
+  // ── copying a mint somebody else paid for ─────────────────────────────
+  //
+  // The address worth watching is usually a vault: it never sends a mint of its
+  // own, every NFT reaching it was bought by a rotating hot wallet. Copying
+  // those means dropping the "the target must be the sender" rule, and that
+  // rule was load-bearing — so what replaces it is checked here rather than
+  // trusted.
+  section("third-party-paid copies");
+
+  withStateDir(userStateDir(44445), () => {
+    const vault = watchTargets.add(VECTORS[1], "high", "both", "vault", "any");
+    const hot = watchTargets.add(VECTORS[2], "high", "both", "hot", "self");
+
+    check("a target can be set to accept any payer", vault.payer === "any");
+    check("…and the default stays the strict one", hot.payer === "self");
+
+    check(
+      "self only accepts the target's own transaction",
+      watchTargets.allowsPayer(hot, VECTORS[2]) && !watchTargets.allowsPayer(hot, VECTORS[0])
+    );
+    check(
+      "…case-insensitively, since senders arrive lowercased",
+      watchTargets.allowsPayer(hot, VECTORS[2].toLowerCase())
+    );
+    check(
+      "any accepts a mint paid for by a wallet never seen before",
+      watchTargets.allowsPayer(vault, VECTORS[0])
+    );
+
+    const flipped = watchTargets.setPayer(VECTORS[2], "any");
+    check("the rule can be changed on an existing target", flipped.payer === "any");
+    check(
+      "…and survives a reload",
+      watchTargets.find(VECTORS[2])?.payer === "any"
+    );
+
+    check("'vault' is accepted as a friendlier spelling of any", watchTargets.parsePayer("vault") === "any");
+    check("an unknown payer setting raises rather than defaulting", throws(() => watchTargets.parsePayer("everyone")));
+
+    // A file written before this setting existed must not be widened by an
+    // upgrade — the operator agreed to the strict rule.
+    const file = join(userStateDir(44445), "targets.json");
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    for (const entry of raw.targets) delete entry.payer;
+    writeFileSync(file, JSON.stringify(raw), "utf8");
+    check(
+      "a target saved before this setting existed reads back as self",
+      watchTargets.list().every((t) => t.payer === "self")
+    );
+  });
+
+  // ── and the replay rule that makes it safe ────────────────────────────
+  //
+  // Dropping the sender check exposes the one failure simulation cannot catch:
+  // calldata that succeeds and mints into *their* wallet. The defence is that a
+  // third-party-paid mint must name the target somewhere, so the recipient can
+  // be rewritten to us.
+  section("third-party replay safety");
+
+  const REPLAY_NFT = "0x1111111111111111111111111111111111111111";
+  const REPLAY_TARGET = VECTORS[0];
+  const REPLAY_WALLET = VECTORS[1];
+  const SEADROP_SINGLETON = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
+  const seadrop = new ethersInterface([
+    "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity)",
+  ]);
+  const creditingTarget = seadrop.encodeFunctionData("mintPublic", [
+    REPLAY_NFT,
+    "0x0000a26b00c1F0DF003000390027140000fAa719",
+    REPLAY_TARGET,
+    1,
+  ]);
+  // The same drop minted by the target itself: nothing in the calldata names
+  // anyone, because SeaDrop credits msg.sender when minterIfNotPayer is zero.
+  const creditingSender = seadrop.encodeFunctionData("mintPublic", [
+    REPLAY_NFT,
+    "0x0000a26b00c1F0DF003000390027140000fAa719",
+    "0x0000000000000000000000000000000000000000",
+    1,
+  ]);
+
+  // A node that approves everything, so what is under test is the rule rather
+  // than the chain's opinion of it.
+  const gasServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x30d40" }));
+    });
+  });
+  await new Promise<void>((resolve) => gasServer.listen(0, "127.0.0.1", resolve));
+  const gasUrl = `http://127.0.0.1:${(gasServer.address() as { port: number }).port}`;
+
+  const boundPlan = await buildReplay({
+    readUrl: gasUrl,
+    target: REPLAY_TARGET,
+    to: SEADROP_SINGLETON,
+    originalData: creditingTarget,
+    value: 0n,
+    wallets: [{ id: "d:1", address: REPLAY_WALLET }],
+    configuredGasLimit: 250_000,
+    requireAddressBound: true,
+  });
+  check("a mint naming the target is replayable when someone else paid", boundPlan.addressBound);
+  check(
+    "…and the rewritten calldata no longer mentions the target",
+    !contains(boundPlan.dataFor.get(REPLAY_WALLET)!, REPLAY_TARGET)
+  );
+  check(
+    "…crediting our wallet instead",
+    inspectCalldata(
+      { to: SEADROP_SINGLETON, data: boundPlan.dataFor.get(REPLAY_WALLET)!, value: 0n },
+      REPLAY_NFT,
+      REPLAY_WALLET
+    ).ok
+  );
+  check(
+    "…where the original would have credited theirs",
+    !inspectCalldata({ to: SEADROP_SINGLETON, data: creditingTarget, value: 0n }, REPLAY_NFT, REPLAY_WALLET).ok
+  );
+
+  // The expensive one. This calldata simulates perfectly and mints to whoever
+  // msg.sender is — but the target was credited by some mechanism we cannot
+  // see, so replaying it is a guess with money on it.
+  let unboundRefused = false;
+  try {
+    await buildReplay({
+      readUrl: gasUrl,
+      target: REPLAY_TARGET,
+      to: SEADROP_SINGLETON,
+      originalData: creditingSender,
+      value: 0n,
+      wallets: [{ id: "d:1", address: REPLAY_WALLET }],
+      configuredGasLimit: 250_000,
+      requireAddressBound: true,
+    });
+  } catch (err) {
+    unboundRefused = err instanceof ReplayError;
+  }
+  check("calldata that never names the target is REFUSED when another wallet paid", unboundRefused);
+
+  const selfPlan = await buildReplay({
+    readUrl: gasUrl,
+    target: REPLAY_TARGET,
+    to: SEADROP_SINGLETON,
+    originalData: creditingSender,
+    value: 0n,
+    wallets: [{ id: "d:1", address: REPLAY_WALLET }],
+    configuredGasLimit: 250_000,
+  });
+  check("…but still replayable when the target paid for it themselves", !selfPlan.addressBound);
+  gasServer.close();
 
   section("wallet store");
   check("starts empty", !storeExists());

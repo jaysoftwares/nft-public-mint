@@ -102,6 +102,7 @@ import {
   selectorKeyboard,
   tierKeyboard,
   mintModeKeyboard,
+  payerKeyboard,
   amountKeyboard,
   chainKeyboard,
   confirmKeyboard,
@@ -413,7 +414,10 @@ const HELP = `<b>Copymint</b>
 whichever you're eligible for. Times are UTC.
 
 <b>Copy-mint</b>
-/watch &lt;address&gt; [high|med|low] [free|paid|both] [label] — mirror selected mints
+/watch &lt;address&gt; [high|med|low] [free|paid|both] [self|any] [label] — mirror mints
+  <code>self</code> copies only what the address sends itself (default).
+  <code>any</code> also copies mints someone else paid for and credited to it —
+  what you need when the address is a vault that never mints directly.
 /unwatch &lt;address&gt; · /targets — manage the watch list
 /copy on|off — autonomous firing kill switch
 /caps — spend limits and today's usage
@@ -1829,24 +1833,38 @@ async function cmdFcfs(ctx: Context): Promise<void> {
   }
 }
 
+/** One phrase for the payer rule, used everywhere it is shown. */
+function describePayer(payer: targets.PayerMode): string {
+  return payer === "any" ? "anything minted to it" : "its own transactions only";
+}
+
 async function cmdWatch(ctx: Context): Promise<void> {
-  const [address, tierArg, modeOrLabel, ...remainingLabel] = args(ctx);
+  const [address, tierArg, ...rest] = args(ctx);
   if (!address) {
     await ctx.reply(
-      "Usage: <code>/watch 0xAlpha… high free alpha-wallet</code>\nTiers: <code>high</code> <code>med</code> <code>low</code>. Filters: <code>free</code> <code>paid</code> <code>both</code>.",
+      "Usage: <code>/watch 0xAlpha… high free any alpha-wallet</code>\n" +
+        "Tiers: <code>high</code> <code>med</code> <code>low</code>. " +
+        "Filters: <code>free</code> <code>paid</code> <code>both</code>. " +
+        "Payer: <code>self</code> <code>any</code>.",
       { parse_mode: "HTML" }
     );
     return;
   }
 
   const tier = targets.parseTier(tierArg, "low");
-  const modeIsExplicit = ["free", "paid", "both"].includes((modeOrLabel ?? "").toLowerCase());
-  const mintMode = targets.parseMintMode(modeIsExplicit ? modeOrLabel : undefined, "both");
-  const labelParts = modeIsExplicit
-    ? remainingLabel
-    : [modeOrLabel, ...remainingLabel].filter((part): part is string => part !== undefined);
-  const label = labelParts.join(" ") || undefined;
-  const target = targets.add(address, tier, mintMode, label);
+
+  // Mode, payer and label all arrive positionally and any of them may be
+  // omitted, so each keyword is claimed from the remaining words rather than
+  // read off a fixed index — otherwise "/watch 0x… high vault-wallet" would
+  // parse the label as a filter and fail.
+  const words = rest.filter((word): word is string => word !== undefined);
+  const modeWord = words.find((w) => ["free", "paid", "both"].includes(w.toLowerCase()));
+  const payerWord = words.find((w) => ["self", "any", "vault"].includes(w.toLowerCase()));
+  const mintMode = targets.parseMintMode(modeWord, "both");
+  const payer = targets.parsePayer(payerWord, "self");
+  const label = words.filter((w) => w !== modeWord && w !== payerWord).join(" ") || undefined;
+
+  const target = targets.add(address, tier, mintMode, label, payer);
   await session.retargetWatchers();
 
   const walletsPerFire = config.copy.tiers[tier];
@@ -1854,9 +1872,16 @@ async function cmdWatch(ctx: Context): Promise<void> {
     [
       `<b>Watching</b> <code>${esc(target.address)}</code>`,
       ``,
-      `tier <b>${tier}</b> → up to ${walletsPerFire} wallets per signal`,
-      `copy <b>${mintMode === "both" ? "free + paid" : `${mintMode} only`}</b>`,
+      `tier  <b>${tier}</b> → up to ${walletsPerFire} wallets per signal`,
+      `copy  <b>${mintMode === "both" ? "free + paid" : `${mintMode} only`}</b>`,
+      `from  <b>${describePayer(payer)}</b>`,
       label ? `label ${esc(label)}` : ``,
+      ``,
+      payer === "any"
+        ? `<i>The payer is not checked — anything minted to this address is copied,` +
+          ` including by wallets you have never seen. Caps bound the cost.</i>`
+        : `<i>Mints somebody else paid for are ignored. If this is a vault that never` +
+          ` sends its own mints, switch it to "any payer" in /targets.</i>`,
       ``,
       session.copyEnabled
         ? `Autonomous firing is <b>ON</b>.`
@@ -1898,7 +1923,8 @@ async function cmdTargets(ctx: Context): Promise<void> {
     const recent = targets.firesInWindow(t.address, 3_600_000);
     return (
       `<code>${short(t.address)}</code>  <b>${t.tier}</b> →${perFire}w  ` +
-      `<b>${t.mintMode}</b> · ${t.fires} fires${recent > 0 ? ` (${recent} this hour)` : ""}` +
+      `<b>${t.mintMode}</b> · ${t.payer === "any" ? "🏦 any payer" : "👤 own tx"}` +
+      ` · ${t.fires} fires${recent > 0 ? ` (${recent} this hour)` : ""}` +
       (t.label ? `  ${esc(t.label)}` : "")
     );
   });
@@ -1912,6 +1938,8 @@ async function cmdTargets(ctx: Context): Promise<void> {
       ``,
       `<i>Cooldown: max ${config.copy.maxFiresPerTargetPerHour}/target/hour · dedup ${config.copy.dedupWindowSec}s</i>`,
       `<i>Free means the target transaction sends 0 native ETH; paid means it sends more than 0.</i>`,
+      `<i>👤 own tx copies only what the address sends itself. 🏦 any payer also copies`,
+      `mints someone else paid for and credited to it — what a vault address needs.</i>`,
     ].join("\n"),
     { parse_mode: "HTML", reply_markup: targetsKeyboard(list) }
   );
@@ -2028,7 +2056,15 @@ function renderCopyEvent(
       feed.push(
         `fire:${event.walletCount}`,
         `🚀 firing ${event.walletCount} wallet(s) · ${eth(event.totalCommitWei)} ETH`,
-        event.trimReason ? `trimmed by ${esc(event.trimReason)}` : undefined
+        // Which wallet paid is the one fact that distinguishes a vault copy from
+        // a normal one, and it is what an operator checks first if a copy looks
+        // wrong. Only shown when it is not the target, since that is the news.
+        [
+          event.trimReason ? `trimmed by ${esc(event.trimReason)}` : undefined,
+          event.paidBy ? `source paid by ${esc(short(event.paidBy))}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
       );
       break;
     case "result": {
@@ -2834,7 +2870,7 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
     case "watch":
       return runWithArgs(
         ctx,
-        [flow.contract!, flow.tier ?? "low", flow.mintMode ?? "both"],
+        [flow.contract!, flow.tier ?? "low", flow.mintMode ?? "both", flow.payer ?? "self"],
         cmdWatch
       );
     case "destination":
@@ -2963,6 +2999,26 @@ async function onCallback(ctx: Context): Promise<void> {
       return;
     }
 
+    case "tp": {
+      const [payerValue, address] = rest;
+      const payer = targets.parsePayer(payerValue);
+      const target = targets.setPayer(address, payer);
+      await ctx.reply(
+        [
+          `<b>Payer rule updated</b>`,
+          ``,
+          `<code>${esc(short(target.address))}</code> → <b>${describePayer(payer)}</b>`,
+          ``,
+          payer === "any"
+            ? `<i>Anything minted to this address is now copied, whoever paid for it.` +
+              ` Your spend caps are the only thing bounding what that can cost.</i>`
+            : `<i>Only mints this address sends and pays for itself are copied.</i>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: targetsKeyboard(targets.list()) }
+      );
+      return;
+    }
+
     case "i": {
       const kind = payload as Flow["kind"];
       const flow = startFlow(chatId, kind, kind === "sweep" ? "ready" : "contract");
@@ -3075,6 +3131,30 @@ async function onCallback(ctx: Context): Promise<void> {
       const flow = getFlow(chatId);
       if (!flow || flow.kind !== "watch") return;
       flow.mintMode = targets.parseMintMode(payload);
+      await ctx.reply(
+        [
+          `<b>Whose transactions count?</b>`,
+          ``,
+          `<b>Only what it sends itself</b> — the safe default. Copies mints this`,
+          `address paid for out of its own wallet.`,
+          ``,
+          `<b>Anything minted to it</b> — for a vault. Serious minters fire from`,
+          `rotating throwaway wallets and credit one cold address, so the vault`,
+          `never sends a mint of its own. Pick this and the payer is not checked:`,
+          `anything minted <i>to</i> that address gets copied.`,
+          ``,
+          `<i>The catch — anyone can mint something to an address unbidden, so this`,
+          `widens what can trigger a spend. Your caps are what bound it.</i>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: payerKeyboard() }
+      );
+      return;
+    }
+
+    case "pa": {
+      const flow = getFlow(chatId);
+      if (!flow || flow.kind !== "watch") return;
+      flow.payer = targets.parsePayer(payload);
       return executeFlow(ctx, flow, false);
     }
 

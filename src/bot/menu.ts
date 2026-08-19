@@ -44,6 +44,7 @@ export interface Flow {
   amount?: string;
   tier?: string;
   mintMode?: string;
+  payer?: string;
   importCount?: number;
   address?: string;
   waitForOpen?: boolean;
@@ -216,9 +217,9 @@ export function walletsPager(offset: number, shown: number, total: number, selec
   return keyboard.row().text("📄 Export all as CSV", "a:csv").row().text("‹ Back", "m:wallets");
 }
 
-/** Per-target price filters plus removal, without asking users to retype addresses. */
+/** Per-target filters plus removal, without asking users to retype addresses. */
 export function targetsKeyboard(
-  entries: { address: string; label?: string; mintMode: string }[]
+  entries: { address: string; label?: string; mintMode: string; payer: string }[]
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   for (const entry of entries.slice(0, 10)) {
@@ -227,6 +228,12 @@ export function targetsKeyboard(
       .text(entry.mintMode === "free" ? "✅ Free" : "Free", `tf:free:${entry.address}`)
       .text(entry.mintMode === "paid" ? "✅ Paid" : "Paid", `tf:paid:${entry.address}`)
       .text(entry.mintMode === "both" ? "✅ Both" : "Both", `tf:both:${entry.address}`)
+      .row();
+    // Which transactions count as this target minting. A vault never sends its
+    // own mints, so "self" would watch it forever and copy nothing.
+    keyboard
+      .text(entry.payer === "self" ? "✅ Own tx" : "Own tx", `tp:self:${entry.address}`)
+      .text(entry.payer === "any" ? "✅ Any payer" : "Any payer", `tp:any:${entry.address}`)
       .row();
     keyboard.text(`✕ ${name}`, `uw:${entry.address}`).row();
   }
@@ -322,6 +329,23 @@ export function mintModeKeyboard(): InlineKeyboard {
     .text("💳 Paid only", "pm:paid")
     .row()
     .text("🔀 Free + paid", "pm:both")
+    .row()
+    .text("✕ Cancel", "x");
+}
+
+/**
+ * Whose transaction counts as this target minting.
+ *
+ * Asked on every new watch rather than defaulted, because the two answers suit
+ * opposite kinds of address and getting it wrong is silent: a hot wallet set to
+ * "any payer" will copy anything anyone airdrops at it, and a vault set to
+ * "own tx" will sit there watching and never fire once.
+ */
+export function payerKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("👤 Only what it sends itself", "pa:self")
+    .row()
+    .text("🏦 Anything minted to it (vault)", "pa:any")
     .row()
     .text("✕ Cancel", "x");
 }

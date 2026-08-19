@@ -16,14 +16,38 @@ import { stateDir, ensureStateDir } from "./paths";
 export type Tier = "high" | "med" | "low";
 export type MintMode = "free" | "paid" | "both";
 
+/**
+ * Whose transaction counts as this target minting.
+ *
+ * `self` — only mints the target sent and paid for itself.
+ * `any`  — also mints another wallet paid for but credited to the target.
+ *
+ * The second exists because the address worth watching is often a vault, not a
+ * hot wallet: a serious minter fires from rotating disposable wallets and
+ * credits everything to one cold address, which is precisely what this bot
+ * does. Watching that address under `self` sees every mint and copies none of
+ * them, because the payer is never the address the NFT lands in.
+ *
+ * It is not the default, and should not be. Under `self` an attacker has to
+ * persuade the target to mint their bait; under `any` they need only mint one
+ * to the target's address, which anybody can do unbidden. What stands between
+ * that and a drained wallet is the price ceiling, the per-event and daily caps,
+ * and the rule in calldata.ts that a third-party-paid mint must name the target
+ * in its calldata so the recipient can be rewritten to us.
+ */
+export type PayerMode = "self" | "any";
+
 export const TIERS: Tier[] = ["high", "med", "low"];
 export const MINT_MODES: MintMode[] = ["free", "paid", "both"];
+export const PAYER_MODES: PayerMode[] = ["self", "any"];
 
 export interface WatchTarget {
   address: string;
   tier: Tier;
   /** Which source transactions this target is allowed to trigger. */
   mintMode: MintMode;
+  /** Whether a mint paid for by another wallet still counts as this target's. */
+  payer: PayerMode;
   label?: string;
   addedAt: number;
   /** Total fires ever, for reporting. */
@@ -49,6 +73,11 @@ function read(): TargetsFile {
         ...target,
         // Migration for targets saved before the filter existed.
         mintMode: MINT_MODES.includes(target.mintMode) ? target.mintMode : "both",
+        // Likewise, and it migrates to the strict value on purpose: a target
+        // saved before this setting existed was configured under a rule that
+        // only ever copied the target's own transactions, and a file upgrade
+        // must not quietly widen what an operator agreed to.
+        payer: PAYER_MODES.includes(target.payer) ? target.payer : "self",
       })),
     };
   } catch {
@@ -87,7 +116,8 @@ export function add(
   address: string,
   tier: Tier,
   mintMode: MintMode = "both",
-  label?: string
+  label?: string,
+  payer: PayerMode = "self"
 ): WatchTarget {
   const normalised = normalise(address);
   const data = read();
@@ -98,6 +128,7 @@ export function add(
   if (existing) {
     existing.tier = tier;
     existing.mintMode = mintMode;
+    existing.payer = payer;
     if (label !== undefined) existing.label = label;
     write(data);
     return existing;
@@ -107,6 +138,7 @@ export function add(
     address: normalised,
     tier,
     mintMode,
+    payer,
     label,
     addedAt: Date.now(),
     fires: 0,
@@ -134,6 +166,31 @@ export function allowsMint(target: Pick<WatchTarget, "mintMode">, valueWei: bigi
     (target.mintMode === "free" && valueWei === 0n) ||
     (target.mintMode === "paid" && valueWei > 0n)
   );
+}
+
+export function setPayer(address: string, payer: PayerMode): WatchTarget {
+  const wanted = normalise(address).toLowerCase();
+  const data = read();
+  const target = data.targets.find((entry) => entry.address.toLowerCase() === wanted);
+  if (!target) throw new TargetsError("That address is not being watched.");
+  target.payer = payer;
+  write(data);
+  return target;
+}
+
+/**
+ * Did the right wallet send this transaction?
+ *
+ * Under `self` the sender must be the target. Under `any` the sender is not
+ * checked at all — the log filter already established that the NFT was minted
+ * *to* the target, and that is the fact the operator asked to copy.
+ */
+export function allowsPayer(
+  target: Pick<WatchTarget, "payer" | "address">,
+  from: string
+): boolean {
+  if (target.payer === "any") return true;
+  return from.toLowerCase() === target.address.toLowerCase();
 }
 
 export function remove(address: string): boolean {
@@ -190,4 +247,16 @@ export function parseMintMode(
   const lower = value.trim().toLowerCase();
   if ((MINT_MODES as string[]).includes(lower)) return lower as MintMode;
   throw new TargetsError(`Unknown mint filter "${value}". Use: free, paid, or both.`);
+}
+
+export function parsePayer(
+  value: string | undefined,
+  fallback: PayerMode = "self"
+): PayerMode {
+  if (!value) return fallback;
+  const lower = value.trim().toLowerCase();
+  if ((PAYER_MODES as string[]).includes(lower)) return lower as PayerMode;
+  // "vault" reads better than "any" when typing, and says why you want it.
+  if (lower === "vault") return "any";
+  throw new TargetsError(`Unknown payer setting "${value}". Use: self or any.`);
 }
