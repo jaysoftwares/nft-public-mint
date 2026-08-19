@@ -64,6 +64,7 @@ import {
   writeDefaultConfig,
   updateUserSettings,
   chainOverrideFrom,
+  parseCapAmount,
   ConfigError,
 } from "../core/config";
 import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
@@ -642,6 +643,58 @@ async function main(): Promise<void> {
     check(
       "both filter accepts free and paid",
       watchTargets.allowsMint(bothTarget, 0n) && watchTargets.allowsMint(bothTarget, 1n)
+    );
+  });
+
+  // ── caps, now settable from chat ──────────────────────────────────────
+  //
+  // These bound what the bot spends unattended, so the writer has to refuse a
+  // bad value rather than store it. A cap that silently became zero would stop
+  // every mint; one that silently gained a decimal place would stop nothing.
+  section("spend caps from chat");
+
+  withStateDir(userStateDir(44446), () => {
+    const capsPath = writeDefaultConfig();
+    const reload = (): { caps: Record<string, string>; copy: { walletSelector: string } } =>
+      JSON.parse(readFileSync(capsPath, "utf8"));
+
+    const raised = updateUserSettings({ caps: { maxPriceEth: "0.02" } });
+    check("a cap can be raised from chat", raised.caps?.maxPriceEth === "0.02");
+    check("…and the others are left alone", raised.caps?.dailyEth === "0.50");
+    check("…and it survives a reload", reload().caps.maxPriceEth === "0.02");
+
+    check("zero is refused — it would stop every mint", throws(() => parseCapAmount("0", "caps.maxPriceEth"), ConfigError));
+    check("a negative amount is refused", throws(() => parseCapAmount("-1", "caps.maxPriceEth"), ConfigError));
+    check("words are refused", throws(() => parseCapAmount("lots", "caps.maxPriceEth"), ConfigError));
+    check(
+      "a misplaced decimal point is caught by the ceiling",
+      throws(() => parseCapAmount("100", "caps.dailyEth"), ConfigError)
+    );
+    check("a trailing ETH is tolerated", parseCapAmount("0.02 ETH", "caps.maxPriceEth") === "0.02");
+
+    // A ceiling above what one event may spend can never bind, so it is not a
+    // guard — refuse the combination rather than store a number that does
+    // nothing.
+    check(
+      "a max price above the per-event cap is refused",
+      throws(() => updateUserSettings({ caps: { maxPriceEth: "0.9" } }), ConfigError)
+    );
+    check(
+      "…and the stored value is unchanged after that refusal",
+      reload().caps.maxPriceEth === "0.02"
+    );
+    check(
+      "…while raising the per-event cap first makes it accepted",
+      updateUserSettings({ caps: { perEventEth: "1", maxPriceEth: "0.9" } }).caps?.maxPriceEth === "0.9"
+    );
+
+    const selector = updateUserSettings({ copyWalletSelector: "funded" });
+    check("the copy-mint wallet selector is settable", selector.copyWalletSelector === "funded");
+    check("…and reloads", reload().copy.walletSelector === "funded");
+    check("an empty selector is refused", throws(() => updateUserSettings({ copyWalletSelector: "  " }), ConfigError));
+    check(
+      "setting a selector does not disturb the caps",
+      reload().caps.dailyEth === "0.50"
     );
   });
 

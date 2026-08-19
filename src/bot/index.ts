@@ -103,6 +103,9 @@ import {
   tierKeyboard,
   mintModeKeyboard,
   payerKeyboard,
+  capsMenu,
+  capAmountKeyboard,
+  walletSelectorMenu,
   amountKeyboard,
   chainKeyboard,
   confirmKeyboard,
@@ -2007,10 +2010,134 @@ async function cmdCaps(ctx: Context): Promise<void> {
       `<i>Max price is the bait guard: an over-priced mint is rejected outright,`,
       `never trimmed. Budget limits trim instead of rejecting.</i>`,
       ``,
-      `Edit these in config.json — they are not settable from here.`,
+      `<b>Wallets that fire</b>  <code>${esc(config.copy.walletSelector)}</code>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: capsMenu() }
+  );
+}
+
+/** Human name for each cap, used by the edit flow's prompts and confirmations. */
+const CAP_LABELS: Record<"event" | "max" | "daily", string> = {
+  max: "Max price per wallet",
+  event: "Per-event cap",
+  daily: "Daily cap",
+};
+
+async function askCapAmount(ctx: Context, kind: "event" | "max" | "daily"): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+  const flow = startFlow(chatId, "cap", "amount");
+  flow.capKind = kind;
+
+  const current =
+    kind === "max"
+      ? config.capMaxPriceWei
+      : kind === "event"
+        ? config.capPerEventWei
+        : config.capDailyWei;
+
+  const explain =
+    kind === "max"
+      ? `The most one wallet may pay for a single mint. Above this a signal is refused outright — it is the bait guard, and it never trims.`
+      : kind === "event"
+        ? `The most one copy signal may commit across all wallets. Too small and the set is trimmed to fewer wallets rather than refused.`
+        : `The most copy-mint may commit in a rolling 24 hours. Mints you run by hand are not charged against it.`;
+
+  await ctx.reply(
+    [
+      `<b>${CAP_LABELS[kind]}</b>`,
+      ``,
+      `now <b>${eth(current)} ETH</b>`,
+      ``,
+      `<i>${explain}</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: capAmountKeyboard(kind) }
+  );
+}
+
+async function saveCap(
+  ctx: Context,
+  kind: "event" | "max" | "daily",
+  value: string
+): Promise<void> {
+  const field = kind === "max" ? "maxPriceEth" : kind === "event" ? "perEventEth" : "dailyEth";
+  const before =
+    kind === "max"
+      ? config.capMaxPriceWei
+      : kind === "event"
+        ? config.capPerEventWei
+        : config.capDailyWei;
+
+  let saved;
+  try {
+    saved = updateUserSettings({ caps: { [field]: value } });
+  } catch (err) {
+    // A rejected cap leaves the old one in place, which is the safe direction.
+    await fail(ctx, err);
+    return cmdCaps(ctx);
+  }
+
+  // The running config is read through a proxy per update, so the live session
+  // picks this up on the next signal without a restart.
+  config.caps = saved.caps!;
+  config.capPerEventWei = parseEther(saved.caps!.perEventEth);
+  config.capMaxPriceWei = parseEther(saved.caps!.maxPriceEth);
+  config.capDailyWei = parseEther(saved.caps!.dailyEth);
+
+  clearFlow(ctx.chat!.id);
+  await ctx.reply(
+    [
+      `<b>${CAP_LABELS[kind]} updated</b>`,
+      ``,
+      `${eth(before)} → <b>${value} ETH</b>`,
+      ``,
+      `<i>In force from the next copy signal — no restart needed.</i>`,
     ].join("\n"),
     { parse_mode: "HTML" }
   );
+  return cmdCaps(ctx);
+}
+
+async function showWalletSelector(ctx: Context): Promise<void> {
+  const ctxTags = await session.tagContextAnyChain();
+  const counts = (selector: string): string => {
+    try {
+      return String(resolveWallets(selector, session.wallets(), ctxTags).length);
+    } catch {
+      return "?";
+    }
+  };
+
+  await ctx.reply(
+    [
+      `<b>Which wallets fire on a copy signal</b>`,
+      ``,
+      `now <code>${esc(config.copy.walletSelector)}</code>`,
+      ``,
+      `<i>Matching right now, across every chain:</i>`,
+      `<code>derived+funded   ${counts("derived+funded").padStart(4)}</code>  generated wallets`,
+      `<code>funded           ${counts("funded").padStart(4)}</code>  any funded wallet`,
+      `<code>imported+funded  ${counts("imported+funded").padStart(4)}</code>  imported only`,
+      ``,
+      `<i>A wallet still has to be armed for auto-fire on top of matching this.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: walletSelectorMenu(config.copy.walletSelector) }
+  );
+}
+
+async function saveWalletSelector(ctx: Context, selector: string): Promise<void> {
+  try {
+    updateUserSettings({ copyWalletSelector: selector });
+  } catch (err) {
+    await fail(ctx, err);
+    return;
+  }
+  config.copy.walletSelector = selector;
+  await ctx.reply(
+    `<b>Copy-mint wallets set to</b> <code>${esc(selector)}</code>`,
+    { parse_mode: "HTML" }
+  );
+  return showWalletSelector(ctx);
 }
 
 /**
@@ -2951,6 +3078,9 @@ async function onCallback(ctx: Context): Promise<void> {
         case "targets":
           return cmdTargets(ctx);
         case "caps":
+          // Doubles as the cancel target for a cap edit, so the pending flow
+          // must go — otherwise it swallows whatever is typed next.
+          clearFlow(chatId);
           return cmdCaps(ctx);
         case "help":
           await ctx.reply(HELP, { parse_mode: "HTML" });
@@ -2997,6 +3127,29 @@ async function onCallback(ctx: Context): Promise<void> {
         { parse_mode: "HTML", reply_markup: targetsKeyboard(targets.list()) }
       );
       return;
+    }
+
+    case "cap":
+      return askCapAmount(ctx, payload as "event" | "max" | "daily");
+
+    case "cv": {
+      const [kind, value] = rest as ["event" | "max" | "daily", string];
+      if (value === "custom") {
+        const flow = startFlow(chatId, "cap", "amount");
+        flow.capKind = kind;
+        await ctx.reply(
+          `<b>${CAP_LABELS[kind]}</b>\n\nSend the amount in ETH, like <code>0.02</code>.`,
+          { parse_mode: "HTML", reply_markup: backTo("a:caps", "✕ Cancel") }
+        );
+        return;
+      }
+      return saveCap(ctx, kind, value);
+    }
+
+    case "sel": {
+      clearFlow(chatId);
+      if (payload === "menu") return showWalletSelector(ctx);
+      return saveWalletSelector(ctx, payload);
     }
 
     case "tp": {
@@ -3282,6 +3435,12 @@ async function onText(ctx: Context): Promise<void> {
       { parse_mode: "HTML" }
     );
     return advanceFlow(ctx, flow);
+  }
+
+  // A cap is not a funding amount and must not borrow its ceiling — a 2 ETH
+  // daily budget is ordinary, while 2 ETH *per wallet* is a fat-finger.
+  if (flow.kind === "cap" && flow.step === "amount" && flow.capKind) {
+    return saveCap(ctx, flow.capKind, text.trim());
   }
 
   if (flow.step === "amount") {

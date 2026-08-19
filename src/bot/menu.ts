@@ -25,7 +25,8 @@ export type FlowKind =
   | "drain"
   | "destination"
   | "importWallet"
-  | "restore";
+  | "restore"
+  | "cap";
 
 export interface Flow {
   kind: FlowKind;
@@ -45,6 +46,8 @@ export interface Flow {
   tier?: string;
   mintMode?: string;
   payer?: string;
+  /** Which spend cap a "cap" flow is collecting an amount for. */
+  capKind?: "event" | "max" | "daily";
   importCount?: number;
   address?: string;
   waitForOpen?: boolean;
@@ -187,6 +190,67 @@ export function autoFireMenu(): InlineKeyboard {
     .text("📋 Who's armed?", "a:autofire")
     .row()
     .text("‹ Back", "m:wallets");
+}
+
+/**
+ * The caps screen, now editable.
+ *
+ * These bound what the bot spends with nobody watching, and they used to be
+ * config.json only — which on a hosted bot meant unreachable by the person
+ * whose money it is. The read-only screen above stays the point of the page;
+ * these just make the numbers on it changeable by whoever they bind.
+ */
+export function capsMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✏️ Max price per wallet", "cap:max")
+    .row()
+    .text("✏️ Per event", "cap:event")
+    .text("✏️ Daily", "cap:daily")
+    .row()
+    .text("👛 Which wallets fire", "sel:menu")
+    .row()
+    .text("‹ Back", "m:copy");
+}
+
+/**
+ * Amounts that suit each cap, since they differ by an order of magnitude.
+ *
+ * The max price is per wallet per mint, the per-event cap covers one whole
+ * signal across the set, and the daily is the rolling total — offering the same
+ * ladder for all three would make two of them useless.
+ */
+export function capAmountKeyboard(kind: "event" | "max" | "daily"): InlineKeyboard {
+  const presets: Record<typeof kind, string[]> = {
+    max: ["0.005", "0.01", "0.02", "0.05"],
+    event: ["0.05", "0.1", "0.25", "0.5"],
+    daily: ["0.25", "0.5", "1", "2"],
+  };
+  const keyboard = new InlineKeyboard();
+  const values = presets[kind];
+  keyboard.text(values[0], `cv:${kind}:${values[0]}`).text(values[1], `cv:${kind}:${values[1]}`).row();
+  keyboard.text(values[2], `cv:${kind}:${values[2]}`).text(values[3], `cv:${kind}:${values[3]}`).row();
+  return keyboard.text("✏️ Type an amount", `cv:${kind}:custom`).row().text("✕ Cancel", "a:caps");
+}
+
+/**
+ * Which wallets a copy signal may spend from.
+ *
+ * Expressed as outcomes rather than selector syntax, because the failure this
+ * prevents is silent: a set whose money sits in imported wallets, with a
+ * selector naming only the derived ones, watches every signal go by and fires
+ * on none of them.
+ */
+export function walletSelectorMenu(current: string): InlineKeyboard {
+  const mark = (selector: string, label: string): string =>
+    current === selector ? `✅ ${label}` : label;
+  return new InlineKeyboard()
+    .text(mark("derived+funded", "Generated wallets"), "sel:derived+funded")
+    .row()
+    .text(mark("funded", "Any funded wallet"), "sel:funded")
+    .row()
+    .text(mark("imported+funded", "Imported wallets only"), "sel:imported+funded")
+    .row()
+    .text("‹ Back", "a:caps");
 }
 
 export function moneyMenu(): InlineKeyboard {

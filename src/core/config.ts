@@ -3,7 +3,7 @@
 // through an explicit, confirmed Telegram flow.
 
 import { readFileSync, existsSync, writeFileSync, renameSync, chmodSync, unlinkSync } from "node:fs";
-import { getAddress, parseEther, parseUnits, ZeroAddress } from "ethers";
+import { getAddress, parseEther, parseUnits, formatEther, ZeroAddress } from "ethers";
 import { CHAINS, resolveChain } from "../chains";
 import { FILES, ensureStateDir } from "./paths";
 
@@ -208,7 +208,28 @@ export interface UserSettingsUpdate {
   funder?: string;
   /** Explicit Telegram copy-mint kill-switch choice. */
   copyEnabled?: boolean;
+  /**
+   * Autonomous spend caps, as decimal ETH strings.
+   *
+   * These were SSH-only, on the reasoning that a limit on unattended spending
+   * should not be one tap away. That reasoning assumed the operator had a
+   * shell — and on a hosted bot the person whose wallets these are usually does
+   * not. The cap then stops being a considered decision and becomes whichever
+   * number shipped as the default, unreachable by the only person it binds.
+   */
+  caps?: { perEventEth?: string; maxPriceEth?: string; dailyEth?: string };
+  /** Which wallets copy-mint may draw on. */
+  copyWalletSelector?: string;
 }
+
+/**
+ * Ceiling on any single cap set from chat.
+ *
+ * Not a policy about how much anyone should spend — a guard against a misplaced
+ * decimal point, which is the realistic way a cap gets set to a hundred times
+ * what was meant. Editing config.json by hand is still unbounded.
+ */
+export const MAX_CAP_WEI = parseEther("10");
 
 /**
  * Persist the narrow settings surface that one Telegram user may change.
@@ -216,10 +237,36 @@ export interface UserSettingsUpdate {
  * Everything else in config.json remains SSH-only. Writing through a sibling
  * temporary file keeps a crash from leaving half-written JSON behind.
  */
+/** A cap value that is a real, positive, sanely-sized ETH amount. */
+export function parseCapAmount(value: string, field: string): string {
+  const text = String(value).trim().replace(/\s*eth$/i, "");
+  if (!/^\d+(\.\d+)?$/.test(text)) {
+    throw new ConfigError(`"${field}" must be a plain ETH amount like 0.02 — got "${value}".`);
+  }
+  let wei: bigint;
+  try {
+    wei = parseEther(text);
+  } catch {
+    throw new ConfigError(`"${field}" is not a valid ETH amount: ${value}`);
+  }
+  if (wei <= 0n) {
+    throw new ConfigError(`"${field}" must be above zero — a zero cap stops every mint.`);
+  }
+  if (wei > MAX_CAP_WEI) {
+    throw new ConfigError(
+      `"${field}" of ${text} ETH is above the ${formatEther(MAX_CAP_WEI)} ETH ceiling for a ` +
+        `cap set from chat. Check the decimal point.`
+    );
+  }
+  return text;
+}
+
 export function updateUserSettings(update: UserSettingsUpdate): {
   destination?: string;
   funder?: string;
   copyEnabled?: boolean;
+  caps?: BotConfig["caps"];
+  copyWalletSelector?: string;
 } {
   const path = FILES.config();
   if (!existsSync(path)) {
@@ -233,7 +280,13 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     throw new ConfigError(`config.json is not valid JSON: ${(err as Error).message}`);
   }
 
-  const result: { destination?: string; funder?: string; copyEnabled?: boolean } = {};
+  const result: {
+    destination?: string;
+    funder?: string;
+    copyEnabled?: boolean;
+    caps?: BotConfig["caps"];
+    copyWalletSelector?: string;
+  } = {};
 
   if (update.destination !== undefined) {
     try {
@@ -268,10 +321,43 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     result.copyEnabled = update.copyEnabled;
   }
 
+  if (update.caps !== undefined) {
+    const merged = { ...DEFAULT_CONFIG.caps, ...(raw.caps ?? {}) };
+    for (const field of ["perEventEth", "maxPriceEth", "dailyEth"] as const) {
+      const supplied = update.caps[field];
+      if (supplied !== undefined) merged[field] = parseCapAmount(supplied, `caps.${field}`);
+    }
+    // The bait guard must stay inside the per-event allowance, or it is not a
+    // guard: a ceiling above what one event may spend can never be the binding
+    // limit, and the operator would be looking at a number that does nothing.
+    if (parseEther(merged.maxPriceEth) > parseEther(merged.perEventEth)) {
+      throw new ConfigError(
+        `A max price of ${merged.maxPriceEth} ETH is above the ${merged.perEventEth} ETH ` +
+          `per-event cap, which would make it meaningless. Raise the per-event cap first.`
+      );
+    }
+    raw.caps = merged;
+    result.caps = merged;
+  }
+
+  if (update.copyWalletSelector !== undefined) {
+    const selector = update.copyWalletSelector.trim();
+    if (selector.length === 0) throw new ConfigError("A wallet selector cannot be empty.");
+    raw.copy = {
+      ...DEFAULT_CONFIG.copy,
+      ...(raw.copy ?? {}),
+      tiers: { ...DEFAULT_CONFIG.copy.tiers, ...(raw.copy?.tiers ?? {}) },
+      walletSelector: selector,
+    };
+    result.copyWalletSelector = selector;
+  }
+
   if (
     result.destination === undefined &&
     result.funder === undefined &&
-    result.copyEnabled === undefined
+    result.copyEnabled === undefined &&
+    result.caps === undefined &&
+    result.copyWalletSelector === undefined
   ) {
     throw new ConfigError("No user setting was supplied.");
   }
