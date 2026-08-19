@@ -32,7 +32,12 @@ import {
   storeExists,
 } from "../core/wallet-store";
 import { ensureUserFundingWallet } from "./user-wallet";
-import { resolve as resolveWallets, summarise, SelectorError } from "../core/tags";
+import {
+  resolve as resolveWallets,
+  resolveForAutoFire,
+  summarise,
+  SelectorError,
+} from "../core/tags";
 import { gasReservation, shortfalls } from "../core/balances";
 import {
   planFunding,
@@ -51,6 +56,7 @@ import {
   spentSince,
 } from "../core/ledger";
 import { collectDashboard, ChainReading } from "../core/dashboard";
+import { probeTarget, assessMint } from "../core/target-probe";
 import * as targets from "../core/targets";
 import { CopyEvent } from "../core/copy-mint";
 import {
@@ -106,6 +112,9 @@ import {
   capsMenu,
   capAmountKeyboard,
   walletSelectorMenu,
+  targetDetailKeyboard,
+  targetWalletsKeyboard,
+  targetPriceKeyboard,
   amountKeyboard,
   chainKeyboard,
   confirmKeyboard,
@@ -1922,10 +1931,10 @@ async function cmdTargets(ctx: Context): Promise<void> {
   }
 
   const lines = list.map((t) => {
-    const perFire = config.copy.tiers[t.tier];
+    const perFire = targets.walletsFor(t, config.copy.tiers);
     const recent = targets.firesInWindow(t.address, 3_600_000);
     return (
-      `<code>${short(t.address)}</code>  <b>${t.tier}</b> →${perFire}w  ` +
+      `<code>${short(t.address)}</code>  →${perFire}w  ` +
       `<b>${t.mintMode}</b> · ${t.payer === "any" ? "🏦 any payer" : "👤 own tx"}` +
       ` · ${t.fires} fires${recent > 0 ? ` (${recent} this hour)` : ""}` +
       (t.label ? `  ${esc(t.label)}` : "")
@@ -1939,13 +1948,221 @@ async function cmdTargets(ctx: Context): Promise<void> {
       ``,
       ...lines,
       ``,
-      `<i>Cooldown: max ${config.copy.maxFiresPerTargetPerHour}/target/hour · dedup ${config.copy.dedupWindowSec}s</i>`,
-      `<i>Free means the target transaction sends 0 native ETH; paid means it sends more than 0.</i>`,
-      `<i>👤 own tx copies only what the address sends itself. 🏦 any payer also copies`,
-      `mints someone else paid for and credited to it — what a vault address needs.</i>`,
+      `<i>Tap one to change what it copies, or to see what it actually mints.</i>`,
     ].join("\n"),
     { parse_mode: "HTML", reply_markup: targetsKeyboard(list) }
   );
+}
+
+/**
+ * One target's page.
+ *
+ * Everything that decides whether this address's mints get copied, in the order
+ * the engine checks it, each line stating the setting rather than describing it
+ * in prose. The point is that "why didn't it fire?" is answerable by reading
+ * down the screen — and that every answer is one tap from being changed.
+ */
+async function showTarget(ctx: Context, address: string): Promise<void> {
+  const target = targets.find(address);
+  if (!target) {
+    await ctx.reply("That address is no longer being watched.", {
+      reply_markup: targetsKeyboard(targets.list()),
+    });
+    return;
+  }
+
+  const perFire = targets.walletsFor(target, config.copy.tiers);
+  const ceiling = targets.maxPriceFor(target, config.capMaxPriceWei);
+  const recent = targets.firesInWindow(target.address, 3_600_000);
+
+  // What could actually fire right now, so a target that looks correctly
+  // configured but has no wallets behind it says so here rather than at T-0.
+  let poolNote = "";
+  try {
+    const ctxTags = await session.tagContextAnyChain();
+    const pool = resolveForAutoFire(config.copy.walletSelector, session.wallets(), ctxTags);
+    poolNote =
+      pool.selected.length === 0
+        ? `\n⚠️ <b>No wallet can fire</b> — armed and funded: 0.`
+        : `\n${Math.min(perFire, pool.selected.length)} wallet(s) would fire · ${pool.selected.length} armed and funded`;
+  } catch {
+    // A chain that will not answer must not stop the page rendering.
+  }
+
+  await ctx.reply(
+    [
+      `🎯 <b>${esc(target.label ?? short(target.address))}</b>`,
+      `<code>${esc(target.address)}</code>`,
+      ``,
+      `<code>copies    ${target.mintMode === "both" ? "free + paid" : `${target.mintMode} only`}</code>`,
+      `<code>from      ${target.payer === "any" ? "anyone who mints to it" : "its own transactions"}</code>`,
+      `<code>wallets   ${perFire}${target.walletCount === undefined ? ` (${target.tier} tier)` : " (set here)"}</code>`,
+      `<code>up to     ${eth(ceiling)} ETH each${target.maxPriceEth === undefined ? " (global cap)" : " (set here)"}</code>`,
+      `<code>fired     ${target.fires}${recent > 0 ? ` · ${recent} this hour` : ""}</code>`,
+      poolNote,
+      ``,
+      session.copyEnabled ? `Copy-mint is <b>ON</b>.` : `⚠️ Copy-mint is <b>OFF</b> — nothing will fire.`,
+      ``,
+      `<i>Per-event ${eth(config.capPerEventWei)} and daily ${eth(config.capDailyWei)} ETH caps still apply on top.</i>`,
+    ]
+      .filter((line) => line !== "")
+      .join("\n"),
+    { parse_mode: "HTML", reply_markup: targetDetailKeyboard(target) }
+  );
+}
+
+/**
+ * What has this address actually minted, and would we have copied it?
+ *
+ * The question every "it isn't working" reduces to. Scanning is the slow part —
+ * several eth_getLogs plus a receipt each — so the card is sent first and
+ * edited when the answer lands.
+ */
+async function probeTargetActivity(ctx: Context, address: string): Promise<void> {
+  const target = targets.find(address);
+  if (!target) {
+    await ctx.reply("That address is no longer being watched.");
+    return;
+  }
+
+  const sent = await ctx.reply(
+    `🔎 <b>${esc(short(target.address))}</b>\n\n<i>scanning ${session.availableChains.length} chain(s) for recent mints…</i>`,
+    { parse_mode: "HTML" }
+  );
+
+  const reservation = gasReservation(config.gasLimit, config.maxFeePerGas);
+  let poolSize = 0;
+  try {
+    const ctxTags = await session.tagContextAnyChain();
+    poolSize = resolveForAutoFire(config.copy.walletSelector, session.wallets(), ctxTags)
+      .selected.length;
+  } catch {
+    // Counted as zero, which the report then names as a blocker — the honest
+    // reading when the balance could not be established.
+  }
+
+  const perChain = await Promise.all(
+    session.availableChains.map(async (chain) => {
+      try {
+        const result = await probeTarget(chain.rpc.readUrl, target.address, {
+          hours: 48,
+          limit: 5,
+        });
+        return { chain, result };
+      } catch (err) {
+        return { chain, error: (err as Error).message };
+      }
+    })
+  );
+
+  const lines: string[] = [
+    `🔎 <b>${esc(target.label ?? short(target.address))}</b>`,
+    `<code>${esc(target.address)}</code>`,
+    ``,
+  ];
+
+  // Blockers are collected across every mint seen, then reported once — the
+  // same missing setting on five mints is one thing to fix, not five.
+  const blockers = new Map<string, { remedy: string; reason: string }>();
+  let mintsSeen = 0;
+  let copyable = 0;
+
+  for (const entry of perChain) {
+    if ("error" in entry || !entry.result) {
+      lines.push(`<b>${esc(entry.chain.name)}</b> — could not scan`);
+      continue;
+    }
+    const { mints, hoursScanned } = entry.result;
+    if (mints.length === 0) {
+      lines.push(`<b>${esc(entry.chain.name)}</b> — nothing in the last ${hoursScanned}h`);
+      continue;
+    }
+
+    lines.push(`<b>${esc(entry.chain.name)}</b> — ${mints.length} mint(s), last ${hoursScanned}h`);
+    for (const mint of mints) {
+      mintsSeen += 1;
+      const assessment = assessMint(mint, {
+        target,
+        tiers: config.copy.tiers,
+        globalMaxPriceWei: config.capMaxPriceWei,
+        perEventWei: config.capPerEventWei,
+        gasReservationWei: reservation,
+        poolSize,
+        copyEnabled: session.copyEnabled,
+      });
+      if (assessment.wouldCopy) copyable += 1;
+      for (const blocker of assessment.blockers) {
+        blockers.set(blocker.kind, { remedy: blocker.remedy, reason: blocker.reason });
+      }
+
+      const paidBy =
+        mint.payer && mint.payer.toLowerCase() !== target.address.toLowerCase()
+          ? ` · paid by ${short(mint.payer)}`
+          : ` · its own tx`;
+      lines.push(
+        `  ${assessment.wouldCopy ? "✅" : "⛔"} <code>${short(mint.contract)}</code>  ` +
+          `${mint.valueWei === 0n ? "free" : `${eth(mint.valueWei)} ETH`}` +
+          `${mint.method ? ` · ${mint.method}` : ""}${paidBy}`
+      );
+      if (assessment.wouldCopy) {
+        lines.push(`      <i>would fire ${assessment.walletCount} wallet(s)</i>`);
+      }
+    }
+    lines.push(``);
+  }
+
+  if (mintsSeen === 0) {
+    lines.push(
+      ``,
+      `<i>No mints found. This address may simply not have minted recently — copy-mint`,
+      `fires on new mints as they happen, so an empty history is not a fault.</i>`
+    );
+  } else if (blockers.size === 0) {
+    lines.push(`<b>✅ Nothing is blocking this target.</b>`, ``, `<i>${copyable} of ${mintsSeen} recent mint(s) would have been copied.</i>`);
+  } else {
+    lines.push(`<b>What is stopping a copy</b>`);
+    for (const [, blocker] of blockers) {
+      lines.push(`⛔ ${esc(blocker.reason)}`, `      → <i>${esc(blocker.remedy)}</i>`);
+    }
+  }
+
+  const text = clamp(lines.join("\n"));
+  try {
+    await ctx.api.editMessageText(ctx.chat!.id, sent.message_id, text, {
+      parse_mode: "HTML",
+      reply_markup: targetDetailKeyboard(target),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch {
+    await ctx.reply(text, { parse_mode: "HTML", reply_markup: targetDetailKeyboard(target) });
+  }
+}
+
+async function saveTargetWallets(ctx: Context, address: string, value: string): Promise<void> {
+  const target = targets.setWalletCount(
+    address,
+    value === "tier" ? undefined : Number(value)
+  );
+  clearFlow(ctx.chat!.id);
+  const perFire = targets.walletsFor(target, config.copy.tiers);
+  await ctx.reply(
+    `<b>Wallets per fire</b> → <b>${perFire}</b>` +
+      (target.walletCount === undefined ? ` <i>(back to the ${target.tier} tier)</i>` : ``),
+    { parse_mode: "HTML" }
+  );
+  return showTarget(ctx, address);
+}
+
+async function saveTargetPrice(ctx: Context, address: string, value: string): Promise<void> {
+  const target = targets.setMaxPrice(address, value === "global" ? undefined : value);
+  clearFlow(ctx.chat!.id);
+  const ceiling = targets.maxPriceFor(target, config.capMaxPriceWei);
+  await ctx.reply(
+    `<b>Price limit</b> → <b>${eth(ceiling)} ETH</b> per wallet` +
+      (target.maxPriceEth === undefined ? ` <i>(back to the global cap)</i>` : ``),
+    { parse_mode: "HTML" }
+  );
+  return showTarget(ctx, address);
 }
 
 async function cmdCopy(ctx: Context): Promise<void> {
@@ -3167,9 +3384,84 @@ async function onCallback(ctx: Context): Promise<void> {
               ` Your spend caps are the only thing bounding what that can cost.</i>`
             : `<i>Only mints this address sends and pays for itself are copied.</i>`,
         ].join("\n"),
-        { parse_mode: "HTML", reply_markup: targetsKeyboard(targets.list()) }
+        { parse_mode: "HTML" }
+      );
+      return showTarget(ctx, address);
+    }
+
+    // ── One target's page ──
+    case "tg":
+      clearFlow(chatId);
+      return showTarget(ctx, payload);
+
+    case "tq":
+      return probeTargetActivity(ctx, payload);
+
+    case "tw": {
+      const target = targets.find(payload);
+      if (!target) return;
+      await ctx.reply(
+        [
+          `<b>Wallets per fire</b>`,
+          ``,
+          `now <b>${targets.walletsFor(target, config.copy.tiers)}</b>`,
+          ``,
+          `<i>How many of your wallets mint when this target does. More wallets means`,
+          `more of the drop and more spent — the per-event cap trims it if the total`,
+          `would exceed ${eth(config.capPerEventWei)} ETH.</i>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: targetWalletsKeyboard(payload) }
       );
       return;
+    }
+
+    case "twv": {
+      const [value, address] = rest;
+      if (value === "custom") {
+        const flow = startFlow(chatId, "targetWallets", "amount");
+        flow.address = address;
+        await ctx.reply(
+          `<b>Wallets per fire</b>\n\nSend a number between 1 and ${targets.MAX_WALLETS_PER_TARGET}.`,
+          { parse_mode: "HTML", reply_markup: backTo(`tg:${address}`, "✕ Cancel") }
+        );
+        return;
+      }
+      return saveTargetWallets(ctx, address, value);
+    }
+
+    case "tpr": {
+      const target = targets.find(payload);
+      if (!target) return;
+      await ctx.reply(
+        [
+          `<b>Price limit for this target</b>`,
+          ``,
+          `now <b>${eth(targets.maxPriceFor(target, config.capMaxPriceWei))} ETH</b> per wallet`,
+          target.maxPriceEth === undefined ? `<i>(the global cap)</i>` : `<i>(set for this target)</i>`,
+          ``,
+          `<i>The most one wallet may pay for a single mint from this address. Above it`,
+          `the signal is refused outright — this is the bait guard, and it never trims.</i>`,
+          ``,
+          `<i>Set it per target so a vault you trust can mint dearer drops without`,
+          `raising the ceiling for every other address you watch.</i>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: targetPriceKeyboard(payload) }
+      );
+      return;
+    }
+
+    case "tpv": {
+      const [value, address] = rest;
+      if (value === "custom") {
+        const flow = startFlow(chatId, "targetPrice", "amount");
+        flow.address = address;
+        await ctx.reply(
+          `<b>Price limit</b>\n\nSend the amount in ETH, like <code>0.02</code>.`,
+          { parse_mode: "HTML", reply_markup: backTo(`tg:${address}`, "✕ Cancel") }
+        );
+        return;
+      }
+      return saveTargetPrice(ctx, address, value);
     }
 
     case "i": {
@@ -3441,6 +3733,23 @@ async function onText(ctx: Context): Promise<void> {
   // daily budget is ordinary, while 2 ETH *per wallet* is a fat-finger.
   if (flow.kind === "cap" && flow.step === "amount" && flow.capKind) {
     return saveCap(ctx, flow.capKind, text.trim());
+  }
+
+  // Per-target values, each validated by its own setter so a bad one reports
+  // what was wrong with it rather than silently reverting to a default.
+  if (flow.kind === "targetWallets" && flow.address) {
+    const count = Number(text.trim());
+    if (!Number.isInteger(count)) {
+      await ctx.reply(
+        `Send a whole number between 1 and ${targets.MAX_WALLETS_PER_TARGET}, or tap Cancel.`
+      );
+      return;
+    }
+    return saveTargetWallets(ctx, flow.address, String(count));
+  }
+
+  if (flow.kind === "targetPrice" && flow.address) {
+    return saveTargetPrice(ctx, flow.address, text.trim());
   }
 
   if (flow.step === "amount") {

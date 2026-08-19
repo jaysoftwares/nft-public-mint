@@ -74,6 +74,7 @@ import { collectDashboard, summariseMints, pct } from "../core/dashboard";
 import { LedgerEntry } from "../core/ledger";
 import { renderDashboard } from "../bot/dashboard";
 import * as watchTargets from "../core/targets";
+import { assessMint, blocksForHours } from "../core/target-probe";
 import { rpcBatchChunked } from "../core/rpc";
 import {
   NonceManager,
@@ -747,6 +748,202 @@ async function main(): Promise<void> {
       "a target saved before this setting existed reads back as self",
       watchTargets.list().every((t) => t.payer === "self")
     );
+  });
+
+  // ── per-target overrides ──────────────────────────────────────────────
+  //
+  // Wallets-per-fire and the price ceiling used to be one shared number each,
+  // set in a file the operator could not reach. Both now sit on the target, so
+  // both need the guard the shared versions had: a bad value must be refused
+  // rather than stored, and a missing one must fall back to the shared default
+  // rather than to no limit at all.
+  section("per-target overrides");
+
+  withStateDir(userStateDir(44447), () => {
+    const TIERS = { high: 50, med: 20, low: 5 };
+    const t = watchTargets.add(VECTORS[0], "low", "both", "vault", "any");
+
+    check("with no override the tier decides", watchTargets.walletsFor(t, TIERS) === 5);
+    const wide = watchTargets.setWalletCount(VECTORS[0], 120);
+    check("an override replaces the tier", watchTargets.walletsFor(wide, TIERS) === 120);
+    check("…and survives a reload", watchTargets.find(VECTORS[0])?.walletCount === 120);
+    const cleared = watchTargets.setWalletCount(VECTORS[0], undefined);
+    check("clearing hands it back to the tier", watchTargets.walletsFor(cleared, TIERS) === 5);
+    check("…leaving no stale value behind", cleared.walletCount === undefined);
+
+    check("zero wallets is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], 0)));
+    check("a negative count is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], -5)));
+    check("a fraction is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], 2.5)));
+    check(
+      "more than the whole store is refused",
+      throws(() => watchTargets.setWalletCount(VECTORS[0], 501))
+    );
+
+    const GLOBAL = parseEther("0.005");
+    check(
+      "with no override the global ceiling applies",
+      watchTargets.maxPriceFor(watchTargets.find(VECTORS[0])!, GLOBAL) === GLOBAL
+    );
+    const dearer = watchTargets.setMaxPrice(VECTORS[0], "0.02");
+    check("a per-target ceiling overrides the global one", watchTargets.maxPriceFor(dearer, GLOBAL) === parseEther("0.02"));
+    check("…and reloads", watchTargets.find(VECTORS[0])?.maxPriceEth === "0.02");
+    check(
+      "clearing returns to the global cap",
+      watchTargets.maxPriceFor(watchTargets.setMaxPrice(VECTORS[0], undefined), GLOBAL) === GLOBAL
+    );
+
+    check("a zero ceiling is refused", throws(() => watchTargets.setMaxPrice(VECTORS[0], "0")));
+    check("words are refused", throws(() => watchTargets.setMaxPrice(VECTORS[0], "cheap")));
+    check(
+      "a misplaced decimal is caught by the ceiling",
+      throws(() => watchTargets.setMaxPrice(VECTORS[0], "100"))
+    );
+    check("a trailing ETH is tolerated", watchTargets.setMaxPrice(VECTORS[0], "0.03 ETH").maxPriceEth === "0.03");
+
+    // The dangerous fallback. A stored value that cannot be parsed must read as
+    // the global cap, never as "no ceiling" — that direction spends money.
+    check(
+      "an unparseable stored ceiling falls back to the global cap",
+      watchTargets.maxPriceFor({ maxPriceEth: "not-a-number" }, GLOBAL) === GLOBAL
+    );
+    check(
+      "…and an empty one does too",
+      watchTargets.maxPriceFor({ maxPriceEth: "" }, GLOBAL) === GLOBAL
+    );
+
+    check(
+      "setting one override leaves the other alone",
+      watchTargets.find(VECTORS[0])?.walletCount === undefined &&
+        watchTargets.find(VECTORS[0])?.maxPriceEth === "0.03"
+    );
+    check("…and neither disturbs the payer rule", watchTargets.find(VECTORS[0])?.payer === "any");
+  });
+
+  // ── how far back a scan actually reaches ──────────────────────────────
+  //
+  // Block times differ by two orders of magnitude across the watched chains —
+  // 12s on Ethereum, 0.1s on Robinhood — so a fixed block count means three
+  // days on one and half an hour on another. That is exactly how a scan comes
+  // back empty and gets read as "this address never mints".
+  section("scan window");
+
+  const blockServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      // A chain producing a block every 0.1s, like Robinhood.
+      const number = Number(BigInt(body.params[0] as string));
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: { timestamp: `0x${Math.round(number / 10).toString(16)}` },
+        })
+      );
+    });
+  });
+  await new Promise<void>((resolve) => blockServer.listen(0, "127.0.0.1", resolve));
+  const blockUrl = `http://127.0.0.1:${(blockServer.address() as { port: number }).port}`;
+
+  const window = await blocksForHours(blockUrl, 1_000_000, 24);
+  check("block time is measured rather than assumed", Math.abs(window.secondsPerBlock - 0.1) < 0.01);
+  check(
+    "…so 24 hours on a fast chain is hundreds of thousands of blocks",
+    Math.abs(window.blocks - 864_000) < 1000
+  );
+  blockServer.close();
+
+  // ── explaining why a copy did not happen ──────────────────────────────
+  //
+  // The report has one job: name every setting standing between a mint and a
+  // copy, so fixing one and discovering another is not the loop. It judges with
+  // the engine's own predicates, so a pass here is a statement about the
+  // engine rather than about a second implementation of it.
+  section("copy blockers");
+
+  withStateDir(userStateDir(44448), () => {
+    const vault = watchTargets.add(VECTORS[1], "high", "both", "vault", "any");
+    const base = {
+      target: vault,
+      tiers: { high: 50, med: 20, low: 5 },
+      globalMaxPriceWei: parseEther("0.005"),
+      perEventWei: parseEther("0.1"),
+      gasReservationWei: parseEther("0.0005"),
+      poolSize: 100,
+      copyEnabled: true,
+    };
+    const mint = {
+      contract: VECTORS[2],
+      transactionHash: "0xabc",
+      blockNumber: 1,
+      payer: VECTORS[0],
+      valueWei: parseEther("0.011"),
+      selector: "0x161ac21f",
+      method: "mintPublic",
+      standard: "erc721" as const,
+    };
+
+    const overPriced = assessMint(mint, base);
+    check("a mint above the ceiling is reported as blocked", !overPriced.wouldCopy);
+    check("…naming the price as the reason", overPriced.blockers.some((b) => b.kind === "price"));
+
+    const raised = assessMint(mint, {
+      ...base,
+      target: { ...vault, maxPriceEth: "0.02" },
+    });
+    check("a per-target ceiling unblocks it", raised.wouldCopy);
+    check(
+      "…and the wallet count is trimmed by the per-event cap",
+      raised.walletCount === Math.floor(0.1 / 0.0115)
+    );
+
+    check(
+      "a self-only target blocks a third-party-paid mint",
+      assessMint(mint, { ...base, target: { ...vault, payer: "self" } }).blockers.some(
+        (b) => b.kind === "payer"
+      )
+    );
+    check(
+      "a free-only target blocks a paid mint",
+      assessMint(mint, { ...base, target: { ...vault, mintMode: "free" } }).blockers.some(
+        (b) => b.kind === "mintMode"
+      )
+    );
+    check(
+      "copy-mint being off is reported, not silently assumed",
+      assessMint(mint, { ...base, copyEnabled: false }).blockers.some((b) => b.kind === "copyOff")
+    );
+    check(
+      "an empty wallet pool is reported",
+      assessMint(mint, { ...base, poolSize: 0 }).blockers.some((b) => b.kind === "pool")
+    );
+    check(
+      "a signature-gated mint is reported as uncopyable by anyone",
+      assessMint({ ...mint, method: "mintSigned" }, base).blockers.some(
+        (b) => b.kind === "signature"
+      )
+    );
+
+    // Every blocker at once, because fixing them one at a time is the loop this
+    // exists to end.
+    const everything = assessMint(
+      { ...mint, method: "mintSigned" },
+      { ...base, target: { ...vault, payer: "self", mintMode: "free" }, poolSize: 0, copyEnabled: false }
+    );
+    check("all blockers are reported together, not just the first", everything.blockers.length >= 5);
+    check("…and each carries a remedy", everything.blockers.every((b) => b.remedy.length > 0));
+
+    const free = assessMint({ ...mint, valueWei: 0n, method: "mintPublic" }, base);
+    check("a free mint from a correctly-set target copies", free.wouldCopy);
+    check("…using the target's wallet count", free.walletCount === 50);
+
+    const capped = assessMint({ ...mint, valueWei: 0n }, {
+      ...base,
+      target: { ...vault, walletCount: 7 },
+    });
+    check("…or its own override when it has one", capped.walletCount === 7);
   });
 
   // ── and the replay rule that makes it safe ────────────────────────────

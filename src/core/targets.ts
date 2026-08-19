@@ -10,7 +10,7 @@
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { getAddress } from "ethers";
+import { getAddress, parseEther, formatEther } from "ethers";
 import { stateDir, ensureStateDir } from "./paths";
 
 export type Tier = "high" | "med" | "low";
@@ -48,6 +48,26 @@ export interface WatchTarget {
   mintMode: MintMode;
   /** Whether a mint paid for by another wallet still counts as this target's. */
   payer: PayerMode;
+  /**
+   * Wallets to fire for this target, overriding the tier's shared number.
+   *
+   * Tiers were a shortcut for "how much do I trust this one", and three shared
+   * numbers in a config file is a poor way to express that when the answer is
+   * per address and the file is not reachable from a phone. The tier stays as
+   * the default; this is the answer when there is one.
+   */
+  walletCount?: number;
+  /**
+   * Price ceiling for this target, as a decimal ETH string.
+   *
+   * Overrides caps.maxPriceEth for its own signals only. One global ceiling has
+   * to be set for the least trusted address being watched, which makes it
+   * useless for the most trusted one — a vault whose drops cost 0.011 cannot
+   * share a ceiling with an unknown wallet that should never spend that much.
+   * The per-event and daily caps still apply on top, so this widens what a
+   * single mint may cost without widening what a day may.
+   */
+  maxPriceEth?: string;
   label?: string;
   addedAt: number;
   /** Total fires ever, for reporting. */
@@ -166,6 +186,87 @@ export function allowsMint(target: Pick<WatchTarget, "mintMode">, valueWei: bigi
     (target.mintMode === "free" && valueWei === 0n) ||
     (target.mintMode === "paid" && valueWei > 0n)
   );
+}
+
+/** Wallets that fire for this target — its own number, or the tier's. */
+export function walletsFor(
+  target: Pick<WatchTarget, "walletCount" | "tier">,
+  tiers: Record<Tier, number>
+): number {
+  return target.walletCount ?? tiers[target.tier];
+}
+
+/** The price ceiling this target's signals are judged against. */
+export function maxPriceFor(
+  target: Pick<WatchTarget, "maxPriceEth">,
+  globalMaxPriceWei: bigint
+): bigint {
+  if (!target.maxPriceEth) return globalMaxPriceWei;
+  try {
+    return parseEther(target.maxPriceEth);
+  } catch {
+    // A malformed override must not become "no ceiling at all".
+    return globalMaxPriceWei;
+  }
+}
+
+export const MAX_WALLETS_PER_TARGET = 500;
+
+/** Fat-finger guard, same purpose as the one on the global caps. */
+export const MAX_TARGET_PRICE_WEI = parseEther("10");
+
+export function setWalletCount(address: string, count: number | undefined): WatchTarget {
+  const wanted = normalise(address).toLowerCase();
+  const data = read();
+  const target = data.targets.find((entry) => entry.address.toLowerCase() === wanted);
+  if (!target) throw new TargetsError("That address is not being watched.");
+
+  if (count === undefined) {
+    delete target.walletCount;
+  } else {
+    if (!Number.isInteger(count) || count < 1 || count > MAX_WALLETS_PER_TARGET) {
+      throw new TargetsError(
+        `Wallets per fire must be a whole number between 1 and ${MAX_WALLETS_PER_TARGET}.`
+      );
+    }
+    target.walletCount = count;
+  }
+  write(data);
+  return target;
+}
+
+export function setMaxPrice(address: string, maxPriceEth: string | undefined): WatchTarget {
+  const wanted = normalise(address).toLowerCase();
+  const data = read();
+  const target = data.targets.find((entry) => entry.address.toLowerCase() === wanted);
+  if (!target) throw new TargetsError("That address is not being watched.");
+
+  if (maxPriceEth === undefined) {
+    delete target.maxPriceEth;
+  } else {
+    const text = String(maxPriceEth).trim().replace(/\s*eth$/i, "");
+    if (!/^\d+(\.\d+)?$/.test(text)) {
+      throw new TargetsError(`"${maxPriceEth}" is not a plain ETH amount like 0.02.`);
+    }
+    let wei: bigint;
+    try {
+      wei = parseEther(text);
+    } catch {
+      throw new TargetsError(`"${maxPriceEth}" is not a valid ETH amount.`);
+    }
+    if (wei <= 0n) {
+      throw new TargetsError("A zero ceiling would refuse every mint from this target.");
+    }
+    if (wei > MAX_TARGET_PRICE_WEI) {
+      throw new TargetsError(
+        `That is above the ${formatEther(MAX_TARGET_PRICE_WEI)} ETH ceiling for a per-target ` +
+          `price. Check the decimal point.`
+      );
+    }
+    target.maxPriceEth = text;
+  }
+  write(data);
+  return target;
 }
 
 export function setPayer(address: string, payer: PayerMode): WatchTarget {

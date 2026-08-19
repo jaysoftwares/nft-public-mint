@@ -219,8 +219,10 @@ export class CopyEngine {
       // ── Which wallets are allowed to act ──
       const ctx = await this.deps.tagContext();
       const pool = resolveForAutoFire(this.deps.copy.walletSelector, this.deps.wallets(), ctx);
-      const tierLimit = this.deps.copy.tiers[watch.tier];
-      const candidates = pool.selected.slice(0, tierLimit);
+      // This target's own number when it has one, the tier's shared default
+      // otherwise. Same for the price ceiling further down.
+      const walletLimit = targets.walletsFor(watch, this.deps.copy.tiers);
+      const candidates = pool.selected.slice(0, walletLimit);
 
       if (candidates.length === 0) {
         skip("No eligible wallets", explainEmptyPool(pool, this.deps.copy.walletSelector));
@@ -283,7 +285,13 @@ export class CopyEngine {
         unitPriceWei: value,
         gasReservationWei: gasReservation,
         requestedWallets: candidates.length,
-        caps: this.deps.caps,
+        // A per-target ceiling replaces the global one for this signal only.
+        // The per-event and daily caps are untouched, so raising what a single
+        // mint may cost never raises what a day may.
+        caps: {
+          ...this.deps.caps,
+          maxPriceWei: targets.maxPriceFor(watch, this.deps.caps.maxPriceWei),
+        },
         // Autonomous spend only. A mint the operator ran by hand is their own
         // decision and must not eat the budget copy-mint fires from.
         spentLast24hWei: spentSince(24, ["mint"], { autoOnly: true }),

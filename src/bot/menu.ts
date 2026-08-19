@@ -26,7 +26,9 @@ export type FlowKind =
   | "destination"
   | "importWallet"
   | "restore"
-  | "cap";
+  | "cap"
+  | "targetWallets"
+  | "targetPrice";
 
 export interface Flow {
   kind: FlowKind;
@@ -281,27 +283,94 @@ export function walletsPager(offset: number, shown: number, total: number, selec
   return keyboard.row().text("📄 Export all as CSV", "a:csv").row().text("‹ Back", "m:wallets");
 }
 
-/** Per-target filters plus removal, without asking users to retype addresses. */
-export function targetsKeyboard(
-  entries: { address: string; label?: string; mintMode: string; payer: string }[]
-): InlineKeyboard {
+/**
+ * The watch list, one row per target.
+ *
+ * Every setting used to live on this screen, three rows deep per address, which
+ * made ten targets thirty rows of buttons with no way to tell which belonged to
+ * what. Each address now opens its own page instead.
+ */
+export function targetsKeyboard(entries: { address: string; label?: string }[]): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  for (const entry of entries.slice(0, 10)) {
-    const name = entry.label || `${entry.address.slice(0, 6)}…${entry.address.slice(-4)}`;
-    keyboard
-      .text(entry.mintMode === "free" ? "✅ Free" : "Free", `tf:free:${entry.address}`)
-      .text(entry.mintMode === "paid" ? "✅ Paid" : "Paid", `tf:paid:${entry.address}`)
-      .text(entry.mintMode === "both" ? "✅ Both" : "Both", `tf:both:${entry.address}`)
-      .row();
-    // Which transactions count as this target minting. A vault never sends its
-    // own mints, so "self" would watch it forever and copy nothing.
-    keyboard
-      .text(entry.payer === "self" ? "✅ Own tx" : "Own tx", `tp:self:${entry.address}`)
-      .text(entry.payer === "any" ? "✅ Any payer" : "Any payer", `tp:any:${entry.address}`)
-      .row();
-    keyboard.text(`✕ ${name}`, `uw:${entry.address}`).row();
+  for (const entry of entries.slice(0, 12)) {
+    const name = entry.label || `${entry.address.slice(0, 8)}…${entry.address.slice(-6)}`;
+    keyboard.text(`🎯 ${name}`, `tg:${entry.address}`).row();
   }
   return keyboard.text("➕ Watch a wallet", "i:watch").row().text("‹ Back", "m:copy");
+}
+
+/**
+ * One target's page: every rule that decides whether its mints get copied.
+ *
+ * Wallets-per-fire and the price ceiling are per target rather than shared,
+ * because both answers are really "how much do I trust this address", and three
+ * tiers plus one global ceiling in a config file could not express that — least
+ * of all from a phone.
+ */
+export function targetDetailKeyboard(entry: {
+  address: string;
+  mintMode: string;
+  payer: string;
+}): InlineKeyboard {
+  const a = entry.address;
+  return new InlineKeyboard()
+    .text("🔎 What does it mint?", `tq:${a}`)
+    .row()
+    .text(entry.mintMode === "free" ? "✅ Free" : "Free", `tf:free:${a}`)
+    .text(entry.mintMode === "paid" ? "✅ Paid" : "Paid", `tf:paid:${a}`)
+    .text(entry.mintMode === "both" ? "✅ Both" : "Both", `tf:both:${a}`)
+    .row()
+    .text(entry.payer === "self" ? "✅ Own tx" : "Own tx", `tp:self:${a}`)
+    .text(entry.payer === "any" ? "✅ Any payer" : "Any payer", `tp:any:${a}`)
+    .row()
+    .text("✏️ Wallets per fire", `tw:${a}`)
+    .row()
+    .text("✏️ Price limit", `tpr:${a}`)
+    .row()
+    .text("✕ Stop watching", `uw:${a}`)
+    .row()
+    .text("‹ All targets", "a:targets");
+}
+
+/** How many wallets fire for this target. "Tier" hands it back to the shared number. */
+export function targetWalletsKeyboard(address: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("1", `twv:1:${address}`)
+    .text("3", `twv:3:${address}`)
+    .text("5", `twv:5:${address}`)
+    .row()
+    .text("10", `twv:10:${address}`)
+    .text("25", `twv:25:${address}`)
+    .text("50", `twv:50:${address}`)
+    .row()
+    .text("100", `twv:100:${address}`)
+    .text("250", `twv:250:${address}`)
+    .text("500", `twv:500:${address}`)
+    .row()
+    .text("✏️ Type a number", `twv:custom:${address}`)
+    .row()
+    .text("↺ Use the tier's number", `twv:tier:${address}`)
+    .row()
+    .text("‹ Back", `tg:${address}`);
+}
+
+/** This target's own price ceiling. "Global" hands it back to caps.maxPriceEth. */
+export function targetPriceKeyboard(address: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("0.005", `tpv:0.005:${address}`)
+    .text("0.01", `tpv:0.01:${address}`)
+    .row()
+    .text("0.02", `tpv:0.02:${address}`)
+    .text("0.05", `tpv:0.05:${address}`)
+    .row()
+    .text("0.1", `tpv:0.1:${address}`)
+    .text("0.25", `tpv:0.25:${address}`)
+    .row()
+    .text("✏️ Type an amount", `tpv:custom:${address}`)
+    .row()
+    .text("↺ Use the global cap", `tpv:global:${address}`)
+    .row()
+    .text("‹ Back", `tg:${address}`);
 }
 
 export function copyMenu(copyOn: boolean): InlineKeyboard {
