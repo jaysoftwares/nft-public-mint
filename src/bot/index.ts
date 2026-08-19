@@ -44,7 +44,13 @@ import {
 } from "../core/funding";
 import { discoverHoldings, sweepNfts, latestBlock } from "../core/holdings";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
-import { earliestMintBlock, mintedContracts, spentSince } from "../core/ledger";
+import {
+  earliestMintBlock,
+  entries as ledgerEntries,
+  mintedContracts,
+  spentSince,
+} from "../core/ledger";
+import { collectDashboard, ChainReading } from "../core/dashboard";
 import * as targets from "../core/targets";
 import { CopyEvent } from "../core/copy-mint";
 import {
@@ -76,7 +82,8 @@ import {
   OpenSeaMintEvent,
   OpenSeaMintReport,
 } from "../core/mint-opensea";
-import { StatusCard, esc, eth, bar, short, toCsv, txLink } from "./ui";
+import { StatusCard, esc, eth, bar, short, clamp, toCsv, txLink } from "./ui";
+import { renderDashboard } from "./dashboard";
 import { feedFor, clearFeed, contractLabel } from "./copy-feed";
 import { askPassphrase } from "../tools/tty";
 import {
@@ -85,6 +92,7 @@ import {
   getFlow,
   clearFlow,
   mainMenu,
+  dashboardMenu,
   mintMenu,
   walletsMenu,
   walletImportMenu,
@@ -380,6 +388,7 @@ async function chainFor(ctx: Context, contract?: string): Promise<ChainContext> 
 const HELP = `<b>Copymint</b>
 
 <b>Wallets</b>
+/dashboard — wallets, funding, copies and spend on one card
 /status — set overview, balances, nonce health
 /wallets [selector] — list matching wallets
 /wallets csv — every wallet, tag and balance as a file
@@ -417,6 +426,84 @@ whichever you're eligible for. Times are UTC.
 <code>0-99</code> index range · <code>0x…</code> address · <code>+</code> and · <code>,</code> or · <code>!</code> not
 
 Your funding wallet is created automatically and kept out of autonomous minting.`;
+
+/**
+ * The dashboard, as a single card.
+ *
+ * Balances are the expensive part — five hundred wallets across three chains is
+ * fifteen hundred reads through a rate-limited provider — so opening the card
+ * uses the session's short-lived balance cache and only ↻ forces a fresh read
+ * from chain. The card is sent before those reads finish and edited in place
+ * when they land, because a tap that shows nothing for ten seconds reads as a
+ * bot that has stopped.
+ */
+async function cmdDashboard(ctx: Context, force = false): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+
+  const loading = [
+    `📊 <b>Dashboard</b>`,
+    ``,
+    `<i>reading ${session.wallets().length} wallet balances on ` +
+      `${session.availableChains.length} chain(s)…</i>`,
+  ].join("\n");
+
+  // A button tap rewrites the message it came from; a typed command opens one.
+  let messageId: number;
+  if (ctx.callbackQuery?.message) {
+    messageId = ctx.callbackQuery.message.message_id;
+    // Editing to identical text is an error, which a double-tap on ↻ produces.
+    await ctx.editMessageText(loading, { parse_mode: "HTML" }).catch(() => undefined);
+  } else {
+    const sent = await ctx.reply(loading, { parse_mode: "HTML" });
+    messageId = sent.message_id;
+  }
+
+  const minFundedWei = gasReservation(config.gasLimit, config.maxFeePerGas);
+  const chains: ChainReading[] = await Promise.all(
+    session.availableChains.map(async (chain) => {
+      const row: ChainReading = {
+        key: chain.key,
+        name: chain.name,
+        symbol: chain.profile.nativeSymbol,
+        minFundedWei,
+      };
+      try {
+        return { ...row, balances: await session.balances(chain.key, force) };
+      } catch {
+        // One chain refusing to answer must not blank the card. It is reported
+        // as unread — which is not the same claim as "these wallets are empty".
+        return row;
+      }
+    })
+  );
+
+  const text = clamp(
+    renderDashboard(
+      collectDashboard({
+        wallets: session.wallets(),
+        funder: config.funder,
+        chains,
+        ledger: ledgerEntries(),
+        targets: targets.list(),
+        copyEnabled: session.copyEnabled,
+        capDailyWei: config.capDailyWei,
+      })
+    )
+  );
+
+  try {
+    await ctx.api.editMessageText(chatId, messageId, text, {
+      parse_mode: "HTML",
+      reply_markup: dashboardMenu(),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch {
+    // The placeholder may have been deleted underneath us; send rather than
+    // leave the operator looking at "reading balances…" forever.
+    await ctx.reply(text, { parse_mode: "HTML", reply_markup: dashboardMenu() });
+  }
+}
 
 async function cmdStatus(ctx: Context): Promise<void> {
   const wallets = session.wallets();
@@ -2522,7 +2609,10 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
       keyboard: mintMenu(),
     },
     wallets: {
-      text: `<b>Wallets</b>\n\n<i>Generate from your main seed, or securely import an existing seed/private key. Imported wallets start manual-only.</i>`,
+      text:
+        `<b>Wallets</b>\n\n` +
+        `<i>Generate from your main seed, or securely import an existing seed/private key. ` +
+        `Imported wallets start manual-only. 📊 Dashboard counts how many are funded.</i>`,
       keyboard: walletsMenu(),
     },
     autofire: {
@@ -2808,6 +2898,10 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "a":
       switch (payload) {
+        case "dash":
+          return cmdDashboard(ctx);
+        case "dash:refresh":
+          return cmdDashboard(ctx, true);
         case "status":
           return cmdStatus(ctx);
         case "wallets":
@@ -3210,6 +3304,7 @@ async function main(): Promise<void> {
   );
   bot.command("settings", (ctx) => showUserSettings(ctx));
   bot.command("help", (ctx) => ctx.reply(HELP, { parse_mode: "HTML" }));
+  bot.command("dashboard", (ctx) => cmdDashboard(ctx).catch((e) => fail(ctx, e)));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));
   bot.command("import", (ctx) => showWalletImport(ctx).catch((e) => fail(ctx, e)));

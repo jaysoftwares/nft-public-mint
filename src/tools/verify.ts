@@ -69,6 +69,9 @@ import {
 import { FILES, stateDir, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
 import { ensureUserFundingWallet } from "../bot/user-wallet";
+import { collectDashboard, summariseMints, pct } from "../core/dashboard";
+import { LedgerEntry } from "../core/ledger";
+import { renderDashboard } from "../bot/dashboard";
 import * as watchTargets from "../core/targets";
 import { rpcBatchChunked } from "../core/rpc";
 import {
@@ -824,6 +827,200 @@ async function main(): Promise<void> {
     );
   }
   check("Robinhood maps to the slug OpenSea answers on", openSeaChainSlug(4663) === "robinhood");
+
+  // ── the dashboard's arithmetic ────────────────────────────────────────
+  //
+  // This screen gets read as the answer to "am I funded?", so the ways it can
+  // mislead are the ways that cost money: counting the funder among the wallets
+  // that mint, reporting a chain that would not answer as a set of empty
+  // wallets, or reading funded-on-Base as funded everywhere.
+  section("dashboard");
+
+  const DASH_FUNDER = VECTORS[0];
+  const DASH_A = VECTORS[1];
+  const DASH_B = VECTORS[2];
+  const DASH_IMPORTED = "0x00000000000000000000000000000000000000aa";
+  const RESERVE = parseEther("0.0005");
+
+  const dashWallets = [
+    { id: "d:0", address: DASH_FUNDER, kind: "derived", autoFire: false },
+    { id: "d:1", address: DASH_A, kind: "derived", autoFire: true },
+    { id: "d:2", address: DASH_B, kind: "derived", autoFire: true },
+    { id: "i:aa", address: DASH_IMPORTED, kind: "imported", autoFire: false },
+  ];
+
+  const dashChains = [
+    {
+      key: "base",
+      name: "Base",
+      symbol: "ETH",
+      minFundedWei: RESERVE,
+      // The imported wallet is deliberately absent: a balance the node did not
+      // return is unknown, not zero.
+      balances: new Map<string, bigint>([
+        [DASH_FUNDER, parseEther("0.03")],
+        [DASH_A, 0n],
+        [DASH_B, parseEther("1")],
+      ]),
+    },
+    {
+      key: "robinhood",
+      name: "Robinhood",
+      symbol: "ETH",
+      minFundedWei: RESERVE,
+      balances: new Map<string, bigint>([
+        [DASH_FUNDER, 0n],
+        [DASH_A, parseEther("0.001")],
+        [DASH_B, 0n],
+        [DASH_IMPORTED, 0n],
+      ]),
+    },
+    // No balances at all — this chain did not answer.
+    { key: "ethereum", name: "Ethereum", symbol: "ETH", minFundedWei: RESERVE },
+  ];
+
+  const dashNow = Date.parse("2026-08-19T12:00:00Z");
+  const HOUR = 3_600_000;
+  const dashLedger: LedgerEntry[] = [
+    {
+      ts: dashNow - 60_000,
+      kind: "mint",
+      chainId: 8453,
+      contract: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      walletIds: ["d:1", "d:2"],
+      valueWei: parseEther("0.002").toString(),
+      quantity: 3,
+    },
+    {
+      ts: dashNow - 120_000,
+      kind: "mint",
+      chainId: 8453,
+      contract: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      walletIds: ["d:1"],
+      valueWei: parseEther("0.001").toString(),
+      auto: true,
+    },
+    {
+      // Older than the rolling window, and the same collection in another case.
+      ts: dashNow - 40 * HOUR,
+      kind: "mint",
+      chainId: 1,
+      contract: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      walletIds: ["d:2"],
+      valueWei: parseEther("5").toString(),
+      auto: true,
+    },
+    {
+      ts: dashNow - 30_000,
+      kind: "fund",
+      chainId: 8453,
+      walletIds: ["d:1"],
+      valueWei: parseEther("0.01").toString(),
+    },
+  ];
+
+  const dash = collectDashboard({
+    wallets: dashWallets,
+    funder: DASH_FUNDER,
+    chains: dashChains,
+    ledger: dashLedger,
+    targets: [{ fires: 4 }, { fires: 1 }],
+    copyEnabled: true,
+    capDailyWei: parseEther("0.05"),
+    now: dashNow,
+  });
+
+  check("the funder is not counted as a minting wallet", dash.wallets.total === 3);
+  check(
+    "…and derived/imported still split correctly",
+    dash.wallets.derived === 2 && dash.wallets.imported === 1
+  );
+  check("armed and manual add up", dash.wallets.armed === 2 && dash.wallets.manual === 1);
+
+  const baseRow = dash.funding.chains.find((c) => c.key === "base")!;
+  const rhRow = dash.funding.chains.find((c) => c.key === "robinhood")!;
+  const ethRow = dash.funding.chains.find((c) => c.key === "ethereum")!;
+
+  check("a chain counts only the wallets it answered for", baseRow.funded === 1 && baseRow.empty === 1);
+  check("…and reports the rest as unread rather than empty", baseRow.unknown === 1);
+  check("the funder's balance is reported apart from the set", baseRow.funderWei === parseEther("0.03"));
+  check("…and left out of the set's total", baseRow.totalWei === parseEther("1"));
+  check("a chain that did not answer is marked unread", !ethRow.read);
+  check("…and contributes no empty wallets", ethRow.empty === 0 && ethRow.funded === 0);
+
+  check(
+    "funded means funded on at least one chain",
+    dash.funding.fundedAnywhere === 2 && rhRow.funded === 1
+  );
+  check("ready to fire is armed AND funded", dash.funding.readyToFire === 2);
+  check(
+    "only chains that answered count as read",
+    dash.funding.chainsRead === 2 && !dash.funding.blind
+  );
+
+  check("every mint is counted", dash.minted.runs === 3 && dash.minted.txs === 4);
+  check("a recorded quantity multiplies the NFT count", dash.minted.nfts === 8);
+  check(
+    "a missing quantity counts one NFT per transaction, not zero",
+    summariseMints([{ ...dashLedger[1], quantity: undefined }]).nfts === 1
+  );
+  check("collections are deduplicated case-insensitively", dash.minted.collections === 2);
+  check("spend sums across every mint", dash.minted.spentWei === parseEther("5.003"));
+
+  check("copies are the autonomous subset", dash.copied.runs === 2 && dash.copied.txs === 2);
+  check("…and carry their own spend", dash.copied.spentWei === parseEther("5.001"));
+  check("watch-list fires are totalled", dash.copy.fires === 5 && dash.copy.targets === 2);
+
+  check("the 24h window drops older entries", dash.day.mintRuns === 2 && dash.day.copyRuns === 1);
+  check(
+    "hand-driven spend is reported apart from the capped kind",
+    dash.day.autoSpentWei === parseEther("0.001") &&
+      dash.day.manualSpentWei === parseEther("0.002")
+  );
+  check("funding transfers are not counted as mints", dash.day.fundedWei === parseEther("0.01"));
+
+  check("percentages survive an empty set", pct(0, 0) === 0 && pct(2, 3) === 67);
+
+  // ── and how it reads ──
+  const dashText = renderDashboard(dash);
+  check("the headline states funded out of total", dashText.includes("2 of 3 wallets funded"));
+  check("an unread chain says so on its own row", /Ethereum\s+unread/.test(dashText));
+  check("the card fits one Telegram message", dashText.length < 4000);
+
+  const blindCard = renderDashboard(
+    collectDashboard({
+      wallets: dashWallets,
+      funder: DASH_FUNDER,
+      chains: dashChains.map((c) => ({ ...c, balances: undefined })),
+      ledger: dashLedger,
+      targets: [],
+      copyEnabled: false,
+      capDailyWei: parseEther("0.05"),
+      now: dashNow,
+    })
+  );
+  check(
+    "with no chain readable it says unknown, never zero funded",
+    blindCard.includes("balances unread")
+  );
+  check("…and does not state a funded count at all", !blindCard.includes("of 3 wallets funded"));
+
+  const emptyStore = renderDashboard(
+    collectDashboard({
+      wallets: [],
+      funder: DASH_FUNDER,
+      chains: dashChains,
+      ledger: [],
+      targets: [],
+      copyEnabled: false,
+      capDailyWei: parseEther("0.05"),
+      now: dashNow,
+    })
+  );
+  check(
+    "a fresh store gets a first step rather than a wall of zeroes",
+    emptyStore.includes("No minting wallets yet")
+  );
 
   // ── a hand-typed funding amount ───────────────────────────────────────
   //

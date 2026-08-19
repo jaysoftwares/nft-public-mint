@@ -431,6 +431,7 @@ export async function executeSignedMint(
       chainId: deps.chainId,
       contract: req.nftContract,
       walletIds: report.outcomes.filter((o) => o.accepted).map((o) => o.id),
+      quantity: req.quantity,
       valueWei: totalValue.toString(),
       fromBlock: await currentBlock(deps.readUrl),
       note: "signed",

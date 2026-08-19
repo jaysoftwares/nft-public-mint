@@ -29,6 +29,15 @@ export interface LedgerEntry {
    * against their own deliberate spending.
    */
   auto?: boolean;
+  /**
+   * NFTs per accepted transaction, when the path knew it.
+   *
+   * Copy-mint replays somebody else's calldata and cannot always decode a
+   * quantity from it, and entries written before this field existed carry none
+   * either. Readers therefore count one per transaction when it is absent:
+   * undercounting is honest in a way that inventing mints would not be.
+   */
+  quantity?: number;
   /** Earliest block a resulting transfer could appear in. */
   fromBlock?: number;
   note?: string;

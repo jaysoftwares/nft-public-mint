@@ -78,18 +78,41 @@ export function clearFlow(chatId: number): void {
 
 export function mainMenu(copyOn: boolean, watching: number): InlineKeyboard {
   return new InlineKeyboard()
+    // Its own full-width row at the top: it is the screen that answers "where
+    // do things stand?", which is what most sessions open with.
+    .text("📊 Dashboard", "a:dash")
+    .row()
     .text("💰 Mint", "m:mint")
     .text("👁 Copy-mint", "m:copy")
     .row()
     .text("👛 Wallets", "m:wallets")
     .text("💸 Money", "m:money")
     .row()
-    .text("📊 Status", "a:status")
+    .text("🩺 Status", "a:status")
     .text(copyOn ? `🟢 Copy ON (${watching})` : "🔴 Copy OFF", "m:copy")
     .row()
     .text("⚙️ Settings", "cfg:menu")
     .row()
     .text("❔ Command help", "a:help");
+}
+
+/**
+ * Under the dashboard.
+ *
+ * Refresh is first because the card is a snapshot and the balances behind it
+ * cache for a few seconds; the rest are the places its numbers lead to, so a
+ * figure that looks wrong is one tap from the screen that can change it.
+ */
+export function dashboardMenu(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("↻ Refresh", "a:dash:refresh")
+    .row()
+    .text("👛 Wallets", "m:wallets")
+    .text("💸 Money", "m:money")
+    .row()
+    .text("👁 Copy-mint", "m:copy")
+    .row()
+    .text("‹ Back", "m:main");
 }
 
 export function settingsMenu(duringSetup = false): InlineKeyboard {
@@ -390,7 +413,7 @@ export function afterSetupMenu(): InlineKeyboard {
     .text("➕ Generate 10", "g:10")
     .text("➕ Generate 100", "g:100")
     .row()
-    .text("📊 Status", "a:status")
+    .text("📊 Dashboard", "a:dash")
     .row()
     .text("☰ Main menu", "m:main");
 }
