@@ -250,7 +250,15 @@ export class LogWatcher {
       // the first point the connection has proved it is worth anything.
       this.lastMessageAt = Date.now();
       this.subscribe();
-      void this.replayMissed();
+      // Fire-and-forget, so a rejection here has nowhere to go — and an
+      // unhandled rejection exits the process outright under Node 22. A single
+      // empty eth_blockNumber reply from the provider took the whole bot down
+      // this way, on a path that runs on every reconnect. start() already
+      // guards the same head read and the polling tick already catches this;
+      // the socket path was the one place that did not.
+      void this.replayMissed().catch((err) => {
+        this.opts.onStatus(`Gap replay failed: ${(err as Error).message}`, "warn");
+      });
       this.startHeartbeat();
     });
 
