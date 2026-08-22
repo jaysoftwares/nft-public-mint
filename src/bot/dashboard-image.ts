@@ -195,7 +195,7 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
 
   // ── Per network ──
   y += statH + 28;
-  const rowH = 62;
+  const rowH = 56;
   const netH = 58 + chains.length * rowH;
   parts.push(
     card(PAD, y, inner, netH),
@@ -204,7 +204,6 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
 
   chains.forEach((chain, i) => {
     const ry = y + 58 + i * rowH;
-    const symbol = input.symbols[chain.key] ?? "ETH";
     const colour = !chain.read ? C.dim : chain.ready > 0 ? C.green : C.red;
     const note = !chain.read
       ? "could not be reached"
@@ -218,8 +217,7 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
       `<circle cx="${PAD + 32}" cy="${ry + 16}" r="6" fill="${colour}"/>`,
       text(truncate(chain.name, 22), PAD + 52, ry + 22, { size: 21, weight: 700 }),
       text(note, W - PAD - 24, ry + 22, { size: 17, fill: C.muted, anchor: "end" }),
-      bar(PAD + 52, ry + 34, inner - 100, chain.ready, Math.max(1, chain.matched || wallets.total), colour),
-      text(symbol, W - PAD - 24, ry + 52, { size: 13, fill: C.dim, anchor: "end" })
+      bar(PAD + 52, ry + 34, inner - 100, chain.ready, Math.max(1, chain.matched || wallets.total), colour)
     );
   });
 
