@@ -162,6 +162,16 @@ export interface DashboardImageInput {
 const MAX_TARGET_ROWS = 24;
 const MAX_WALLET_ROWS = 12;
 
+/**
+ * A network name that fits a narrow column.
+ *
+ * "Robinhood Chain" truncated to "Robinhood …" is uglier and no more
+ * informative than dropping the word, and every chain here is a chain.
+ */
+function columnLabel(name: string): string {
+  return truncate(name.replace(/ Chain$/, ""), 11);
+}
+
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
@@ -349,7 +359,7 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
 
     chains.forEach((chain, i) => {
       parts.push(
-        text(truncate(chain.name, 11), firstCol + i * colW, y + 62, {
+        text(columnLabel(chain.name), firstCol + i * colW, y + 62, {
           size: 13,
           weight: 700,
           fill: C.dim,
@@ -374,6 +384,7 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
           text(held === undefined ? "·" : eth(held, 4), firstCol + c * colW, ry, {
             size: 15,
             mono: true,
+            anchor: "end",
             fill: held !== undefined && held > 0n ? C.text : C.dim,
           })
         );
