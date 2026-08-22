@@ -246,11 +246,11 @@ export function walletSelectorMenu(current: string): InlineKeyboard {
   const mark = (selector: string, label: string): string =>
     current === selector ? `✅ ${label}` : label;
   return new InlineKeyboard()
-    .text(mark("derived+funded", "Generated wallets"), "sel:derived+funded")
+    .text(mark("all", "Every wallet — recommended"), "sel:all")
     .row()
-    .text(mark("funded", "Any funded wallet"), "sel:funded")
+    .text(mark("derived", "Generated wallets only"), "sel:derived")
     .row()
-    .text(mark("imported+funded", "Imported wallets only"), "sel:imported+funded")
+    .text(mark("imported", "Imported wallets only"), "sel:imported")
     .row()
     .text("‹ Back", "a:caps");
 }

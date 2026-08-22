@@ -177,6 +177,44 @@ export interface AutoFirePool {
  * post-selector exclusions made an unarmed wallet and an empty one produce the
  * same message, which is how a funded wallet came to be described as unfunded.
  */
+/**
+ * The wallets a copy signal fires from. Selector, minus the ones that cannot
+ * physically send.
+ *
+ * Deliberately does NOT require a wallet to be armed or funded, which is a
+ * reversal. The old pool demanded both, and both turned out to be traps rather
+ * than protections:
+ *
+ *   Arming was a second switch behind the switch. An operator who has chosen
+ *   which wallets copy-mint spends from has already said what they want; making
+ *   them say it again in a different menu only produces a set-up that looks
+ *   complete and fires at nothing. Fifteen mints were detected in one day and
+ *   every one was declined for want of a flag nobody knew to set.
+ *
+ *   The funding check cost more than it saved. Deciding it meant reading every
+ *   wallet's balance before firing — ten to fifteen seconds on five hundred
+ *   wallets, on a path whose whole budget is one block. And it bought nothing:
+ *   a wallet without gas has its transaction rejected by the node at no cost,
+ *   which is the same outcome, arrived at without spending the drop.
+ *
+ * A nonce gap is different and still excluded — that wallet's transaction
+ * cannot land whatever its balance, and skipping it is free.
+ */
+export function resolveForCopy(
+  selector: string,
+  wallets: ManagedWallet[],
+  ctx: TagContext
+): { selected: ManagedWallet[]; matched: number; stuck: number; total: number } {
+  const matched = resolve(selector, wallets, ctx);
+  const selected = matched.filter((w) => !ctx.state.get(w.id)?.nonceGap);
+  return {
+    selected,
+    matched: matched.length,
+    stuck: matched.length - selected.length,
+    total: wallets.length,
+  };
+}
+
 export function resolveForAutoFire(
   selector: string,
   wallets: ManagedWallet[],

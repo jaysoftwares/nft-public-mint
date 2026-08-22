@@ -419,7 +419,7 @@ export class Session {
           nonces: chain.nonces,
           signerFor: this.signerFor,
           wallets: () => this.wallets(),
-          tagContext: (force?: boolean) => this.tagContext(chain.key, force),
+          copyContext: () => this.copyContext(chain.key),
         },
         (event) => onCopyEvent(event, chain)
       );
@@ -525,5 +525,34 @@ export class Session {
   /** Whether one chain is being watched, so readiness can be reported per chain. */
   hasWatcher(chainKey: string): boolean {
     return this.watchers.has(chainKey);
+  }
+
+  /**
+   * The selector context for a copy signal — built from memory, never the network.
+   *
+   * `tagContext` reads every wallet's balance, which on five hundred wallets
+   * through a rate-limited provider took ten to fifteen seconds. It sat on the
+   * copy path, whose entire budget is one block, so every signal arrived at its
+   * decision about a hundred blocks late — and while it waited, every other
+   * signal in the burst was turned away as "busy".
+   *
+   * Nothing on the firing path needs a balance any more (see resolveForCopy),
+   * and nonce gaps are tracked locally, so this costs nothing and returns
+   * immediately. Balances are still read for the screens that report them,
+   * where a few seconds do not matter.
+   */
+  copyContext(chainKey?: string): TagContext {
+    const chain = this.chain(chainKey);
+    const stuck = chain.nonces.stuckAddresses();
+    const ctx: TagContext = {
+      minFundedWei: gasReservation(this.config.gasLimit, this.config.maxFeePerGas),
+      state: new Map(),
+    };
+    for (const wallet of this.wallets()) {
+      // No balanceWei: absent means unknown, so `funded`/`unfunded` simply do
+      // not apply rather than resolving to a guess.
+      ctx.state.set(wallet.id, { nonceGap: stuck.has(wallet.address) });
+    }
+    return ctx;
   }
 }

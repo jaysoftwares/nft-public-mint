@@ -144,7 +144,15 @@ export const DEFAULT_CONFIG: BotConfig = {
     tiers: { high: 50, med: 20, low: 5 },
     dedupWindowSec: 60,
     maxFiresPerTargetPerHour: 3,
-    walletSelector: "derived+funded",
+    // Every wallet, not just the generated-and-funded ones.
+    //
+    // The old default excluded imported wallets and required a balance read to
+    // evaluate. On a real deployment that meant the money — which was entirely
+    // in imported wallets — was unreachable, and the check cost ten seconds of
+    // a one-block budget to reach that conclusion. Selecting broadly and
+    // letting the node reject what it cannot pay for is both faster and what
+    // an operator means by "copy with my wallets".
+    walletSelector: "all",
     wsUrl: "",
   },
   signed: {

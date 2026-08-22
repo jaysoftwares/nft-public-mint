@@ -100,11 +100,11 @@ export function walletChoiceKeyboard(chainKey: string, current: string): InlineK
   const mark = (selector: string, label: string): string =>
     current === selector ? `✅ ${label}` : label;
   return new InlineKeyboard()
-    .text(mark("funded", "Any wallet with money — recommended"), `cs:sel:${chainKey}:funded`)
+    .text(mark("all", "Every wallet — recommended"), `cs:sel:${chainKey}:all`)
     .row()
-    .text(mark("derived+funded", "Only generated wallets"), `cs:sel:${chainKey}:derived+funded`)
+    .text(mark("derived", "Only generated wallets"), `cs:sel:${chainKey}:derived`)
     .row()
-    .text(mark("imported+funded", "Only imported wallets"), `cs:sel:${chainKey}:imported+funded`)
+    .text(mark("imported", "Only imported wallets"), `cs:sel:${chainKey}:imported`)
     .row()
     .text("‹ Back", "cs:start");
 }

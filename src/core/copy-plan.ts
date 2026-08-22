@@ -249,12 +249,26 @@ export async function planCopy(args: PlanCopyArgs): Promise<CopyPlan> {
     fundingFailures += 1;
   }
   if (!sim || !sim.ok) {
+    // Same reasoning as the replay rung: a wallet being short is the node’s
+    // decision at dispatch, for free, not ours to make here at the cost of the
+    // whole drop.
     if (fundingFailures === probes.length) {
-      throw new CopyPlanError(
-        `${replayFailure} Its public stage is open at ${formatEther(value)} ETH, but the wallets ` +
-          `tried cannot cover that plus gas, so the mint could not even be tested.`,
-        "Top your wallets up — the collection itself was not the problem."
-      );
+      const dataForAll = new Map<string, string>();
+      for (const wallet of args.wallets) dataForAll.set(wallet.address, data);
+      return {
+        strategy: "public-stage",
+        to: SEADROP_ADDRESS,
+        value,
+        dataFor: dataForAll,
+        gasLimit: args.configuredGasLimit,
+        quantity: perWallet,
+        unitPriceWei: drop.mintPrice,
+        addressBound: false,
+        selector: data.slice(0, 10),
+        how:
+          "They used a wallet-locked stage we cannot re-use, so this mints the same " +
+          "collection through its open public stage instead.",
+      };
     }
     throw new CopyPlanError(
       `${replayFailure} Minting its public stage was tried instead and the test run failed: ${sim?.reason ?? "no reason given"}`,

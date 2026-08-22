@@ -10,7 +10,7 @@
 // that costs money, so an abort costs nothing at all.
 
 import { ManagedWallet } from "./wallet-store";
-import { TagContext, resolveForAutoFire, AutoFirePool } from "./tags";
+import { TagContext, resolveForCopy, resolveForAutoFire, AutoFirePool } from "./tags";
 import { NonceManager } from "./nonce-manager";
 import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
@@ -46,7 +46,13 @@ export interface CopyDeps {
   nonces: NonceManager;
   signerFor(id: string): Wallet | HDNodeWallet;
   wallets(): ManagedWallet[];
-  tagContext(force?: boolean): Promise<TagContext>;
+  /**
+   * Selector context, built from memory rather than the network.
+   *
+   * Synchronous on purpose. The awaited version read every wallet's balance and
+   * cost ten to fifteen seconds on the one path that has a block to work in.
+   */
+  copyContext(): TagContext;
 }
 
 export interface CopyResult {
@@ -294,8 +300,14 @@ export class CopyEngine {
       const firesInWindow = targets.firesInWindow(target, 3_600_000);
 
       // ── Which wallets are allowed to act ──
-      const ctx = await this.deps.tagContext();
-      const pool = resolveForAutoFire(this.deps.copy.walletSelector, this.deps.wallets(), ctx);
+      //
+      // No balance read and no arming check: whatever the selector names, fires.
+      // Both gates were removed deliberately — see resolveForCopy. A wallet
+      // short of gas has its transaction rejected by the node for nothing,
+      // which is the same outcome as excluding it, reached without spending the
+      // drop working out which wallets those are.
+      const ctx = this.deps.copyContext();
+      const pool = resolveForCopy(this.deps.copy.walletSelector, this.deps.wallets(), ctx);
       // This target's own number when it has one, the tier's shared default
       // otherwise. Same for the price ceiling further down.
       const walletLimit = targets.walletsFor(watch, this.deps.copy.tiers);
@@ -303,9 +315,15 @@ export class CopyEngine {
 
       if (candidates.length === 0) {
         skip(
-          `Not enough funds to copy on ${this.deps.chainName}`,
-          explainEmptyPool(pool, this.deps.copy.walletSelector, this.deps.chainName),
-          `Fund your wallets on ${this.deps.chainName}, or point copy-mint at a set that is funded there. Mints on your other networks are still being copied.`
+          "No wallets to buy with",
+          pool.total === 0
+            ? "You have no wallets yet."
+            : pool.matched === 0
+              ? `None of your ${pool.total} wallets match "${this.deps.copy.walletSelector}".`
+              : `All ${pool.matched} matching wallets are behind a nonce gap and cannot send right now.`,
+          pool.matched === 0
+            ? "Change which wallets copy-mint buys with, under Copy-mint."
+            : "The reconciler clears nonce gaps on its own within a minute."
         );
         return;
       }

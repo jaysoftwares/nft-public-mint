@@ -243,11 +243,23 @@ export async function buildReplay(args: BuildReplayArgs): Promise<ReplayPlan> {
   }
 
   if (!outcome || !outcome.ok) {
+    // Short wallets are not a reason to abandon the drop.
+    //
+    // A funding revert says nothing about the calldata — it says this wallet
+    // cannot pay, which the node decides for itself, for free, at dispatch.
+    // Refusing here meant one poor wallet in the probe set cancelled the mint
+    // for every wallet behind it, and working out which wallets could pay cost
+    // a balance sweep the block budget cannot afford. So it proceeds on the
+    // configured gas limit and lets the ones with money through.
     if (fundingFailures === probes.length) {
-      throw new ReplayError(
-        `Every wallet tried is short of the ${args.value} wei mint price plus gas, so the ` +
-          `simulation could not run. Top them up with /fund — the calldata itself was not rejected.`
-      );
+      return {
+        to: args.to,
+        value: args.value,
+        dataFor,
+        selector: selectorOf(args.originalData),
+        addressBound,
+        gasLimit: args.configuredGasLimit,
+      };
     }
     throw new ReplayError(
       `Simulation reverted — not firing. ${outcome?.reason ?? "no reason given"}` +
