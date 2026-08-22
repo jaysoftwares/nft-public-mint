@@ -1,47 +1,44 @@
 // The dashboard card.
 //
-// One screen that answers the questions an operator actually opens the bot to
-// ask: how many wallets do I have, how many of them can pay for a mint right
-// now, is copy-mint watching anything, and what has it spent. Those facts were
-// all reachable before — spread over /status, /wallets, /caps and the copy feed
-// — which meant assembling them by hand from four screens while a stage was
-// opening.
+// What this replaces: seven headed blocks of fixed-width label/number rows, all
+// of them true, none of them saying whether the thing was working. It read as a
+// wall of statistics — "armed 511", "funded 0/511", "signals 0" — in a private
+// vocabulary, and the operator's summary of it was that the screen was full of
+// text and explained nothing. That was a fair reading. A row saying `armed 511`
+// does not tell you that armed means "allowed to buy without asking", and a
+// screen of thirty such rows does not tell you which one is the problem.
 //
-// Telegram gives no control over type size, so hierarchy comes from three
-// things instead: the headline is the one number that matters and sits alone at
-// the top, every other figure is a fixed-width row so the eye can scan a column
-// rather than parse a sentence, and each block is small enough that nothing
-// scrolls off a phone.
+// So the shape changed, on three rules:
 //
-// Every number here is either read from chain a moment ago or recorded locally.
-// Nothing is projected, and nothing is a placeholder — a dashboard that
-// invented a figure would be worse than no dashboard at all, which is why
-// there is no floor price or profit line: this bot has no price feed, so it
-// cannot honestly show one.
+//   Lead with the verdict, not the data. The first line says whether it is
+//   working, and if not, what is stopping it. Everything else is support.
+//
+//   Say what a number means in the same breath as the number. Not `armed 511`
+//   but "511 can buy without asking you first".
+//
+//   Show less. Anything that is zero, or that duplicates a figure above, or
+//   that only matters while something is happening, is not on the card. A
+//   number nobody acts on is noise no matter how correct it is.
+//
+// Nothing here is projected or invented — same rule as before, and the reason
+// there is still no floor price or profit line: this bot has no price feed, so
+// it cannot honestly show one.
 
 import { DashboardStats, ChainFunding, pct } from "../core/dashboard";
+import { Finding, Severity } from "../core/diagnosis";
 import { esc, eth, bar } from "./ui";
-
-/** Column widths chosen so the widest row still fits a phone without wrapping. */
-const LABEL = 11;
-const VALUE = 9;
-
-function stat(label: string, value: string, note?: string): string {
-  const row = `<code>${label.padEnd(LABEL)}${value.padStart(VALUE)}</code>`;
-  return note ? `${row}  ${note}` : row;
-}
 
 function ago(then: number, now: number): string {
   const seconds = Math.max(0, Math.round((now - then) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 60) return `${seconds} seconds ago`;
   const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 60) return `${minutes} ${minutes === 1 ? "minute" : "minutes"} ago`;
   const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
+  if (hours < 48) return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+  return `${Math.round(hours / 24)} days ago`;
 }
 
-/** "19 Aug 08:06" — the bot runs on a VPS, so the clock has to say which one. */
+/** "19 Aug 08:06 UTC" — the bot runs on a VPS, so the clock has to say which one. */
 function stamp(at: number): string {
   const when = new Date(at);
   const month = when.toLocaleString("en-GB", { month: "short", timeZone: "UTC" });
@@ -53,142 +50,169 @@ function plural(count: number, one: string, many: string): string {
 }
 
 /**
- * One chain's row.
+ * One chain's line.
  *
- * A chain that would not answer says so rather than showing zeroes. Reporting
- * an unread chain as "0 funded" is the single most expensive thing this screen
- * could get wrong: it reads as "your wallets are empty" when the truth is
- * "nobody asked".
+ * A chain that would not answer says so in words rather than showing zeroes.
+ * Reporting an unread chain as "0 funded" is the single most expensive thing
+ * this screen could get wrong: it reads as "your wallets are empty" when the
+ * truth is "nobody asked".
  */
-function chainRow(chain: ChainFunding, minters: number): string {
-  const name = esc(chain.name).slice(0, LABEL - 1).padEnd(LABEL);
-  if (!chain.read) return `<code>${name}${"unread".padStart(VALUE)}</code>`;
-
-  const counts = `${chain.funded}/${minters}`.padStart(VALUE);
-  const held = `${eth(chain.totalWei, 4)} ${chain.symbol}`;
-  return `<code>${name}${counts}</code>  ${held}` + (chain.unknown > 0 ? `  <i>(${chain.unknown} unread)</i>` : "");
+function chainLine(chain: ChainFunding, total: number): string {
+  const name = `<b>${esc(chain.name)}</b>`;
+  if (!chain.read) return `${name} — could not be reached just now`;
+  if (chain.funded === 0) {
+    return `${name} — no wallets ready · ${eth(chain.totalWei, 4)} ${chain.symbol} held`;
+  }
+  return (
+    `${name} — ${chain.funded} of ${total} ${plural(chain.funded, "wallet", "wallets")} ready · ` +
+    `${eth(chain.totalWei, 4)} ${chain.symbol} held`
+  );
 }
 
-export function renderDashboard(stats: DashboardStats): string {
+/**
+ * The card.
+ *
+ * `findings` comes from the same health check the "Why?" screen runs, so the
+ * dashboard and that screen can never disagree — which they would, inevitably,
+ * if each worked the verdict out for itself.
+ */
+export function renderDashboard(
+  stats: DashboardStats,
+  findings: Finding[] = [],
+  state: Severity = "ok"
+): string {
   const { wallets, funding, minted, copied, copy, day } = stats;
   const now = stats.generatedAt;
-  const lines: string[] = [`📊 <b>Dashboard</b>`, ``];
+  const lines: string[] = [];
 
-  // ── Headline ──
+  // ── The verdict ──
+  //
+  // First, always, and in one sentence. This is the line that was missing: the
+  // old card could show a perfectly healthy set of numbers for a bot that had
+  // been unable to buy anything for a week.
+  const blockers = findings.filter((f) => f.severity === "blocking");
+  if (blockers.length > 0) {
+    lines.push(
+      `🔴 <b>Not buying anything</b>`,
+      ``,
+      esc(blockers[0].title) + ".",
+      ...(blockers[0].fix ? [`<i>→ ${esc(blockers[0].fix)}</i>`] : []),
+      ...(blockers.length > 1
+        ? [``, `<i>and ${blockers.length - 1} other ${plural(blockers.length - 1, "problem", "problems")} — tap “Why?” below.</i>`]
+        : []),
+      ``
+    );
+  } else if (state === "limiting") {
+    lines.push(
+      `🟡 <b>Running, but skipping some mints</b>`,
+      ``,
+      ...(findings[0] ? [esc(findings[0].title) + "."] : []),
+      ``
+    );
+  } else if (copy.enabled) {
+    lines.push(
+      `🟢 <b>Watching and ready to buy</b>`,
+      ``,
+      `Following ${copy.targets} ${plural(copy.targets, "wallet", "wallets")} with ` +
+        `${funding.readyToFire} of yours ready to copy them.`,
+      ``
+    );
+  } else {
+    lines.push(`⚪️ <b>Copy-mint is off</b>`, ``, `Nothing is being bought.`, ``);
+  }
+
+  // ── Your wallets ──
   if (wallets.total === 0) {
     lines.push(
-      `<b>No minting wallets yet</b>`,
-      ``,
-      `<i>Generate a set from Wallets, then fund them. Everything below fills in from there.</i>`,
+      `<b>Your wallets</b>`,
+      `You have none yet. Make some under Wallets, then send them ETH for gas.`,
       ``
     );
   } else if (funding.blind) {
     lines.push(
-      `<b>${wallets.total} wallets</b> · balances unread`,
-      ``,
-      `<i>No chain answered just now, so how many are funded is unknown — not zero. Tap ↻ to try again.</i>`,
+      `<b>Your wallets</b>`,
+      `${wallets.total} wallets. No network answered just now, so how many have money ` +
+        `is unknown — <i>not</i> zero. Tap ↻ to try again.`,
       ``
     );
   } else {
     const share = pct(funding.fundedAnywhere, wallets.total);
     lines.push(
-      `<b>${funding.fundedAnywhere} of ${wallets.total} wallets funded</b>  ·  ${share}%`,
-      `<code>${bar(funding.fundedAnywhere, wallets.total)}</code>`,
-      `<i>${eth(funding.totalWei, 4)} ETH held · ${funding.readyToFire} armed and funded, ready to fire</i>`,
+      `<b>Your wallets</b>`,
+      `<code>${bar(funding.fundedAnywhere, wallets.total)}</code>  ${share}%`,
+      `<b>${funding.fundedAnywhere} of ${wallets.total}</b> have enough for gas, ` +
+        `holding ${eth(funding.totalWei, 4)} ETH between them.`,
+      `<b>${funding.readyToFire}</b> of those can buy without asking you first.`,
+      ...(wallets.manual > 0
+        ? [`<i>${wallets.manual} will always ask you before spending.</i>`]
+        : []),
+      ``
+    );
+
+    // Per network, because gas is per network: the same wallet is ready on one
+    // and broke on another, and only this block can say which.
+    if (funding.chains.length > 0) {
+      lines.push(
+        `<b>Ready, by network</b>`,
+        ...funding.chains.map((chain) => chainLine(chain, wallets.total)),
+        ``
+      );
+    }
+
+    lines.push(
+      `<b>Money to top up with</b>`,
+      `${eth(funding.funderWei, 4)} ETH in your funding wallet.`,
       ``
     );
   }
 
-  // ── Wallets ──
-  //
-  // When nothing could be read, these rows say so rather than printing zeroes.
-  // "funded 0" and "funded unknown" look alike and mean opposite things, and
-  // the first one reads as an empty set of wallets that may be perfectly funded.
-  lines.push(
-    `<b>👛 Wallets</b>`,
-    ...(funding.blind
-      ? [stat("funded", "unread", "no chain answered")]
-      : [
-          stat("funded", String(funding.fundedAnywhere), "can pay for a mint"),
-          stat("empty", String(Math.max(0, wallets.total - funding.fundedAnywhere)), "needs gas"),
-        ]),
-    stat("armed", String(wallets.armed), "fires on a copy signal"),
-    stat("manual", String(wallets.manual), "confirm every time"),
-    stat("imported", String(wallets.imported)),
-    // Summed over every chain the funder was readable on. Which chain it is
-    // actually sitting on decides whether a fund succeeds, so that figure is
-    // shown per chain on the buttons of the fund flow rather than implied here.
-    stat(
-      "funder",
-      funding.blind ? "unread" : eth(funding.funderWei, 4),
-      funding.blind ? "" : "ETH to fund with, all chains"
-    ),
-    ``
-  );
+  // ── Copying ──
+  lines.push(`<b>Copying</b>`);
+  if (copy.targets === 0) {
+    lines.push(`You are not following anyone yet.`);
+  } else if (copied.runs === 0) {
+    lines.push(
+      `Following ${copy.targets} ${plural(copy.targets, "wallet", "wallets")}. ` +
+        `Nothing bought yet.`
+    );
+  } else {
+    lines.push(
+      `Bought <b>${copied.nfts}</b> ${plural(copied.nfts, "NFT", "NFTs")} by copying, ` +
+        `across ${copied.collections} ${plural(copied.collections, "collection", "collections")}, ` +
+        `for ${eth(copied.spentWei)} ETH.`,
+      ...(copied.lastAt !== undefined ? [`<i>Last one ${ago(copied.lastAt, now)}.</i>`] : [])
+    );
+  }
+  lines.push(``);
 
-  // ── Per chain ──
-  //
-  // Funded is per chain because gas is: the same wallet is ready on Robinhood
-  // and broke on Base, and only this block can say which.
-  lines.push(
-    `<b>⛓ Funded per chain</b>`,
-    ...funding.chains.map((chain) => chainRow(chain, wallets.total)),
-    `<i>funded = holds at least ${eth(funding.chains[0]?.minFundedWei ?? 0n)} ETH, one mint's gas reservation</i>`,
-    ``
-  );
+  // ── Everything bought, if hand-driven mints happened too ──
+  if (minted.runs > copied.runs) {
+    lines.push(
+      `<b>Everything you've minted</b>`,
+      `<b>${minted.nfts}</b> ${plural(minted.nfts, "NFT", "NFTs")} across ` +
+        `${minted.collections} ${plural(minted.collections, "collection", "collections")}, ` +
+        `for ${eth(minted.spentWei)} ETH.`,
+      `<i>Includes the copies above and anything you minted by hand.</i>`,
+      ``
+    );
+  }
 
-  // ── Copy-mint ──
+  // ── Today's spending ──
   //
-  // Signals acted on and mints that landed are separate numbers on purpose. A
-  // target that fires constantly while nothing lands is the failure worth
-  // seeing, and one combined figure would hide it in either direction.
+  // The cap governs autonomous spending only, so hand-driven mints sit beside
+  // it rather than inside it — charging them to the same budget is what used to
+  // silence copy-mint after the operator minted something themselves.
   lines.push(
-    `<b>👁 Copy-mint</b>  ${copy.enabled ? "🟢 ON" : "🔴 OFF"}`,
-    stat("targets", String(copy.targets), plural(copy.targets, "wallet watched", "wallets watched")),
-    ...(copy.fires > 0 ? [stat("signals", String(copy.fires), "acted on")] : []),
-    stat("copied", String(copied.runs), plural(copied.runs, "mint landed", "mints landed")),
-    stat("sent", String(copied.txs), "wallet transactions"),
-    stat("spent", eth(copied.spentWei), "ETH"),
-    ...(copied.lastAt !== undefined ? [stat("last", ago(copied.lastAt, now))] : []),
-    ...(copy.targets === 0
-      ? [`<i>Nothing is being watched yet — add a wallet under Copy-mint.</i>`]
+    `<b>Spending, last 24 hours</b>`,
+    `<code>${bar(Number(day.autoSpentWei), Number(day.capWei))}</code>`,
+    `${eth(day.autoSpentWei)} of ${eth(day.capWei)} ETH — the limit on what the bot ` +
+      `may spend on its own.`,
+    ...(day.manualSpentWei > 0n
+      ? [`<i>Plus ${eth(day.manualSpentWei)} ETH you spent yourself, which does not count against it.</i>`]
       : []),
     ``
   );
 
-  // ── All minting ──
-  lines.push(
-    `<b>💰 Minting, all time</b>`,
-    stat(
-      "drops",
-      String(minted.runs),
-      minted.collections === minted.runs
-        ? ""
-        : `${minted.collections} ${plural(minted.collections, "collection", "collections")}`
-    ),
-    stat("NFTs", String(minted.nfts), "bought"),
-    stat("sent", String(minted.txs), "wallet transactions"),
-    stat("spent", eth(minted.spentWei), "ETH"),
-    ...(minted.lastAt !== undefined ? [stat("last", ago(minted.lastAt, now))] : []),
-    ``
-  );
-
-  // ── The rolling day ──
-  //
-  // The cap governs autonomous spending only, so hand-driven mints are shown
-  // beside it rather than inside it — charging them to the same budget is what
-  // used to silence copy-mint after an operator minted something themselves.
-  const spentToday = day.autoSpentWei;
-  lines.push(
-    `<b>📈 Last 24 hours</b>`,
-    `<code>${bar(Number(spentToday), Number(day.capWei))}</code>  ${eth(spentToday)} / ${eth(day.capWei)} ETH`,
-    stat("auto", eth(day.autoSpentWei), "ETH · counts against the cap"),
-    stat("by hand", eth(day.manualSpentWei), "ETH · does not"),
-    stat("mints", String(day.mintRuns), `${day.copyRuns} from copy signals`),
-    ...(day.fundedWei > 0n ? [stat("funded", eth(day.fundedWei), "ETH sent to wallets")] : []),
-    ``
-  );
-
-  lines.push(`<i>${stamp(now)} · ↻ re-reads every balance from chain</i>`);
+  lines.push(`<i>${stamp(now)} · ↻ checks every balance again</i>`);
   return lines.join("\n");
 }

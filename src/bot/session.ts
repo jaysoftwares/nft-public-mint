@@ -402,6 +402,7 @@ export class Session {
           readUrl: chain.rpc.readUrl,
           endpoints: chain.rpc.endpoints,
           chainId: chain.chainId,
+          chainName: chain.name,
           gasLimit: this.config.gasLimit,
           maxFeePerGas: this.config.maxFeePerGas,
           maxPriorityFeePerGas: this.config.maxPriorityFeePerGas,
@@ -514,5 +515,10 @@ export class Session {
 
   get watching(): boolean {
     return this.watchers.size > 0;
+  }
+
+  /** Chains with a live watcher, for the health check to compare against. */
+  get watcherCount(): number {
+    return this.watchers.size;
   }
 }

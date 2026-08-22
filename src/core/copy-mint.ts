@@ -14,11 +14,12 @@ import { TagContext, resolveForAutoFire, AutoFirePool } from "./tags";
 import { NonceManager } from "./nonce-manager";
 import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
-import { buildReplay, ReplayError } from "./calldata";
+import { planCopy, CopyPlanError } from "./copy-plan";
 import { inspectCalldata } from "./mint-opensea";
 import { evaluate, PolicyCaps, PolicyVerdict } from "./policy";
 import { rpcCall } from "./rpc";
 import { record, spentSince } from "./ledger";
+import { recordSignal } from "./copy-journal";
 import * as targets from "./targets";
 import { Wallet, HDNodeWallet, formatEther } from "ethers";
 import { CopyConfig } from "./config";
@@ -35,6 +36,8 @@ export interface CopyDeps {
   readUrl: string;
   endpoints: Endpoint[];
   chainId: number;
+  /** For the journal, so a stored signal says which chain without a lookup. */
+  chainName: string;
   gasLimit: number;
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
@@ -55,7 +58,14 @@ export interface CopyResult {
   accepted: number;
   rejected: number;
   totalCommitWei: bigint;
+  /** What one wallet paid, all in. */
   unitPriceWei: bigint;
+  /** NFTs each wallet received. */
+  quantity: number;
+  /** "replay" or "public-stage" — which rung of the ladder did it. */
+  strategy: string;
+  /** One plain sentence on how the copy was made. */
+  how: string;
   elapsedMs: number;
   dispatchMs: number;
   hashes: { id: string; address: string; hash: string; accepted: boolean }[];
@@ -64,8 +74,26 @@ export interface CopyResult {
 
 export type CopyEvent =
   | { type: "signal"; target: string; contract: string; txHash: string; block: number }
-  | { type: "skipped"; target: string; contract: string; reason: string; detail?: string }
-  | { type: "simulated"; gasLimit: number; addressBound: boolean; selector: string }
+  | {
+      type: "skipped";
+      target: string;
+      contract: string;
+      reason: string;
+      detail?: string;
+      /** What the operator can change. Absent when there is genuinely nothing. */
+      fix?: string;
+    }
+  | {
+      type: "simulated";
+      gasLimit: number;
+      addressBound: boolean;
+      selector: string;
+      /** Which rung of the ladder built this. */
+      strategy: string;
+      /** One plain sentence describing what is about to be bought. */
+      how: string;
+      quantity: number;
+    }
   | {
       type: "firing";
       walletCount: number;
@@ -141,8 +169,27 @@ export class CopyEngine {
     const target = event.recipient;
     const contract = event.contract;
 
-    const skip = (reason: string, detail?: string): void =>
-      this.emit({ type: "skipped", target, contract, reason, detail });
+    // Every miss is both shown live and written down. The live card collapses
+    // and rotates, which is right for watching and useless for asking later —
+    // and "why has this never fired?" is always asked later.
+    const skip = (reason: string, detail?: string, fix?: string): void => {
+      this.emit({ type: "skipped", target, contract, reason, detail, fix });
+      try {
+        recordSignal({
+          chainId: this.deps.chainId,
+          chainName: this.deps.chainName,
+          target,
+          contract,
+          txHash: event.transactionHash,
+          block: event.blockNumber,
+          outcome: "skipped",
+          what: detail ? `${reason} — ${detail}` : reason,
+          fix,
+        });
+      } catch {
+        // A journal that cannot be written must never stop a mint.
+      }
+    };
 
     this.emit({
       type: "signal",
@@ -153,14 +200,22 @@ export class CopyEngine {
     });
 
     if (!this.deps.copy.enabled) {
-      skip("Copy-mint disabled", "Signal recorded only. Enable with /copy on.");
+      skip(
+        "Copy-mint is switched off",
+        "The mint was spotted and written down, but nothing was bought.",
+        "Tap the red “Copy OFF” button on the main menu to turn it on."
+      );
       return;
     }
 
     // One event at a time. Two mints landing in the same block would otherwise
     // race for the same nonces and the same budget.
     if (this.busy) {
-      skip("Already firing", "Another signal is mid-flight.");
+      skip(
+        "Busy with another mint",
+        "Two watched wallets minted at almost the same moment, and only the first was followed.",
+        "Working as intended — buying two drops at once would double-spend the same wallets."
+      );
       return;
     }
     this.busy = true;
@@ -174,7 +229,11 @@ export class CopyEngine {
         4_000
       );
       if (!tx || !tx.to) {
-        skip("Transaction unavailable", "Contract creation, or the node has not indexed it yet.");
+        skip(
+          "Could not read their transaction",
+          "The node had not caught up with it yet.",
+          "Nothing to change — this is a passing RPC hiccup."
+        );
         return;
       }
 
@@ -185,7 +244,7 @@ export class CopyEngine {
 
       const watch = targets.find(target);
       if (!watch) {
-        skip("Target no longer watched");
+        skip("That wallet is no longer being watched", undefined, "Nothing to change.");
         return;
       }
 
@@ -199,18 +258,31 @@ export class CopyEngine {
       const paidByOther = tx.from.toLowerCase() !== target.toLowerCase();
       if (paidByOther && !targets.allowsPayer(watch, tx.from)) {
         skip(
-          "Not the target's own transaction",
-          `Paid by ${tx.from.slice(0, 10)}… — set this target to "any payer" to copy mints ` +
-            `credited to it that somebody else paid for.`
+          "Somebody else paid for their mint",
+          `The NFT went to the wallet you watch, but ${tx.from.slice(0, 10)}… paid for it. ` +
+            `This wallet is set to follow only mints it pays for itself.`,
+          `Open Copy-mint → this wallet and switch it to “any payer”. Vault wallets almost ` +
+            `always receive mints paid for by a different hot wallet, so “own tx” never fires for them.`
         );
         return;
       }
       const value = BigInt(tx.value);
       if (!targets.allowsMint(watch, value)) {
-        const kind = value === 0n ? "free" : "paid";
+        // The single commonest reason this bot does nothing.
+        //
+        // "Free only" is the narrowest setting on the watch screen and reads
+        // like the safe one, so it gets chosen — and then every paid mint is
+        // dropped in silence. Nineteen wallets were watched for days at this
+        // setting while every drop they bought cost money. Say the price, say
+        // the setting, and say where to change it.
+        const paid = value > 0n;
         skip(
-          `${kind === "free" ? "Free" : "Paid"} mint filtered`,
-          `This target is set to copy ${watch.mintMode} mints only.`
+          paid ? "They paid for this one, and you only follow free mints" : "This one was free, and you only follow paid mints",
+          paid
+            ? `They spent ${formatEther(value)} ETH on it. This wallet is set to “free mints only”, so it was left alone.`
+            : `It cost nothing. This wallet is set to “paid mints only”, so it was left alone.`,
+          `Open Copy-mint → this wallet and switch it to “any mint”. Most real drops cost ` +
+            `something, so “free only” will sit and watch almost everything go past.`
         );
         return;
       }
@@ -225,31 +297,60 @@ export class CopyEngine {
       const candidates = pool.selected.slice(0, walletLimit);
 
       if (candidates.length === 0) {
-        skip("No eligible wallets", explainEmptyPool(pool, this.deps.copy.walletSelector));
+        skip(
+          "None of your wallets could buy it",
+          explainEmptyPool(pool, this.deps.copy.walletSelector),
+          "Fix whichever of those it names — the wallet screen shows the same counts."
+        );
         return;
       }
 
-      // ── Rewrite and simulate ──
+      // ── Work out how to copy it, and prove the plan works ──
+      //
+      // Two rungs: replay their calldata, or failing that mint the same
+      // collection's own public stage. See copy-plan.ts — the second rung is
+      // what makes a gated drop copyable at all, and its absence is why this
+      // reported "cannot be replayed" and stopped.
       let replay;
       try {
-        replay = await buildReplay({
+        replay = await planCopy({
           readUrl: this.deps.readUrl,
           target,
           to: tx.to,
           originalData: tx.input,
           value,
+          contract,
           wallets: candidates.map((w) => ({ id: w.id, address: w.address })),
           configuredGasLimit: this.deps.gasLimit,
           // Only meaningful when the payer and the recipient differ; harmless
           // otherwise, since a self-paid mint has nothing to rewrite anyway.
           requireAddressBound: paidByOther,
+          allowPublicFallback: this.deps.copy.publicFallback !== false,
         });
       } catch (err) {
-        if (err instanceof ReplayError) {
-          skip("Not replayable", err.message);
+        if (err instanceof CopyPlanError) {
+          skip("Could not copy this mint", err.message, err.fix);
           return;
         }
         throw err;
+      }
+
+      // Re-check the filter against what *we* will pay.
+      //
+      // The public rung prices from chain, so a free allowlist mint they got
+      // for nothing can cost real money through the open stage. The earlier
+      // check tested their price, which is now the wrong number: somebody who
+      // asked to follow only free mints must not be handed a bill because the
+      // free door was shut to us. Their answer governs our spending, not theirs.
+      if (replay.strategy !== "replay" && !targets.allowsMint(watch, replay.value)) {
+        skip(
+          "Their mint was free, ours would not be",
+          `They got in through a stage we cannot use. The public stage costs ` +
+            `${formatEther(replay.value)} ETH, and this wallet is set to follow free mints only.`,
+          `Switch it to “any mint” if you are happy to pay the public price when their ` +
+            `stage is closed to you.`
+        );
+        return;
       }
 
       // Who does the rewritten calldata actually credit?
@@ -267,7 +368,11 @@ export class CopyEngine {
           wallet.address
         );
         if (!check.ok) {
-          skip("Would not credit our wallet", check.reason);
+          skip(
+            "That mint would have gone to someone else's wallet",
+            check.reason,
+            "Nothing to change — this guard stops the bot paying for another person's NFT."
+          );
           return;
         }
       }
@@ -277,12 +382,21 @@ export class CopyEngine {
         gasLimit: replay.gasLimit,
         addressBound: replay.addressBound,
         selector: replay.selector,
+        strategy: replay.strategy,
+        how: replay.how,
+        quantity: replay.quantity,
       });
 
       // ── Caps ──
+      //
+      // Priced from the plan, not from their transaction. On the public rung we
+      // are buying at the open stage's price, which may be nothing like what
+      // they paid on an allowlist — charging their price to our budget would
+      // measure the wrong money entirely.
       const gasReservation = BigInt(replay.gasLimit) * this.deps.maxFeePerGas;
       const verdict: PolicyVerdict = evaluate({
-        unitPriceWei: value,
+        unitPriceWei: replay.value,
+        quantity: replay.quantity,
         gasReservationWei: gasReservation,
         requestedWallets: candidates.length,
         // A per-target ceiling replaces the global one for this signal only.
@@ -301,7 +415,7 @@ export class CopyEngine {
       });
 
       if (!verdict.allowed) {
-        skip(verdict.reason, verdict.detail);
+        skip(verdict.reason, verdict.detail, verdict.fix);
         return;
       }
 
@@ -353,9 +467,39 @@ export class CopyEngine {
           walletIds: report.outcomes.filter((o) => o.accepted).map((o) => o.id),
           // Ledger tracks committed value, which is what the daily cap measures.
           valueWei: (verdict.unitCostWei * BigInt(report.accepted)).toString(),
+          // Now knowable on both rungs, so the NFT count stops being an
+          // undercount of one per transaction.
+          quantity: replay.quantity,
           fromBlock: event.blockNumber,
           note: `copy ${target}`,
         });
+      }
+
+      try {
+        recordSignal({
+          chainId: this.deps.chainId,
+          chainName: this.deps.chainName,
+          target,
+          contract,
+          txHash: event.transactionHash,
+          block: event.blockNumber,
+          outcome: report.accepted > 0 ? "fired" : "failed",
+          what:
+            report.accepted > 0
+              ? `Bought it with ${report.accepted} wallet(s). ${replay.how}`
+              : `Tried to buy it with ${firing.length} wallet(s) and every transaction was rejected. ` +
+                (summariseErrors(report.outcomes)[0]?.reason ?? "No reason given."),
+          fix:
+            report.accepted > 0
+              ? undefined
+              : "Usually gas or funding. Check the wallet screen, then top up with Fund.",
+          walletsFired: firing.length,
+          walletsAccepted: report.accepted,
+          spentWei: (verdict.unitCostWei * BigInt(report.accepted)).toString(),
+          strategy: replay.strategy,
+        });
+      } catch {
+        /* never let bookkeeping affect the outcome */
       }
 
       this.emit({
@@ -369,7 +513,10 @@ export class CopyEngine {
           accepted: report.accepted,
           rejected: report.rejected,
           totalCommitWei: verdict.totalCommitWei,
-          unitPriceWei: value,
+          unitPriceWei: replay.value,
+          quantity: replay.quantity,
+          strategy: replay.strategy,
+          how: replay.how,
           elapsedMs: Number(process.hrtime.bigint() - started) / 1e6,
           dispatchMs: report.dispatchMs,
           hashes: report.outcomes.map((o) => ({

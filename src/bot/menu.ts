@@ -377,11 +377,17 @@ export function copyMenu(copyOn: boolean): InlineKeyboard {
   return new InlineKeyboard()
     .text(copyOn ? "🛑 Turn OFF" : "▶️ Turn ON", copyOn ? "c:off" : "c:on")
     .row()
-    .text("🎯 Watched targets", "a:targets")
+    // Directly under the switch, because "it's on and nothing happens" is the
+    // state people are actually in when they open this screen.
+    .text("🩺 Why isn't it buying?", "a:why")
     .row()
-    .text("➕ Watch a wallet", "i:watch")
+    .text("📜 Mints spotted", "a:signals")
     .row()
-    .text("📈 Spend caps", "a:caps")
+    .text("🎯 Wallets I follow", "a:targets")
+    .row()
+    .text("➕ Follow a wallet", "i:watch")
+    .row()
+    .text("💷 Spending limits", "a:caps")
     .row()
     .text("‹ Back", "m:main");
 }
@@ -455,13 +461,28 @@ export function tierKeyboard(): InlineKeyboard {
     .text("✕ Cancel", "x");
 }
 
+/**
+ * Which of their mints to follow.
+ *
+ * Order and wording both changed after this setting silently disabled the
+ * product. "Free only" sat at the top, reads like the cautious choice, and was
+ * picked for every watched wallet — at which point the bot ignored every drop
+ * that cost money, which is nearly all of them. Nineteen wallets were followed
+ * for days and bought nothing, and the only trace was a skip line in a card
+ * that rotates every ten minutes.
+ *
+ * So the useful answer is first and labelled as the one to take, and the two
+ * narrowing filters say what they will cost you rather than just what they are.
+ * The price ceiling is the real protection against overspending; this setting
+ * was never that, and presenting it as a safety choice was the mistake.
+ */
 export function mintModeKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("🆓 Free only", "pm:free")
+    .text("✅ Any mint they make  ·  recommended", "pm:both")
     .row()
-    .text("💳 Paid only", "pm:paid")
+    .text("🆓 Only free ones (ignores paid drops)", "pm:free")
     .row()
-    .text("🔀 Free + paid", "pm:both")
+    .text("💳 Only paid ones (ignores free drops)", "pm:paid")
     .row()
     .text("✕ Cancel", "x");
 }

@@ -43,6 +43,8 @@ import {
 import { requiredPerWallet, shortfalls } from "../core/balances";
 import { substituteAddress, contains, selectorOf, buildReplay, ReplayError } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
+import { decodeSeaDropMint } from "../core/copy-plan";
+import { diagnose, overallState } from "../core/diagnosis";
 import { explainEmptyPool } from "../core/copy-mint";
 import { parseCollectionInput } from "../core/collection-input";
 import { openSeaChainSlug } from "../core/opensea-api";
@@ -1388,8 +1390,8 @@ async function main(): Promise<void> {
 
   // ── and how it reads ──
   const dashText = renderDashboard(dash);
-  check("the headline states funded out of total", dashText.includes("2 of 3 wallets funded"));
-  check("an unread chain says so on its own row", /Ethereum\s+unread/.test(dashText));
+  check("the headline states funded out of total", dashText.includes("<b>2 of 3</b> have enough for gas"));
+  check("an unread chain says so in words", /Ethereum<\/b> \u2014 could not be reached/.test(dashText));
   check("the card fits one Telegram message", dashText.length < 4000);
 
   const blindCard = renderDashboard(
@@ -1406,7 +1408,7 @@ async function main(): Promise<void> {
   );
   check(
     "with no chain readable it says unknown, never zero funded",
-    blindCard.includes("balances unread")
+    blindCard.includes("how many have money is unknown")
   );
   check("…and does not state a funded count at all", !blindCard.includes("of 3 wallets funded"));
 
@@ -1424,7 +1426,7 @@ async function main(): Promise<void> {
   );
   check(
     "a fresh store gets a first step rather than a wall of zeroes",
-    emptyStore.includes("No minting wallets yet")
+    emptyStore.includes("You have none yet")
   );
 
   // ── a hand-typed funding amount ───────────────────────────────────────
@@ -1762,7 +1764,7 @@ async function main(): Promise<void> {
   check("price above ceiling is REJECTED", !baited.allowed);
   check(
     "…and not trimmed to fit the budget",
-    !baited.allowed && baited.reason === "Price above ceiling"
+    !baited.allowed && baited.reason === "Too expensive"
   );
 
   // Budget limits trim rather than reject: some wallets beat none.
@@ -2142,6 +2144,195 @@ async function main(): Promise<void> {
     "an unrecognised selector on SeaDrop defers to simulation",
     inspectCalldata({ to: SEADROP, data: "0xdeadbeef", value: 0n }, NFT, ME).ok
   );
+
+
+  // ── copying a mint that is not a plain public one ──────────────────────
+  //
+  // Every case here is taken from a real transaction the deployed bot watched
+  // and declined. 0x161ac21f is SeaDrop's mintPublic; the calldata below is
+  // byte-for-byte what a watched wallet sent on Robinhood Chain, three NFTs for
+  // 0.0195 ETH, which the bot reported as an over-priced single mint and threw
+  // away. Both halves of that mistake are asserted against here.
+  section("copy planning");
+
+  const LIVE_MINT_PUBLIC =
+    "0x161ac21f" +
+    "0000000000000000000000006c0db931b9ecc750e01ff1d540f1c8e28d62ceaf" +
+    "00000000000000000000000034e381622f22e3da467378aa651484f79cdfc8c7" +
+    "0000000000000000000000005e84a4bba53d563438c1f4020f8d9d7d89499999" +
+    "0000000000000000000000000000000000000000000000000000000000000003";
+
+  const liveDecoded = decodeSeaDropMint(SEADROP, LIVE_MINT_PUBLIC);
+  check("a real mintPublic decodes", liveDecoded !== undefined);
+  check("…with its quantity", liveDecoded?.quantity === 3);
+  check(
+    "…and its collection",
+    liveDecoded?.nftContract.toLowerCase() === "0x6c0db931b9ecc750e01ff1d540f1c8e28d62ceaf"
+  );
+  check("…and is not treated as gated", liveDecoded?.gated === false);
+
+  const signedIface = new ethersInterface([
+    "function mintSigned(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity, (uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool) mintParams, uint256 salt, bytes signature)",
+  ]);
+  const gatedCall = decodeSeaDropMint(
+    SEADROP,
+    signedIface.encodeFunctionData("mintSigned", [
+      NFT,
+      "0x0000a26b00c1F0DF003000390027140000fAa719",
+      ZERO_ADDRESS,
+      1n,
+      [0n, 0n, 0n, 0n, 0n, 0n, 0n, false],
+      1n,
+      "0x" + "11".repeat(65),
+    ])
+  );
+  check("a signed mint decodes", gatedCall !== undefined);
+  check(
+    "…and IS flagged gated, so no estimateGas is spent proving it cannot be replayed",
+    gatedCall?.gated === true
+  );
+
+  check(
+    "calldata sent somewhere other than SeaDrop does not decode",
+    decodeSeaDropMint(NFT, LIVE_MINT_PUBLIC) === undefined
+  );
+
+  // ── the price ceiling is per NFT, not per transaction ──────────────────
+  //
+  // The bug this pins: buying three at 0.0065 arrived as one 0.0195 "unit
+  // price" and was refused against a 0.005 ceiling it never breached. The
+  // operator saw a cheap mint declined as too expensive, with no way to tell
+  // that the quantity was the reason.
+  const bulk = {
+    ...base,
+    unitPriceWei: parseEther("0.012"),
+    quantity: 3,
+    requestedWallets: 5,
+  };
+  check("three at 0.004 clears a 0.005-per-NFT ceiling", evaluate(bulk).allowed);
+  check(
+    "…while the same total charged for one NFT does not",
+    !evaluate({ ...bulk, quantity: 1 }).allowed
+  );
+
+  // The live transaction that started this: 0.0195 for three, which is 0.0065
+  // each. The quantity fix drops it from 0.0195 to 0.0065 — a threefold
+  // difference — and it is STILL over the 0.005 ceiling that was configured.
+  // Both facts matter: the arithmetic was wrong, and the limit was also too low
+  // for what was being followed. Fixing one without the other buys nothing.
+  const liveBulk = { ...base, unitPriceWei: parseEther("0.0195"), quantity: 3, requestedWallets: 5 };
+  check("the real transaction is still over a 0.005 ceiling", !evaluate(liveBulk).allowed);
+  check(
+    "…and is refused at its per-NFT price, not its total",
+    !evaluate(liveBulk).allowed &&
+      (evaluate(liveBulk) as { detail?: string }).detail?.includes("0.0065 ETH per NFT") === true
+  );
+  check(
+    "…and clears once the ceiling covers it",
+    evaluate({ ...liveBulk, caps: { ...caps, maxPriceWei: parseEther("0.01") } }).allowed
+  );
+  check(
+    "a genuinely dear mint is still refused",
+    !evaluate({ ...bulk, unitPriceWei: parseEther("0.06"), quantity: 3 }).allowed
+  );
+
+  // Refusals have to name the setting to change, or they are the unexplainable
+  // errors this work exists to remove.
+  const dear = evaluate({ ...bulk, unitPriceWei: parseEther("0.06"), quantity: 3 });
+  check("…and says what to change", !dear.allowed && (dear.fix ?? "").includes("max price per NFT"));
+  check(
+    "…quoting the real per-NFT price, not the transaction total",
+    !dear.allowed && (dear.detail ?? "").includes("0.02 ETH per NFT")
+  );
+
+  // ── the health check ───────────────────────────────────────────────────
+  //
+  // The exact configuration the deployed bot sat in for days: copy on, wallets
+  // funded and armed, watchers connected, every target following free mints
+  // only, and every drop they bought costing money. Four green lights and no
+  // purchases. This asserts the join gets made.
+  section("health check");
+
+  const healthyBase = {
+    copyEnabled: true,
+    watchersUp: 3,
+    watchersTotal: 3,
+    walletsTotal: 500,
+    walletsMatched: 500,
+    walletsReady: 500,
+    walletsUnfunded: 0,
+    walletsUnarmed: 0,
+    selector: "derived+funded",
+    maxPriceWei: parseEther("0.005"),
+    perEventWei: parseEther("0.1"),
+    dailyWei: parseEther("0.5"),
+    dailySpentWei: 0n,
+    skips: [],
+    journal: { seen: 0, fired: 0, skipped: 0 },
+    minFundedWei: parseEther("0.0005"),
+  };
+  const watched = (mode: "free" | "paid" | "both") => ({
+    address: "0x5E84a4bbA53D563438c1f4020f8D9d7d89499999",
+    tier: "high" as const,
+    mintMode: mode,
+    payer: "any" as const,
+    addedAt: 0,
+    fires: 0,
+    recentFires: [],
+  });
+
+  const allFree = diagnose({ ...healthyBase, targets: [watched("free"), watched("free")] });
+  check("following free mints only is reported as blocking", allFree[0]?.severity === "blocking");
+  check(
+    "…and named as the setting it is",
+    allFree[0]?.title.includes("free mints only") === true
+  );
+  check("…with a one-tap remedy", allFree[0]?.action?.callback === "fixall:mode");
+
+  const mixed = diagnose({ ...healthyBase, targets: [watched("free"), watched("both")] });
+  check(
+    "some-but-not-all is a limitation, not a blockage",
+    mixed[0]?.severity === "limiting" && mixed[0]?.title.includes("1 of your 2")
+  );
+
+  const fine = diagnose({ ...healthyBase, targets: [watched("both")] });
+  check("a correct set-up reports no problem", overallState(fine) === "ok");
+  check(
+    "…and says it is waiting rather than implying a fault",
+    fine[0]?.title.includes("waiting") === true
+  );
+
+  // An unfunded set and an notArmed set are opposite problems. Reporting them
+  // with one sentence is what sent people to top up wallets that had money.
+  const noGas = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    walletsReady: 0,
+    walletsUnfunded: 500,
+    walletsUnarmed: 0,
+  });
+  const notArmed = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    walletsReady: 0,
+    walletsUnfunded: 0,
+    walletsUnarmed: 500,
+  });
+  check("no gas is reported as needing gas", noGas.some((f) => f.title.includes("gas")));
+  check("not armed is reported as not armed", notArmed.some((f) => f.title.includes("not armed")));
+  check(
+    "…and the two never share a sentence",
+    !noGas.some((f) => f.title.includes("not armed")) &&
+      !notArmed.some((f) => f.title.includes("enough for gas"))
+  );
+
+  check(
+    "copy switched off is the first thing said",
+    diagnose({ ...healthyBase, copyEnabled: false, targets: [watched("both")] })[0]?.title.includes(
+      "switched off"
+    ) === true
+  );
+
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   cleanup();

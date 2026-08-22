@@ -33,6 +33,16 @@ export interface CopyConfig {
   maxFiresPerTargetPerHour: number;
   /** Base pool copy-mint draws from, before tier limits and safety rails. */
   walletSelector: string;
+  /**
+   * Mint the collection's own public stage when their calldata cannot be reused.
+   *
+   * On by default, and the difference between copying most drops and copying
+   * almost none: a target minting through an allowlist or a signed stage
+   * produces calldata locked to their address, and without this rung the whole
+   * signal is thrown away even though the same collection is standing open to
+   * anyone. Turn it off only to mirror strictly — same stage or nothing.
+   */
+  publicFallback?: boolean;
   /** WebSocket endpoint. Empty derives one from the read RPC, else polls. */
   wsUrl: string;
 }

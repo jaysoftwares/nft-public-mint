@@ -88,7 +88,14 @@ import {
   OpenSeaMintEvent,
   OpenSeaMintReport,
 } from "../core/mint-opensea";
+import { diagnose, overallState, Finding } from "../core/diagnosis";
+import {
+  tallySkips,
+  recentSignals,
+  summarise as summariseJournal,
+} from "../core/copy-journal";
 import { StatusCard, esc, eth, bar, short, clamp, toCsv, txLink } from "./ui";
+import { renderHealth, healthMenu, renderSignals, signalsMenu } from "./health";
 import { renderDashboard } from "./dashboard";
 import { feedFor, clearFeed, contractLabel } from "./copy-feed";
 import { askPassphrase } from "../tools/tty";
@@ -426,12 +433,16 @@ const HELP = `<b>Copymint</b>
 whichever you're eligible for. Times are UTC.
 
 <b>Copy-mint</b>
-/watch &lt;address&gt; [high|med|low] [free|paid|both] [self|any] [label] — mirror mints
+/watch &lt;address&gt; [high|med|low] [both|free|paid] [self|any] [label] — copy their mints
+  <code>both</code> is the default and what you almost always want.
+  <code>free</code> and <code>paid</code> narrow it, and will silently ignore everything else.
   <code>self</code> copies only what the address sends itself (default).
   <code>any</code> also copies mints someone else paid for and credited to it —
   what you need when the address is a vault that never mints directly.
 /unwatch &lt;address&gt; · /targets — manage the watch list
 /copy on|off — autonomous firing kill switch
+/why — why nothing is being bought, and how to fix it
+/signals — every mint spotted, and what came of each
 /caps — spend limits and today's usage
 
 <b>Settings</b>
@@ -494,6 +505,11 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
     })
   );
 
+  // The same health check the "Why?" screen runs, so the two can never
+  // disagree about whether the bot is working — which they would, eventually,
+  // if the card worked its own verdict out separately.
+  const findings = await currentFindings();
+
   const text = clamp(
     renderDashboard(
       collectDashboard({
@@ -504,7 +520,9 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
         targets: targets.list(),
         copyEnabled: session.copyEnabled,
         capDailyWei: config.capDailyWei,
-      })
+      }),
+      findings,
+      overallState(findings)
     )
   );
 
@@ -519,6 +537,111 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
     // leave the operator looking at "reading balances…" forever.
     await ctx.reply(text, { parse_mode: "HTML", reply_markup: dashboardMenu() });
   }
+}
+
+/**
+ * Show a card, replacing the one that was tapped when there was one.
+ *
+ * A button that appends a new message instead of updating the one under your
+ * thumb turns a three-tap fix into a screen of near-identical cards, which is
+ * most of why the copy screens became unreadable.
+ */
+async function respond(
+  ctx: Context,
+  text: string,
+  keyboard: InlineKeyboard
+): Promise<void> {
+  const options = {
+    parse_mode: "HTML" as const,
+    reply_markup: keyboard,
+    link_preview_options: { is_disabled: true },
+  };
+  if (ctx.callbackQuery?.message) {
+    // Editing to identical text is an API error, which a double tap produces.
+    const edited = await ctx.editMessageText(text, options).catch(() => undefined);
+    if (edited !== undefined) return;
+  }
+  await ctx.reply(text, options);
+}
+
+/**
+ * "Why isn't it buying anything?"
+ *
+ * The question this bot could not answer. Every fact was already on a screen
+ * somewhere and no screen put them together, so a set-up that was one setting
+ * away from working looked identical to one that was perfect — four green
+ * lights and no mints. This gathers the same facts in one pass and says which
+ * one is in the way.
+ */
+async function currentFindings(): Promise<Finding[]> {
+  const tagCtx = await session.tagContextAnyChain();
+  const pool = resolveForAutoFire(config.copy.walletSelector, session.wallets(), tagCtx);
+
+  return diagnose({
+    copyEnabled: session.copyEnabled,
+    targets: targets.list(),
+    watchersUp: session.watcherCount,
+    watchersTotal: session.availableChains.length,
+    walletsTotal: pool.total,
+    walletsMatched: pool.matched,
+    walletsReady: pool.selected.length,
+    walletsUnfunded: pool.unfunded,
+    walletsUnarmed: pool.excludedManual,
+    selector: config.copy.walletSelector,
+    maxPriceWei: config.capMaxPriceWei,
+    perEventWei: config.capPerEventWei,
+    dailyWei: config.capDailyWei,
+    dailySpentWei: spentSince(24, ["mint"], { autoOnly: true }),
+    skips: tallySkips(),
+    journal: summariseJournal(),
+    minFundedWei: pool.minFundedWei,
+  });
+}
+
+async function cmdWhy(ctx: Context): Promise<void> {
+  const findings = await currentFindings();
+  const text = clamp(renderHealth(findings, overallState(findings)));
+  await respond(ctx, text, healthMenu(findings));
+}
+
+/** The recorded history of what the watcher saw, misses included. */
+async function cmdSignals(ctx: Context): Promise<void> {
+  const text = clamp(renderSignals(recentSignals(12)));
+  await respond(ctx, text, signalsMenu());
+}
+
+/**
+ * Apply one remedy across every watched wallet at once.
+ *
+ * Only widening changes belong here. Nothing on this path narrows what the bot
+ * follows or raises what it may spend — a one-tap button that increases
+ * autonomous spending is not a convenience, it is a trap, and the price limits
+ * stay where the operator put them deliberately.
+ */
+async function cmdFixAll(ctx: Context, what: string): Promise<void> {
+  if (what !== "mode") return;
+
+  const changed: string[] = [];
+  for (const target of targets.list()) {
+    if (target.mintMode === "both") continue;
+    targets.setMintMode(target.address, "both");
+    changed.push(target.address);
+  }
+
+  const text =
+    changed.length === 0
+      ? [`✅ <b>Already following every mint</b>`, ``, `No wallet needed changing.`].join("\n")
+      : [
+          `✅ <b>Now following every mint</b>`,
+          ``,
+          `${changed.length} watched ${changed.length === 1 ? "wallet" : "wallets"} will be copied ` +
+            `whether the drop is free or paid.`,
+          ``,
+          `<i>Your price limit still applies — nothing will be bought above ` +
+            `${eth(config.capMaxPriceWei)} ETH per NFT.</i>`,
+        ].join("\n");
+
+  await respond(ctx, text, backTo("a:why", "‹ Back to the health check"));
 }
 
 async function cmdStatus(ctx: Context): Promise<void> {
@@ -1854,9 +1977,9 @@ async function cmdWatch(ctx: Context): Promise<void> {
   const [address, tierArg, ...rest] = args(ctx);
   if (!address) {
     await ctx.reply(
-      "Usage: <code>/watch 0xAlpha… high free any alpha-wallet</code>\n" +
+      "Usage: <code>/watch 0xAlpha… high both any alpha-wallet</code>\n" +
         "Tiers: <code>high</code> <code>med</code> <code>low</code>. " +
-        "Filters: <code>free</code> <code>paid</code> <code>both</code>. " +
+        "Which mints: <code>both</code> (the default) · <code>free</code> ignores paid drops · <code>paid</code> ignores free ones. " +
         "Payer: <code>self</code> <code>any</code>.",
       { parse_mode: "HTML" }
     );
@@ -2383,17 +2506,25 @@ function renderCopyEvent(
       feed.countSkipped();
       // Keyed on the reason, not the contract: forty "Already firing" skips in
       // a row are one fact, and reading it forty times obscures the rest.
+      // The fix goes on the card, not just in the journal. A reason without a
+      // remedy is the thing that made these unreadable — "Price above ceiling"
+      // told nobody which number to change.
       feed.push(
         `skip:${event.reason}`,
         `⏭ ${esc(event.reason)}`,
-        event.detail ? esc(event.detail) : undefined
+        [event.detail ? esc(event.detail) : undefined, event.fix ? `→ ${esc(event.fix)}` : undefined]
+          .filter(Boolean)
+          .join("\n") || undefined
       );
       break;
     case "simulated":
+      // Which rung did it matters more than the selector: "copying their exact
+      // mint" and "their stage was closed to us, buying the public one" are
+      // different purchases and the operator should never have to infer which.
       feed.push(
-        `sim:${event.selector}`,
-        `✅ simulated <code>${esc(event.selector)}</code> · gas ${event.gasLimit}`,
-        event.addressBound ? `Target's address was embedded — rewritten to ours.` : undefined
+        `sim:${event.strategy}`,
+        `✅ ${event.strategy === "public-stage" ? "Buying its public stage" : "Copying their mint"} · test run passed`,
+        esc(event.how)
       );
       break;
     case "firing":
@@ -2425,7 +2556,8 @@ function renderCopyEvent(
           r.rejected > 0 ? `${r.rejected} rejected` : ``,
           ``,
           `contract <code>${esc(short(r.contract))}</code>`,
-          `price ${eth(r.unitPriceWei)} ETH · committed ${eth(r.totalCommitWei)} ETH`,
+          `${r.quantity > 1 ? `${r.quantity} NFTs each · ` : ``}${eth(r.unitPriceWei)} ETH per wallet · ${eth(r.totalCommitWei)} ETH in total`,
+          esc(r.how),
           `signal → dispatch <b>${r.elapsedMs.toFixed(0)}ms</b> (block budget 2000ms)`,
           r.hashes.find((h) => h.accepted)
             ? `\n${txLink(chain.chainId, r.hashes.find((h) => h.accepted)!.hash, "view transaction")}`
@@ -3284,6 +3416,10 @@ async function onCallback(ctx: Context): Promise<void> {
           return cmdDashboard(ctx, true);
         case "status":
           return cmdStatus(ctx);
+        case "why":
+          return cmdWhy(ctx);
+        case "signals":
+          return cmdSignals(ctx);
         case "wallets":
           return runWithArgs(ctx, ["all"], cmdWallets);
         case "balances":
@@ -3318,6 +3454,13 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "c":
       return runWithArgs(ctx, [payload], cmdCopy);
+
+    // One-tap remedies offered by the health check. They exist because the
+    // setting that silenced this bot was four taps deep and had to be changed
+    // on every watched wallet one at a time — a fix nobody was going to find,
+    // let alone repeat nineteen times.
+    case "fixall":
+      return cmdFixAll(ctx, payload);
 
     // Page through a wallet list. Stateless — the selector rides in the data.
     case "wp": {
@@ -3854,6 +3997,8 @@ async function main(): Promise<void> {
   bot.command("help", (ctx) => ctx.reply(HELP, { parse_mode: "HTML" }));
   bot.command("dashboard", (ctx) => cmdDashboard(ctx).catch((e) => fail(ctx, e)));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
+  bot.command("why", (ctx) => cmdWhy(ctx).catch((e) => fail(ctx, e)));
+  bot.command("signals", (ctx) => cmdSignals(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));
   bot.command("import", (ctx) => showWalletImport(ctx).catch((e) => fail(ctx, e)));
   bot.command("generate", (ctx) => cmdGenerate(ctx).catch((e) => fail(ctx, e)));
