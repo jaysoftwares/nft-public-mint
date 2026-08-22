@@ -107,7 +107,12 @@ import {
 } from "./setup-copy";
 import { BOT_COMMANDS } from "./commands";
 import { renderDashboard } from "./dashboard";
-import { buildDashboardSvg, renderDashboardPng } from "./dashboard-image";
+import {
+  buildDashboardSvg,
+  renderDashboardPng,
+  TargetRow,
+  WalletRow,
+} from "./dashboard-image";
 import { feedFor, clearFeed, contractLabel } from "./copy-feed";
 import { askPassphrase } from "../tools/tty";
 import {
@@ -571,6 +576,7 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
   // "reading balances…" forever.
   try {
     const readiness = await currentReadiness();
+    const holdings = await walletRows();
     const png = await renderDashboardPng(
       buildDashboardSvg({
         stats,
@@ -580,6 +586,9 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
         symbols: Object.fromEntries(
           session.availableChains.map((c) => [c.key, c.profile.nativeSymbol])
         ),
+        targets: targetRows(),
+        wallets: holdings.rows,
+        emptyWallets: holdings.empty,
       })
     );
     await ctx.api.deleteMessage(chatId, messageId).catch(() => undefined);
@@ -761,6 +770,57 @@ async function readinessFor(chainKey?: string): Promise<NetworkStep[]> {
       }
     })
   );
+}
+
+/**
+ * The wallets, and what each holds where.
+ *
+ * Sorted richest first and cut to the ones holding something, because the
+ * question this answers is "can it buy?" — and five hundred rows of zero is not
+ * a wallet list, it is a wall. The empty remainder is counted, not listed, and
+ * the CSV export stays the place to see all of them.
+ */
+async function walletRows(): Promise<{ rows: WalletRow[]; empty: number }> {
+  const wallets = session.wallets().filter((w) => w.address !== config.funder);
+
+  const perChain = new Map<string, Map<string, bigint>>();
+  for (const chain of session.availableChains) {
+    try {
+      perChain.set(chain.key, await session.balances(chain.key));
+    } catch {
+      // Unreadable: the column shows "·" rather than a zero it cannot vouch for.
+    }
+  }
+
+  const rows: WalletRow[] = wallets.map((wallet) => {
+    const balances: Record<string, bigint> = {};
+    let total = 0n;
+    for (const [key, map] of perChain) {
+      const held = map.get(wallet.address);
+      if (held === undefined) continue;
+      balances[key] = held;
+      total += held;
+    }
+    return {
+      address: wallet.address,
+      kind: wallet.kind === "derived" ? "generated" : "imported",
+      armed: wallet.autoFire,
+      balances,
+      totalWei: total,
+    };
+  });
+
+  const holding = rows.filter((r) => r.totalWei > 0n).sort((a, b) => (b.totalWei > a.totalWei ? 1 : -1));
+  return { rows: holding, empty: rows.length - holding.length };
+}
+
+function targetRows(): TargetRow[] {
+  return targets.list().map((t) => ({
+    address: t.address,
+    label: t.label,
+    copies: t.fires,
+    follows: t.mintMode === "both" ? "any mint" : `${t.mintMode} only`,
+  }));
 }
 
 /** The same per-network readiness the wizard shows, for the dashboard picture. */

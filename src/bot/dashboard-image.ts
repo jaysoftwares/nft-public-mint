@@ -115,6 +115,28 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
 }
 
+/** One wallet being followed. */
+export interface TargetRow {
+  address: string;
+  label?: string;
+  /** How many of its mints have been copied. */
+  copies: number;
+  /** "any", "free only", "paid only" — what is being followed. */
+  follows: string;
+}
+
+/** One of our own wallets, and what it holds where. */
+export interface WalletRow {
+  address: string;
+  /** "generated" or "imported" — the two behave differently by default. */
+  kind: string;
+  /** Allowed to buy without asking. */
+  armed: boolean;
+  /** Chain key → balance. Missing means that chain could not be read. */
+  balances: Record<string, bigint>;
+  totalWei: bigint;
+}
+
 export interface DashboardImageInput {
   stats: DashboardStats;
   findings: Finding[];
@@ -122,6 +144,26 @@ export interface DashboardImageInput {
   chains: ChainReadiness[];
   /** Native symbol per chain key, for the per-network rows. */
   symbols: Record<string, string>;
+  /** Every wallet being followed. */
+  targets?: TargetRow[];
+  /**
+   * Our wallets, richest first.
+   *
+   * Only the ones holding something are worth a row — five hundred lines of
+   * "0" is not a wallet list, it is a wall, and the ones that can actually buy
+   * are the entire question. The empty remainder is summarised in one line.
+   */
+  wallets?: WalletRow[];
+  /** Wallets not in the list above, because they hold nothing anywhere. */
+  emptyWallets?: number;
+}
+
+/** Rows before the list stops being readable and starts being a wall. */
+const MAX_TARGET_ROWS = 24;
+const MAX_WALLET_ROWS = 12;
+
+function shortAddress(address: string): string {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
 
 /**
@@ -221,8 +263,138 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
     );
   });
 
-  // ── Today's spending ──
   y += netH + 28;
+
+  // ── Wallets you follow ──
+  //
+  // Two columns, because nineteen single-line rows is most of a screen spent on
+  // the least surprising information — you chose these addresses, so the useful
+  // part is which of them have actually produced anything.
+  const targets = input.targets ?? [];
+  if (targets.length > 0) {
+    const shown = targets.slice(0, MAX_TARGET_ROWS);
+    const perColumn = Math.ceil(shown.length / 2);
+    const tRowH = 30;
+    const tH = 58 + perColumn * tRowH + (targets.length > shown.length ? 26 : 8);
+    const colW = (inner - 48) / 2;
+
+    parts.push(
+      card(PAD, y, inner, tH),
+      text(`WALLETS YOU FOLLOW · ${targets.length}`, PAD + 24, y + 34, {
+        size: 14,
+        weight: 700,
+        fill: C.dim,
+      })
+    );
+
+    shown.forEach((target, i) => {
+      const col = i < perColumn ? 0 : 1;
+      const row = i < perColumn ? i : i - perColumn;
+      const tx = PAD + 24 + col * colW;
+      const ty = y + 58 + row * tRowH + 16;
+      const active = target.copies > 0;
+
+      parts.push(
+        `<circle cx="${tx + 6}" cy="${ty - 5}" r="4" fill="${active ? C.green : C.dim}"/>`,
+        text(shortAddress(target.address), tx + 20, ty, { size: 16, mono: true }),
+        text(
+          truncate(target.label ?? target.follows, 16),
+          tx + 168,
+          ty,
+          { size: 14, fill: C.dim }
+        ),
+        text(
+          active ? `${target.copies} copied` : "—",
+          tx + colW - 34,
+          ty,
+          { size: 14, fill: active ? C.green : C.dim, anchor: "end" }
+        )
+      );
+    });
+
+    if (targets.length > shown.length) {
+      parts.push(
+        text(`and ${targets.length - shown.length} more`, PAD + 24, y + tH - 16, {
+          size: 14,
+          fill: C.dim,
+        })
+      );
+    }
+    y += tH + 28;
+  }
+
+  // ── The wallets doing the buying ──
+  const rows = input.wallets ?? [];
+  if (rows.length > 0 || (input.emptyWallets ?? 0) > 0) {
+    const shown = rows.slice(0, MAX_WALLET_ROWS);
+    const wRowH = 30;
+    const extra = input.emptyWallets ?? 0;
+    const hidden = rows.length - shown.length;
+    const footer = extra > 0 || hidden > 0 ? 28 : 8;
+    const wH = 84 + shown.length * wRowH + footer;
+
+    // One column per network, right-aligned so the decimal points line up and
+    // a short balance cannot be mistaken for a long one.
+    const colW = 132;
+    const firstCol = W - PAD - 24 - (chains.length - 1) * colW;
+
+    parts.push(
+      card(PAD, y, inner, wH),
+      text("YOUR WALLETS, AND WHAT THEY HOLD", PAD + 24, y + 34, {
+        size: 14,
+        weight: 700,
+        fill: C.dim,
+      })
+    );
+
+    chains.forEach((chain, i) => {
+      parts.push(
+        text(truncate(chain.name, 11), firstCol + i * colW, y + 62, {
+          size: 13,
+          weight: 700,
+          fill: C.dim,
+          anchor: "end",
+        })
+      );
+    });
+
+    shown.forEach((wallet, i) => {
+      const ry = y + 84 + i * wRowH + 14;
+      parts.push(
+        `<circle cx="${PAD + 30}" cy="${ry - 5}" r="4" fill="${wallet.armed ? C.green : C.amber}"/>`,
+        text(shortAddress(wallet.address), PAD + 44, ry, { size: 16, mono: true }),
+        text(wallet.kind === "imported" ? "imported" : "generated", PAD + 196, ry, {
+          size: 13,
+          fill: C.dim,
+        })
+      );
+      chains.forEach((chain, c) => {
+        const held = wallet.balances[chain.key];
+        parts.push(
+          text(held === undefined ? "·" : eth(held, 4), firstCol + c * colW, ry, {
+            size: 15,
+            mono: true,
+            fill: held !== undefined && held > 0n ? C.text : C.dim,
+          })
+        );
+      });
+    });
+
+    const notes: string[] = [];
+    if (hidden > 0) notes.push(`${hidden} more with a balance`);
+    if (extra > 0) notes.push(`${extra} holding nothing`);
+    if (notes.length > 0) {
+      parts.push(
+        text(`${notes.join(" · ")} — /wallets csv for the full list`, PAD + 24, y + wH - 16, {
+          size: 14,
+          fill: C.dim,
+        })
+      );
+    }
+    y += wH + 28;
+  }
+
+  // ── Today's spending ──
   const spendH = 118;
   const spent = Number(day.autoSpentWei);
   const cap = Number(day.capWei);

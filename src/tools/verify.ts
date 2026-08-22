@@ -2323,6 +2323,67 @@ async function main(): Promise<void> {
   );
   check("a funded chain reports what it can do", svg.includes("42 ready to buy"));
 
+  // Followed wallets and our own, with balances, because "is it set up" and
+  // "can it actually pay" are different questions and the card only answered
+  // the first. Five hundred rows of zero is a wall, not a list, so only the
+  // wallets holding something get a line and the rest are counted.
+  const detailed = buildDashboardSvg({
+    stats: dash,
+    findings: [],
+    state: "ok",
+    chains: picChains,
+    symbols: {},
+    targets: [
+      { address: "0x5E84a4bbA53D563438c1f4020f8D9d7d89499999", copies: 3, follows: "any mint" },
+      { address: "0x99E83A929463515cFaE0391B8bF4b978c32712bB", copies: 0, follows: "any mint" },
+    ],
+    wallets: [
+      {
+        address: "0x754a2A3410d5DeC0599DA4Bb42A1C3F8e5B37353",
+        kind: "imported",
+        armed: true,
+        balances: { robinhood: 57129315302634000n, ethereum: 0n },
+        totalWei: 57129315302634000n,
+      },
+    ],
+    emptyWallets: 489,
+  });
+  check("followed wallets are listed", detailed.includes("WALLETS YOU FOLLOW"));
+  check("…with a shortened address", detailed.includes("0x5E84…9999"));
+  check("…and how many of their mints were copied", detailed.includes("3 copied"));
+  check("our own wallets are listed", detailed.includes("YOUR WALLETS, AND WHAT THEY HOLD"));
+  check("…with a balance per network", detailed.includes("0.0571"));
+  check(
+    "…and the empty remainder is counted rather than drawn",
+    detailed.includes("489 holding nothing")
+  );
+
+  // A chain that could not be read must not print a zero balance — that reads
+  // as an empty wallet when the truth is that nobody asked.
+  const unreadable = buildDashboardSvg({
+    stats: dash,
+    findings: [],
+    state: "ok",
+    chains: picChains,
+    symbols: {},
+    wallets: [
+      {
+        address: "0x754a2A3410d5DeC0599DA4Bb42A1C3F8e5B37353",
+        kind: "generated",
+        armed: true,
+        balances: { robinhood: 1000000000000000n },
+        totalWei: 1000000000000000n,
+      },
+    ],
+    emptyWallets: 0,
+  });
+  check("an unread balance is a dot, never a zero", unreadable.includes(">·<"));
+
+  check(
+    "a card with no wallets or targets simply omits those sections",
+    !svg.includes("WALLETS YOU FOLLOW") && !svg.includes("YOUR WALLETS")
+  );
+
   // One apostrophe in a collection name would otherwise void the whole
   // document, and a dashboard that fails to parse renders as nothing at all.
   const risky = buildDashboardSvg({
