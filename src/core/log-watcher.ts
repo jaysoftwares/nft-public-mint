@@ -61,6 +61,16 @@ const DEFAULT_POLL_MS = 750;
  */
 const SUBSCRIBE_TIMEOUT_MS = 15_000;
 
+/**
+ * Attempts at reading the chain head before giving up on a gap replay.
+ *
+ * The head read gates the whole catch-up, so a single flaky answer costing the
+ * replay is a poor trade — but this runs on reconnect, so it cannot retry for
+ * long either.
+ */
+const HEAD_READ_ATTEMPTS = 3;
+const HEAD_RETRY_MS = 250;
+
 export interface LogEvent {
   /** The token contract that emitted the Transfer. */
   contract: string;
@@ -545,8 +555,34 @@ export class LogWatcher {
     this.lastSeenBlock = head;
   }
 
+  /**
+   * The chain head, retried — because everything downstream of it is skipped
+   * when it fails.
+   *
+   * One attempt used to be all it got, and a single transient answer from the
+   * provider ("Empty result for eth_blockNumber", seen roughly once a day on
+   * QuickNode, usually on the reconnect right after a restart) abandoned the
+   * whole gap replay for that reconnect. That is a real hole rather than a
+   * cosmetic one: the blocks between the socket dropping and reconnecting are
+   * exactly the ones nothing else will ever look at, so a mint inside that
+   * window is missed outright and silently.
+   *
+   * Three attempts, 250ms apart. Deliberately tight — this sits on the
+   * reconnect path, and a drop opening does not wait for us.
+   */
   private async currentBlock(): Promise<number> {
-    return Number(BigInt(await rpcCall<string>(this.opts.httpUrl, "eth_blockNumber", [])));
+    let last: Error | undefined;
+    for (let attempt = 0; attempt < HEAD_READ_ATTEMPTS; attempt += 1) {
+      try {
+        return Number(BigInt(await rpcCall<string>(this.opts.httpUrl, "eth_blockNumber", [])));
+      } catch (err) {
+        last = err as Error;
+        if (attempt < HEAD_READ_ATTEMPTS - 1) {
+          await new Promise((resolve) => setTimeout(resolve, HEAD_RETRY_MS));
+        }
+      }
+    }
+    throw last ?? new Error("eth_blockNumber failed");
   }
 
   // ── Emission ────────────────────────────────────────────────────────

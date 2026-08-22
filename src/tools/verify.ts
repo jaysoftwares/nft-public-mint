@@ -508,6 +508,104 @@ async function main(): Promise<void> {
     await new Promise<void>((resolve) => chainServer.close(() => resolve()));
   }
 
+  // ── a flaky chain-head read ────────────────────────────────────────────
+  //
+  // The head read gates the gap replay, and it used to get exactly one attempt.
+  // QuickNode answers "Empty result for eth_blockNumber" roughly once a day —
+  // usually on the reconnect right after a restart — and that one answer threw
+  // the whole catch-up away. The blocks between a socket dropping and coming
+  // back are the ones nothing else will ever look at, so a mint in that window
+  // was missed outright and in silence.
+  section("chain head retry");
+
+  let headAttempts = 0;
+  let emptyRepliesLeft = 2;
+  const flakyServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      response.setHeader("content-type", "application/json");
+      if (body.method === "eth_blockNumber") {
+        headAttempts += 1;
+        if (emptyRepliesLeft > 0) {
+          emptyRepliesLeft -= 1;
+          // Exactly what the provider sends: HTTP 200, no error, no result.
+          response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id }));
+          return;
+        }
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x64" }));
+        return;
+      }
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: [] }));
+    });
+  });
+  await new Promise<void>((resolve) => flakyServer.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const flakyUrl = `http://127.0.0.1:${(flakyServer.address() as { port: number }).port}`;
+    const notices: string[] = [];
+    const flaky = new LogWatcher({
+      wsUrl: undefined,
+      httpUrl: flakyUrl,
+      targets: [WATCHED],
+      onMint: () => undefined,
+      onStatus: (message) => notices.push(message),
+      pollIntervalMs: 10_000,
+    });
+
+    await flaky.start();
+    flaky.stop();
+
+    check("a transient empty head read is retried", headAttempts === 3, `attempts: ${headAttempts}`);
+    check(
+      "…and the watcher never reports a failed startup read",
+      !notices.some((m) => m.includes("Could not read the chain head")),
+      notices.join(" | ")
+    );
+  } finally {
+    await new Promise<void>((resolve) => flakyServer.close(() => resolve()));
+  }
+
+  // Retries are bounded: a provider that is genuinely down must not hold the
+  // reconnect path open, and the watcher still has to come up.
+  let deadAttempts = 0;
+  const deadServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (body.method === "eth_blockNumber") deadAttempts += 1;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: body.id }));
+    });
+  });
+  await new Promise<void>((resolve) => deadServer.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const deadUrl = `http://127.0.0.1:${(deadServer.address() as { port: number }).port}`;
+    const deadNotices: string[] = [];
+    const dead = new LogWatcher({
+      wsUrl: undefined,
+      httpUrl: deadUrl,
+      targets: [WATCHED],
+      onMint: () => undefined,
+      onStatus: (message) => deadNotices.push(message),
+      pollIntervalMs: 10_000,
+    });
+    await dead.start();
+    dead.stop();
+
+    check("a dead endpoint gives up after three tries", deadAttempts === 3, `attempts: ${deadAttempts}`);
+    check(
+      "…and the watcher still comes up rather than throwing",
+      deadNotices.some((m) => m.includes("Could not read the chain head")),
+      deadNotices.join(" | ")
+    );
+  } finally {
+    await new Promise<void>((resolve) => deadServer.close(() => resolve()));
+  }
+
   section("user settings");
   const configPath = writeDefaultConfig();
   const savedSettings = updateUserSettings({
