@@ -30,6 +30,7 @@ import {
 import {
   resolve as resolveWallets,
   resolveForAutoFire,
+  resolveForCopy,
   emptyContext,
   SelectorError,
 } from "../core/tags";
@@ -47,7 +48,6 @@ import { decodeSeaDropMint } from "../core/copy-plan";
 import { diagnose, overallState, ChainReadiness } from "../core/diagnosis";
 import { buildDashboardSvg } from "../bot/dashboard-image";
 import { BOT_COMMANDS, UNLISTED_ALIASES, validateCommands } from "../bot/commands";
-import { explainEmptyPool } from "../core/copy-mint";
 import { parseCollectionInput } from "../core/collection-input";
 import { openSeaChainSlug } from "../core/opensea-api";
 import { CHAINS } from "../chains";
@@ -1253,40 +1253,45 @@ async function main(): Promise<void> {
   check("imported wallets refused even when selected", autoImported.selected.length === 0);
   check("manual exclusion is reported", autoImported.excludedManual === 1);
 
-  // ── why nothing fired ─────────────────────────────────────────────────
+  // ── the pool a copy signal fires from ─────────────────────────────────
   //
-  // The reported symptom was a funded wallet being described as having no
-  // funds, because one sentence covered every cause. Each cause is now checked
-  // to name itself.
-  section("empty-pool diagnosis");
+  // Two gates were removed from this after they declined fifteen mints in a
+  // day while the money sat ready: a wallet no longer has to be "armed", and no
+  // longer has to prove it holds gas. Deciding the second meant reading every
+  // balance first, which cost ten to fifteen seconds of a one-block budget to
+  // learn something the node decides for free at dispatch.
+  section("copy pool");
 
-  const unarmed = explainEmptyPool(resolveForAutoFire("imported", all, ctx), "imported");
-  check("an unarmed wallet is called unarmed", /not armed/i.test(unarmed), unarmed);
-  check("…and does not claim it is unfunded", !/below|top them up/i.test(unarmed), unarmed);
-  check("…and says how to arm it", /autofire/i.test(unarmed), unarmed);
-
-  const brokeCtx = emptyContext(parseEther("0.0005"));
-  all.forEach((w) => brokeCtx.state.set(w.id, { balanceWei: 0n }));
-  const broke = explainEmptyPool(resolveForAutoFire("derived+funded", all, brokeCtx), "derived+funded", "Ethereum");
-  check("an empty set is called unfunded", /below the 0.0005 ETH/i.test(broke), broke);
-  check("…and names the chain it is talking about", /on Ethereum/.test(broke), broke);
-  check("…and says the other networks still work", /other networks are unaffected/i.test(broke), broke);
-
-  const stuckCtx = emptyContext(parseEther("0.0005"));
-  all.forEach((w) => stuckCtx.state.set(w.id, { balanceWei: parseEther("0.001"), nonceGap: true }));
-  const jammed = explainEmptyPool(resolveForAutoFire("derived+funded", all, stuckCtx), "derived+funded");
-  check("a jammed set is called jammed", /nonce gap/i.test(jammed), jammed);
-
+  const copyPool = resolveForCopy("all", all, ctx);
   check(
-    "an empty store says so plainly",
-    /you have no wallets yet/i.test(explainEmptyPool(resolveForAutoFire("all", [], ctx), "all"))
+    "an unarmed wallet still fires",
+    copyPool.selected.some((w) => !w.autoFire),
+    `selected ${copyPool.selected.length} of ${all.length}`
   );
 
-  // An unread balance must never be reported as an empty wallet — that is the
-  // exact confusion this whole section exists to prevent.
-  const blindCtx = emptyContext(parseEther("0.0005"));
-  const blind = resolveForAutoFire("all", all, blindCtx);
-  check("wallets with unknown balances are not counted unfunded", blind.unfunded === 0);
+  const noBalances = emptyContext(parseEther("0.0005"));
+  const blindPool = resolveForCopy("all", all, noBalances);
+  check(
+    "…and so does one whose balance was never read",
+    blindPool.selected.length === all.length
+  );
+
+  const brokeCtx2 = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => brokeCtx2.state.set(w.id, { balanceWei: 0n }));
+  check(
+    "…and so does an empty one, because the node rejects it for free",
+    resolveForCopy("all", all, brokeCtx2).selected.length === all.length
+  );
+
+  // A nonce gap is different: that transaction cannot land whatever the
+  // balance, so skipping it costs nothing and is still done.
+  const stuckCtx2 = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => stuckCtx2.state.set(w.id, { balanceWei: parseEther("1"), nonceGap: true }));
+  const jammedPool = resolveForCopy("all", all, stuckCtx2);
+  check("a wallet behind a nonce gap is still skipped", jammedPool.selected.length === 0);
+  check("…and counted", jammedPool.stuck === all.length);
+
+  check("the selector still decides membership", resolveForCopy("imported", all, ctx).matched < all.length);
 
   // ── pasted input ──────────────────────────────────────────────────────
   section("collection input");
@@ -2402,8 +2407,8 @@ async function main(): Promise<void> {
   section("dashboard picture");
 
   const picChains: ChainReadiness[] = [
-    { key: "ethereum", name: "Ethereum", read: true, watching: true, ready: 0, funded: 0, matched: 500, unarmed: 0 },
-    { key: "robinhood", name: "Robinhood Chain", read: true, watching: true, ready: 42, funded: 42, matched: 500, unarmed: 0 },
+    { key: "ethereum", name: "Ethereum", read: true, watching: true, funded: 0, matched: 500 },
+    { key: "robinhood", name: "Robinhood Chain", read: true, watching: true, funded: 42, matched: 500 },
   ];
   const svg = buildDashboardSvg({
     stats: dash,
@@ -2419,7 +2424,7 @@ async function main(): Promise<void> {
     "a chain with no gas says so instead of showing a bare zero",
     svg.includes("no gas here")
   );
-  check("a funded chain reports what it can do", svg.includes("42 ready to buy"));
+  check("a funded chain reports what it can pay with", svg.includes("42 can pay here"));
 
   // Followed wallets and our own, with balances, because "is it set up" and
   // "can it actually pay" are different questions and the card only answered
@@ -2439,7 +2444,7 @@ async function main(): Promise<void> {
       {
         address: "0x754a2A3410d5DeC0599DA4Bb42A1C3F8e5B37353",
         kind: "imported",
-        armed: true,
+        canPay: true,
         balances: { robinhood: 57129315302634000n, ethereum: 0n },
         totalWei: 57129315302634000n,
       },
@@ -2468,7 +2473,7 @@ async function main(): Promise<void> {
       {
         address: "0x754a2A3410d5DeC0599DA4Bb42A1C3F8e5B37353",
         kind: "generated",
-        armed: true,
+        canPay: true,
         balances: { robinhood: 1000000000000000n },
         totalWei: 1000000000000000n,
       },
@@ -2515,10 +2520,8 @@ async function main(): Promise<void> {
     name,
     read: true,
     watching: true,
-    ready: 500,
     funded: 500,
     matched: 500,
-    unarmed: 0,
     ...over,
   });
   const healthyBase = {
@@ -2528,7 +2531,6 @@ async function main(): Promise<void> {
     selector: "derived+funded",
     selectorExcludesImported: false,
     importedTotal: 0,
-    importedArmed: 0,
     maxPriceWei: parseEther("0.005"),
     perEventWei: parseEther("0.1"),
     dailyWei: parseEther("0.5"),
@@ -2573,15 +2575,21 @@ async function main(): Promise<void> {
   const noGas = diagnose({
     ...healthyBase,
     targets: [watched("both")],
-    chains: healthyBase.chains.map((c) => ({ ...c, ready: 0, funded: 0, unarmed: 0 })),
+    chains: healthyBase.chains.map((c) => ({ ...c, funded: 0 })),
   });
   const notArmed = diagnose({
     ...healthyBase,
     targets: [watched("both")],
-    chains: healthyBase.chains.map((c) => ({ ...c, ready: 0, unarmed: 500 })),
+    chains: healthyBase.chains.map((c) => ({ ...c, funded: 0 })),
   });
   check("no gas anywhere is reported as needing gas", noGas.some((f) => f.title.includes("can pay")));
-  check("not armed is reported as asking first", notArmed.some((f) => f.title.includes("ask before spending")));
+  // Arming is gone, and its absence has to stay gone: a wallet that holds gas
+  // is reported as able to pay whether or not any switch was flipped. The old
+  // second switch declined fifteen mints in a day while the money sat ready.
+  check(
+    "arming is never reported as a reason not to buy",
+    !notArmed.some((f) => (f.title + f.detail).toLowerCase().includes("arm"))
+  );
 
   // The finding this whole section exists for: one broke network must not read
   // as a broken bot. Robinhood funded and Ethereum empty is a working set-up
@@ -2591,8 +2599,8 @@ async function main(): Promise<void> {
     ...healthyBase,
     targets: [watched("both")],
     chains: [
-      chainRow("Ethereum", { ready: 0, funded: 0 }),
-      chainRow("Base", { ready: 0, funded: 0 }),
+      chainRow("Ethereum", { funded: 0 }),
+      chainRow("Base", { funded: 0 }),
       chainRow("Robinhood Chain"),
     ],
   });
@@ -2613,7 +2621,7 @@ async function main(): Promise<void> {
   const unread = diagnose({
     ...healthyBase,
     targets: [watched("both")],
-    chains: [chainRow("Ethereum", { read: false, ready: 0, funded: 0, matched: 0 }), chainRow("Robinhood Chain")],
+    chains: [chainRow("Ethereum", { read: false, funded: 0, matched: 0 }), chainRow("Robinhood Chain")],
   });
   check(
     "an unreachable chain says so rather than reporting no funds",
@@ -2628,22 +2636,20 @@ async function main(): Promise<void> {
     targets: [watched("both")],
     selectorExcludesImported: true,
     importedTotal: 10,
-    importedArmed: 0,
   });
   check(
     "imported wallets excluded by the selector are reported",
     importedLocked.some((f) => f.title.includes("imported wallets are not being used"))
   );
-  const importedUnarmed = diagnose({
+  const importedSelected = diagnose({
     ...healthyBase,
     targets: [watched("both")],
     selectorExcludesImported: false,
     importedTotal: 10,
-    importedArmed: 0,
   });
   check(
-    "imported wallets that are selected but manual are reported separately",
-    importedUnarmed.some((f) => f.title.includes("set to ask first"))
+    "imported wallets that are selected raise nothing at all",
+    overallState(importedSelected) === "ok"
   );
 
   check(

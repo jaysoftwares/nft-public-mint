@@ -130,8 +130,8 @@ export interface WalletRow {
   address: string;
   /** "generated" or "imported" — the two behave differently by default. */
   kind: string;
-  /** Allowed to buy without asking. */
-  armed: boolean;
+  /** Holds enough for gas somewhere. Shown, not enforced. */
+  canPay: boolean;
   /** Chain key → balance. Missing means that chain could not be read. */
   balances: Record<string, bigint>;
   totalWei: bigint;
@@ -256,20 +256,18 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
 
   chains.forEach((chain, i) => {
     const ry = y + 58 + i * rowH;
-    const colour = !chain.read ? C.dim : chain.ready > 0 ? C.green : C.red;
+    const colour = !chain.read ? C.dim : chain.funded > 0 ? C.green : C.red;
     const note = !chain.read
       ? "could not be reached"
-      : chain.ready > 0
-        ? `${chain.ready} ready to buy`
-        : chain.funded > 0
-          ? `${chain.funded} funded, none armed`
-          : `no gas here — mints spotted, not bought`;
+      : chain.funded > 0
+        ? `${chain.funded} can pay here`
+        : `no gas here — mints fire but are rejected`;
 
     parts.push(
       `<circle cx="${PAD + 32}" cy="${ry + 16}" r="6" fill="${colour}"/>`,
       text(truncate(chain.name, 22), PAD + 52, ry + 22, { size: 21, weight: 700 }),
       text(note, W - PAD - 24, ry + 22, { size: 17, fill: C.muted, anchor: "end" }),
-      bar(PAD + 52, ry + 34, inner - 100, chain.ready, Math.max(1, chain.matched || wallets.total), colour)
+      bar(PAD + 52, ry + 34, inner - 100, chain.funded, Math.max(1, chain.matched || wallets.total), colour)
     );
   });
 
@@ -371,7 +369,7 @@ export function buildDashboardSvg(input: DashboardImageInput): string {
     shown.forEach((wallet, i) => {
       const ry = y + 84 + i * wRowH + 14;
       parts.push(
-        `<circle cx="${PAD + 30}" cy="${ry - 5}" r="4" fill="${wallet.armed ? C.green : C.amber}"/>`,
+        `<circle cx="${PAD + 30}" cy="${ry - 5}" r="4" fill="${wallet.canPay ? C.green : C.amber}"/>`,
         text(shortAddress(wallet.address), PAD + 44, ry, { size: 16, mono: true }),
         text(wallet.kind === "imported" ? "imported" : "generated", PAD + 196, ry, {
           size: 13,

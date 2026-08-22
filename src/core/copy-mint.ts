@@ -10,7 +10,7 @@
 // that costs money, so an abort costs nothing at all.
 
 import { ManagedWallet } from "./wallet-store";
-import { TagContext, resolveForCopy, resolveForAutoFire, AutoFirePool } from "./tags";
+import { TagContext, resolveForCopy } from "./tags";
 import { NonceManager } from "./nonce-manager";
 import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
@@ -109,59 +109,6 @@ export type CopyEvent =
       paidBy?: string;
     }
   | { type: "result"; result: CopyResult };
-
-/**
- * Say why no wallet fired, in terms the operator can act on.
- *
- * The old wording — "N manual-only, N stuck, none funded and armed" — described
- * an armed-but-unfunded set and a funded-but-unarmed set identically, so a
- * freshly funded wallet reported as having no money. Each cause now gets its
- * own sentence and its own remedy, and the funding bar is quoted so a balance
- * can be checked against it rather than guessed at.
- */
-export function explainEmptyPool(pool: AutoFirePool, selector: string, chain = "this network"): string {
-  const bar = `${formatEther(pool.minFundedWei)} ETH`;
-
-  if (pool.total === 0) return "You have no wallets yet — make or import some first.";
-
-  if (pool.matched === 0) {
-    if (pool.unfunded === pool.total) {
-      // Named per chain, deliberately. This exact sentence used to say "on this
-      // chain" while the operator was looking at a bot that had money on
-      // Robinhood, so it read as "you have no money" rather than "you have no
-      // money *here*" — and a mint on a funded chain was still perfectly
-      // copyable at the time.
-      return (
-        `Not enough funds to copy on ${chain} — all ${pool.total} of your wallets are below the ` +
-        `${bar} needed for gas there. Other networks are unaffected.`
-      );
-    }
-    return (
-      `None of your wallets are set to buy on ${chain} ` +
-      `(${pool.total} in total, ${pool.unfunded} below the ${bar} gas bar). ` +
-      `Change which wallets copy-mint spends from under Copy-mint.`
-    );
-  }
-
-  // Something matched, so the selector is not the problem — the rails are.
-  const causes: string[] = [];
-  if (pool.excludedManual > 0) {
-    causes.push(
-      `${pool.excludedManual} matched but ${pool.excludedManual === 1 ? "is" : "are"} not armed ` +
-        `for auto-fire — arm with /autofire, or from Wallets → Auto-fire`
-    );
-  }
-  if (pool.excludedStuck > 0) {
-    causes.push(
-      `${pool.excludedStuck} ${pool.excludedStuck === 1 ? "is" : "are"} behind a nonce gap ` +
-        `— the reconciler retries these automatically`
-    );
-  }
-  if (causes.length === 0) {
-    causes.push(`${pool.matched} matched but none survived the safety rails`);
-  }
-  return `${causes.join(". ")}.`;
-}
 
 export class CopyEngine {
   private readonly deps: CopyDeps;

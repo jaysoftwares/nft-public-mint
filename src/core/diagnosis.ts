@@ -59,14 +59,16 @@ export interface ChainReadiness {
   read: boolean;
   /** A live watcher is attached. */
   watching: boolean;
-  /** Matched the selector, armed, funded, not stuck: can buy here right now. */
-  ready: number;
-  /** Matched the selector and holds enough for gas here. */
+  /**
+   * Matched the selector and holds enough for gas here.
+   *
+   * Reported, never enforced. Every matched wallet fires on a signal; this is
+   * how many the network will accept a transaction from, which is worth
+   * knowing before a drop rather than discovering after one.
+   */
   funded: number;
   /** Matched the selector at all. */
   matched: number;
-  /** Matched and funded here, but not armed for autonomous firing. */
-  unarmed: number;
 }
 
 export interface DiagnosisInput {
@@ -79,7 +81,6 @@ export interface DiagnosisInput {
   /** True when the chosen selector cannot match imported wallets. */
   selectorExcludesImported: boolean;
   importedTotal: number;
-  importedArmed: number;
   maxPriceWei: bigint;
   perEventWei: bigint;
   dailyWei: bigint;
@@ -211,16 +212,6 @@ export function diagnose(input: DiagnosisInput): Finding[] {
       fix: "Point copy-mint at any funded wallet, or at your imported ones.",
       action: { label: "👛 Choose which wallets buy", callback: "sel:menu" },
     });
-  } else if (input.importedTotal > 0 && input.importedArmed === 0) {
-    findings.push({
-      severity: "blocking",
-      title: `Your imported wallets are set to ask first`,
-      detail:
-        `All ${input.importedTotal} are manual-only, so copy-mint will never spend from them on its ` +
-        `own — imported keys start that way because they usually hold real money.`,
-      fix: "Arm them if you want copy-mint to buy with them automatically.",
-      action: { label: "⚡ Arm imported wallets", callback: "f:imported:on" },
-    });
   }
 
   // ── Per network ──
@@ -229,55 +220,34 @@ export function diagnose(input: DiagnosisInput): Finding[] {
   // Robinhood and an empty Ethereum is a working bot with one network switched
   // off, not a broken one, and the old wording could not tell those apart.
   const readable = input.chains.filter((c) => c.read);
-  const live = readable.filter((c) => c.ready > 0);
+  const live = readable.filter((c) => c.funded > 0);
 
   if (readable.length > 0 && live.length === 0 && anyMatched) {
     // Nothing can act anywhere — but "has no money" and "has money and is not
     // allowed to spend it" are opposite problems with opposite fixes, and
     // collapsing them is exactly the mistake this module was written to stop.
-    const fundedSomewhere = readable.some((c) => c.funded > 0);
-    findings.push(
-      fundedSomewhere
-        ? {
-            severity: "blocking",
-            title: "Your funded wallets all ask before spending",
-            detail:
-              `They hold enough to mint, but every one of them is set to confirm first, so ` +
-              `copy-mint can never act on a signal by itself.`,
-            fix: "Arm the wallets you want copy-mint to buy with.",
-            action: { label: "⚡ Arm wallets", callback: "af:menu" },
-          }
-        : {
-            severity: "blocking",
-            title: "No network has a wallet that can pay",
-            detail:
-              `A wallet needs at least ${eth(input.minFundedWei)} ETH on the network it is buying ` +
-              `on. None of yours clears that anywhere.`,
-            fix: "Fund your wallets on the network you want to copy on.",
-            action: { label: "💸 Fund wallets", callback: "m:fund" },
-          }
-    );
+    findings.push({
+      severity: "blocking",
+      title: "No network has a wallet that can pay",
+      detail:
+        `A wallet needs at least ${eth(input.minFundedWei)} ETH on the network it is buying on. ` +
+        `None of yours clears that anywhere. Signals will still fire, and every transaction ` +
+        `will be rejected for want of gas.`,
+      fix: "Fund your wallets on the network you want to copy on.",
+      action: { label: "💸 Fund wallets", callback: "m:fund" },
+    });
   } else {
     for (const chain of readable) {
-      if (chain.ready > 0) continue;
+      if (chain.funded > 0) continue;
       // Not blocking. This chain is out; the others carry on.
       findings.push({
         severity: "limiting",
         title: `${chain.name}: nothing here can pay`,
         detail:
-          chain.funded === 0
-            ? `No wallet holds the ${eth(input.minFundedWei)} ETH needed for gas on ${chain.name}, ` +
-              `so mints there will be spotted and reported but not copied.`
-            : `${chain.funded} funded on ${chain.name}, but ${chain.unarmed} of them ask before spending, ` +
-              `so none can act on their own.`,
-        fix:
-          chain.funded === 0
-            ? `Send ETH to your wallets on ${chain.name}, or stop watching it.`
-            : `Arm them, or pick a different set of wallets.`,
-        action:
-          chain.funded === 0
-            ? { label: "💸 Fund wallets", callback: "m:fund" }
-            : { label: "⚡ Arm wallets", callback: "af:menu" },
+          `No wallet holds the ${eth(input.minFundedWei)} ETH needed for gas on ${chain.name}, so ` +
+          `mints there will be copied and every transaction rejected for want of gas.`,
+        fix: `Send ETH to your wallets on ${chain.name}, or stop watching it.`,
+        action: { label: "💸 Fund wallets", callback: "m:fund" },
       });
     }
   }
@@ -332,8 +302,8 @@ export function diagnose(input: DiagnosisInput): Finding[] {
   // ── Nothing is wrong ──
 
   if (findings.length === 0) {
-    const ready = input.chains.reduce((n, c) => Math.max(n, c.ready), 0);
-    const on = input.chains.filter((c) => c.ready > 0).map((c) => c.name);
+    const ready = input.chains.reduce((n, c) => Math.max(n, c.funded), 0);
+    const on = input.chains.filter((c) => c.funded > 0).map((c) => c.name);
     if (input.journal.seen === 0) {
       findings.push({
         severity: "ok",

@@ -670,7 +670,6 @@ async function currentFindings(): Promise<Finding[]> {
       };
       try {
         const ctx = await session.tagContext(chain.key);
-        const pool = resolveForAutoFire(selector, wallets, ctx);
         const matched = resolveWallets(selector, wallets, ctx);
         const fundedHere = matched.filter((w: ManagedWallet) => {
           const balance = ctx.state.get(w.id)?.balanceWei;
@@ -679,10 +678,8 @@ async function currentFindings(): Promise<Finding[]> {
         return {
           ...row,
           read: true,
-          ready: pool.selected.length,
           funded: fundedHere.length,
           matched: matched.length,
-          unarmed: fundedHere.filter((w: ManagedWallet) => !w.autoFire).length,
         };
       } catch {
         // Unreadable is not empty, and must never be reported as though it were.
@@ -707,7 +704,6 @@ async function currentFindings(): Promise<Finding[]> {
     selectorExcludesImported:
       imported.length > 0 && !matchedAnywhere.some((w: ManagedWallet) => w.kind !== "derived"),
     importedTotal: imported.length,
-    importedArmed: imported.filter((w) => w.autoFire).length,
     maxPriceWei: config.capMaxPriceWei,
     perEventWei: config.capPerEventWei,
     dailyWei: config.capDailyWei,
@@ -752,20 +748,14 @@ async function readinessFor(chainKey?: string): Promise<NetworkStep[]> {
           ...base,
           read: true,
           funderWei: balances.get(config.funder) ?? 0n,
-          wallets: {
-            total: wallets.length,
-            matched: matched.length,
-            funded: funded.length,
-            unarmed: funded.filter((w: ManagedWallet) => !w.autoFire).length,
-            ready: pool.selected.length,
-          },
+          wallets: { total: wallets.length, matched: matched.length, funded: funded.length },
         };
       } catch {
         return {
           ...base,
           read: false,
           funderWei: 0n,
-          wallets: { total: wallets.length, matched: 0, funded: 0, unarmed: 0, ready: 0 },
+          wallets: { total: wallets.length, matched: 0, funded: 0 },
         };
       }
     })
@@ -804,7 +794,7 @@ async function walletRows(): Promise<{ rows: WalletRow[]; empty: number }> {
     return {
       address: wallet.address,
       kind: wallet.kind === "derived" ? "generated" : "imported",
-      armed: wallet.autoFire,
+      canPay: total > 0n,
       balances,
       totalWei: total,
     };
@@ -831,10 +821,8 @@ async function currentReadiness(): Promise<ChainReadiness[]> {
     name: s.name,
     read: s.read,
     watching: session.hasWatcher(s.key),
-    ready: s.wallets.ready,
     funded: s.wallets.funded,
     matched: s.wallets.matched,
-    unarmed: s.wallets.unarmed,
   }));
 }
 

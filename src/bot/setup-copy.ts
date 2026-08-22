@@ -1,10 +1,15 @@
 // Getting copy-mint actually ready, one network at a time.
 //
 // The bot had every setting reachable and no path through them. Copy-mint needs
-// four things true at once — something to follow, wallets it is allowed to
-// spend from, those wallets armed, and those wallets holding gas *on the
-// network the mint happens on* — and each lived on a different screen, in a
-// different vocabulary, with nothing anywhere saying they had to agree.
+// three things true at once — something to follow, wallets it is allowed to
+// spend from, and gas on the network the mint happens on — and each lived on a
+// different screen, in a different vocabulary, with nothing anywhere saying
+// they had to agree.
+//
+// There used to be a fourth: the wallets also had to be separately "armed".
+// That was removed — choosing which wallets copy-mint spends from already says
+// what you want, and a second switch behind the switch only produced a set-up
+// that looked complete and bought nothing.
 //
 // The result was a set-up that looked complete and could not buy: the money
 // sat in imported wallets, the selector named generated ones, and the network
@@ -24,12 +29,14 @@ export interface WalletBreakdown {
   total: number;
   /** Matched by the chosen selector. */
   matched: number;
-  /** Matched and holding the gas reservation on this network. */
+  /**
+   * Matched and holding the gas reservation on this network.
+   *
+   * Reported, not enforced. Every matched wallet fires; this is how many of
+   * them the network will actually accept a transaction from, which is worth
+   * knowing before a drop rather than after it.
+   */
   funded: number;
-  /** Matched and funded here, but still set to ask before spending. */
-  unarmed: number;
-  /** Matched, funded, armed: can buy here right now. */
-  ready: number;
 }
 
 export interface NetworkStep {
@@ -63,16 +70,16 @@ export function networkKeyboard(steps: NetworkStep[]): InlineKeyboard {
   for (const step of steps) {
     const state = !step.read
       ? "unreachable"
-      : step.wallets.ready > 0
-        ? `${step.wallets.ready} ready`
-        : "not ready";
-    keyboard.text(`${step.wallets.ready > 0 ? "✅" : "⬜️"} ${step.name} · ${state}`, `cs:chain:${step.key}`).row();
+      : step.wallets.funded > 0
+        ? `${step.wallets.funded} can pay`
+        : "no gas here";
+    keyboard.text(`${step.wallets.funded > 0 ? "✅" : "⬜️"} ${step.name} · ${state}`, `cs:chain:${step.key}`).row();
   }
   return keyboard.text("‹ Back", "m:copy");
 }
 
 export function renderNetworkChoice(steps: NetworkStep[]): string {
-  const ready = steps.filter((s) => s.wallets.ready > 0);
+  const ready = steps.filter((s) => s.wallets.funded > 0);
   return [
     `🚀 <b>Set up copy-mint</b>`,
     ``,
@@ -152,17 +159,15 @@ export function renderReadiness(step: NetworkStep, selector: string, copyOn: boo
   }
 
   lines.push(
-    `${tick(w.matched > 0)} <b>Allowed to buy</b> — ${w.matched} of your ${w.total} wallets`,
+    `${tick(w.matched > 0)} <b>Buying with</b> — ${w.matched} of your ${w.total} wallets`,
     `${tick(w.funded > 0)} <b>Have gas on ${esc(step.name)}</b> — ${w.funded} of those ${w.matched}`,
-    `${tick(w.funded > 0 && w.unarmed === 0)} <b>Allowed to buy without asking</b> — ` +
-      `${w.funded - w.unarmed} of those ${w.funded}`,
     `${tick(copyOn)} <b>Copy-mint switched on</b>`,
     ``
   );
 
-  if (w.ready > 0) {
+  if (w.funded > 0) {
     lines.push(
-      `🟢 <b>${w.ready} ${w.ready === 1 ? "wallet is" : "wallets are"} ready to buy on ${esc(step.name)}.</b>`,
+      `🟢 <b>${w.funded} ${w.funded === 1 ? "wallet can" : "wallets can"} pay on ${esc(step.name)}.</b>`,
       ``
     );
   }
@@ -185,12 +190,6 @@ export function renderReadiness(step: NetworkStep, selector: string, copyOn: boo
         `<b>${eth(needed)} ${esc(step.symbol)}</b>.`
     );
   }
-  if (w.unarmed > 0) {
-    todo.push(
-      `Arm ${w.unarmed} funded ${w.unarmed === 1 ? "wallet" : "wallets"} — they have money but ` +
-        `are set to ask you before every mint, so copy-mint cannot use them on its own.`
-    );
-  }
   if (!copyOn) todo.push(`Switch copy-mint on.`);
 
   if (todo.length > 0) {
@@ -203,7 +202,7 @@ export function renderReadiness(step: NetworkStep, selector: string, copyOn: boo
     `<i>Your funding wallet holds ${eth(step.funderWei)} ${esc(step.symbol)} on ${esc(step.name)}.</i>`
   );
 
-  if (w.ready > 0 && todo.length === 0) {
+  if (w.funded > 0 && todo.length === 0) {
     lines.push(
       ``,
       `<i>Mints on your other networks are still spotted and reported. They are only bought ` +
@@ -221,7 +220,6 @@ export function readinessKeyboard(step: NetworkStep, copyOn: boolean): InlineKey
   if (w.funded < Math.min(SUGGESTED, w.matched) || w.funded === 0) {
     keyboard.text(`💸 Send gas on ${step.name}`, "m:fund").row();
   }
-  if (w.unarmed > 0) keyboard.text(`⚡ Arm the funded wallets`, "f:funded:on").row();
   if (!copyOn) keyboard.text("🟢 Switch copy-mint on", "c:on").row();
 
   return keyboard
