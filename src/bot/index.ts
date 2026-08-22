@@ -105,6 +105,7 @@ import {
   renderReadiness,
   readinessKeyboard,
 } from "./setup-copy";
+import { BOT_COMMANDS } from "./commands";
 import { renderDashboard } from "./dashboard";
 import { buildDashboardSvg, renderDashboardPng } from "./dashboard-image";
 import { feedFor, clearFeed, contractLabel } from "./copy-feed";
@@ -4258,6 +4259,15 @@ async function main(): Promise<void> {
 
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
+
+  // Publish the "/" menu. Never fatal: a bot that cannot reach Telegram to
+  // register its command list still works perfectly for anyone who types the
+  // commands, and refusing to start over a cosmetic call would be absurd.
+  try {
+    await bot.api.setMyCommands(BOT_COMMANDS);
+  } catch (err) {
+    console.error(`  Could not publish the command menu: ${(err as Error).message}`);
+  }
 
   console.log("  Multi-user bot running. Each private chat has isolated state.\n");
   void resumeStoredUsers().catch((err) =>

@@ -46,6 +46,7 @@ import { evaluate, PolicyCaps } from "../core/policy";
 import { decodeSeaDropMint } from "../core/copy-plan";
 import { diagnose, overallState, ChainReadiness } from "../core/diagnosis";
 import { buildDashboardSvg } from "../bot/dashboard-image";
+import { BOT_COMMANDS, UNLISTED_ALIASES, validateCommands } from "../bot/commands";
 import { explainEmptyPool } from "../core/copy-mint";
 import { parseCollectionInput } from "../core/collection-input";
 import { openSeaChainSlug } from "../core/opensea-api";
@@ -2247,7 +2248,52 @@ async function main(): Promise<void> {
     !dear.allowed && (dear.detail ?? "").includes("0.02 ETH per NFT")
   );
 
-  // ── the dashboard picture ──────────────────────────────────────────────
+  // ── the "/" menu ───────────────────────────────────────────────────────
+  //
+  // Twenty-five commands were registered and none declared to Telegram, so the
+  // picker was empty and every one had to be typed from memory — including the
+  // ones added so the bot could explain itself.
+  section("command menu");
+
+  const commandProblems = validateCommands(BOT_COMMANDS);
+  check(
+    "the published list is one Telegram will accept",
+    commandProblems.length === 0,
+    commandProblems.join(" ")
+  );
+
+  // A menu entry pointing at nothing is the obvious way this breaks: the
+  // command appears, is tapped, and the bot says nothing at all.
+  const botSource = readFileSync(join(__dirname, "..", "bot", "index.ts"), "utf8");
+  const registered = new Set<string>();
+  // Parsed as plain strings rather than a regex: the command name is always
+  // the quoted argument before the handler, and everything after "(ctx" is the
+  // body, which may quote anything at all.
+  for (const chunk of botSource.split("bot.command(").slice(1)) {
+    const cut = chunk.indexOf("(ctx");
+    const head = cut > 0 ? chunk.slice(0, cut) : "";
+    head.split(String.fromCharCode(34)).forEach((piece, index) => {
+      if (index % 2 === 1 && /^[a-z0-9_]+$/.test(piece)) registered.add(piece);
+    });
+  }
+  const missing = BOT_COMMANDS.filter((c) => !registered.has(c.command)).map((c) => c.command);
+  check("every command in the menu actually exists", missing.length === 0, missing.join(", "));
+
+  // The reverse is a weaker claim — a command may be deliberately unlisted —
+  // but a *new* one silently absent from the picker is the failure that put
+  // /why and /setup out of reach, so it is reported rather than asserted.
+  const unlisted = [...registered].filter(
+    (name) => !BOT_COMMANDS.some((c) => c.command === name) && !UNLISTED_ALIASES.has(name)
+  );
+  check(
+    "no command is missing from the menu",
+    unlisted.length === 0,
+    unlisted.length > 0 ? `unlisted: ${unlisted.join(", ")}` : ""
+  );
+
+  check("the most-reached-for screens come first", BOT_COMMANDS[0].command === "start");
+
+    // ── the dashboard picture ──────────────────────────────────────────────
   //
   // Drawn rather than typed, because a Telegram text message has no type sizes,
   // no colour and no alignment that survives a phone rotating — every attempt
