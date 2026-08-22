@@ -37,6 +37,21 @@ else
 fi
 node -v
 
+# ── Fonts, for the dashboard picture ───────────────────────────────────
+#
+# The dashboard is drawn as an image and rasterised with sharp, which renders
+# text through fontconfig. A stock VPS has no fonts at all — not a missing
+# typeface, literally none — so without this every label comes out blank and the
+# card is a set of coloured bars with nothing to read. Tiny download, and the
+# bot falls back to the text dashboard if it is somehow absent anyway.
+say "Fonts"
+if fc-list >/dev/null 2>&1 && fc-list | grep -qi dejavu; then
+  note "already installed"
+else
+  note "installing DejaVu for the dashboard image"
+  apt-get install -y -qq fontconfig fonts-dejavu-core
+fi
+
 # ── Service user and directories ───────────────────────────────────────
 say "User and directories"
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then

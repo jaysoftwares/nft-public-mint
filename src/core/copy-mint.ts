@@ -113,22 +113,27 @@ export type CopyEvent =
  * own sentence and its own remedy, and the funding bar is quoted so a balance
  * can be checked against it rather than guessed at.
  */
-export function explainEmptyPool(pool: AutoFirePool, selector: string): string {
+export function explainEmptyPool(pool: AutoFirePool, selector: string, chain = "this network"): string {
   const bar = `${formatEther(pool.minFundedWei)} ETH`;
 
-  if (pool.total === 0) return "No wallets in the store yet — generate or import some first.";
+  if (pool.total === 0) return "You have no wallets yet — make or import some first.";
 
   if (pool.matched === 0) {
     if (pool.unfunded === pool.total) {
+      // Named per chain, deliberately. This exact sentence used to say "on this
+      // chain" while the operator was looking at a bot that had money on
+      // Robinhood, so it read as "you have no money" rather than "you have no
+      // money *here*" — and a mint on a funded chain was still perfectly
+      // copyable at the time.
       return (
-        `All ${pool.total} wallet(s) are below the ${bar} gas reservation on this chain, ` +
-        `so none count as funded. Top them up with /fund.`
+        `Not enough funds to copy on ${chain} — all ${pool.total} of your wallets are below the ` +
+        `${bar} needed for gas there. Other networks are unaffected.`
       );
     }
     return (
-      `No wallet matched the copy selector "${selector}" ` +
-      `(${pool.total} in the store, ${pool.unfunded} below the ${bar} bar). ` +
-      `Change copy.walletSelector in config.json if the wrong set is being asked for.`
+      `None of your wallets are set to buy on ${chain} ` +
+      `(${pool.total} in total, ${pool.unfunded} below the ${bar} gas bar). ` +
+      `Change which wallets copy-mint spends from under Copy-mint.`
     );
   }
 
@@ -298,9 +303,9 @@ export class CopyEngine {
 
       if (candidates.length === 0) {
         skip(
-          "None of your wallets could buy it",
-          explainEmptyPool(pool, this.deps.copy.walletSelector),
-          "Fix whichever of those it names — the wallet screen shows the same counts."
+          `Not enough funds to copy on ${this.deps.chainName}`,
+          explainEmptyPool(pool, this.deps.copy.walletSelector, this.deps.chainName),
+          `Fund your wallets on ${this.deps.chainName}, or point copy-mint at a set that is funded there. Mints on your other networks are still being copied.`
         );
         return;
       }

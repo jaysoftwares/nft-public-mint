@@ -377,8 +377,11 @@ export function copyMenu(copyOn: boolean): InlineKeyboard {
   return new InlineKeyboard()
     .text(copyOn ? "🛑 Turn OFF" : "▶️ Turn ON", copyOn ? "c:off" : "c:on")
     .row()
-    // Directly under the switch, because "it's on and nothing happens" is the
-    // state people are actually in when they open this screen.
+    // First, because it is the only screen that walks all four requirements.
+    // Everything below it changes one setting in isolation, which is how a
+    // set-up ends up complete on every screen and unable to buy on any network.
+    .text("🚀 Set up copy-mint", "cs:start")
+    .row()
     .text("🩺 Why isn't it buying?", "a:why")
     .row()
     .text("📜 Mints spotted", "a:signals")

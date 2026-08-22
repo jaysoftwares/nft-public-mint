@@ -42,20 +42,44 @@ export interface Finding {
   action?: { label: string; callback: string };
 }
 
+/**
+ * One network's ability to copy, on its own terms.
+ *
+ * Readiness is per chain because gas is per chain, and the engine has always
+ * worked that way — one watcher and one wallet pool each. The reporting did
+ * not, which is the whole problem this type exists to fix: an empty Ethereum
+ * pool was announced as "none of your wallets have enough for gas", a sentence
+ * that reads as total failure while Robinhood was funded and perfectly able to
+ * buy. A chain that cannot pay should cost you that chain, not the bot.
+ */
+export interface ChainReadiness {
+  key: string;
+  name: string;
+  /** False when balances could not be read — never the same claim as "empty". */
+  read: boolean;
+  /** A live watcher is attached. */
+  watching: boolean;
+  /** Matched the selector, armed, funded, not stuck: can buy here right now. */
+  ready: number;
+  /** Matched the selector and holds enough for gas here. */
+  funded: number;
+  /** Matched the selector at all. */
+  matched: number;
+  /** Matched and funded here, but not armed for autonomous firing. */
+  unarmed: number;
+}
+
 export interface DiagnosisInput {
   copyEnabled: boolean;
   targets: WatchTarget[];
-  /** Chains whose watcher is currently connected, and those that are not. */
-  watchersUp: number;
-  watchersTotal: number;
+  /** Per network, in the order they should be shown. */
+  chains: ChainReadiness[];
   walletsTotal: number;
-  /** Matched the copy selector. */
-  walletsMatched: number;
-  /** Matched, armed, funded — the set that can actually buy. */
-  walletsReady: number;
-  walletsUnfunded: number;
-  walletsUnarmed: number;
   selector: string;
+  /** True when the chosen selector cannot match imported wallets. */
+  selectorExcludesImported: boolean;
+  importedTotal: number;
+  importedArmed: number;
   maxPriceWei: bigint;
   perEventWei: bigint;
   dailyWei: bigint;
@@ -158,9 +182,10 @@ export function diagnose(input: DiagnosisInput): Finding[] {
     });
   }
 
-  // ── Wallets that cannot pay ──
+  // ── Which wallets are even allowed to buy ──
 
-  if (input.walletsMatched === 0) {
+  const anyMatched = input.chains.some((c) => c.matched > 0);
+  if (!anyMatched) {
     findings.push({
       severity: "blocking",
       title: "No wallet is allowed to buy",
@@ -168,51 +193,111 @@ export function diagnose(input: DiagnosisInput): Finding[] {
         `Copy-mint is set to spend from “${input.selector}”, and none of your ` +
         `${input.walletsTotal} wallets fit that description.`,
       fix: "Change which wallets copy-mint may spend from.",
-      action: { label: "👛 Which wallets fire", callback: "sel:menu" },
+      action: { label: "👛 Choose which wallets buy", callback: "sel:menu" },
     });
-  } else if (input.walletsReady === 0) {
-    // Split deliberately. "None ready" used to cover both an unfunded set and
-    // an unarmed one, which are opposite problems with opposite fixes, and the
-    // shared wording sent people to top up wallets that already had money.
-    if (input.walletsUnfunded > 0) {
+  }
+
+  // The trap behind "my imported wallets have the money and it still does
+  // nothing". They are excluded twice over — the default selector names only
+  // generated wallets, and imported keys default to manual because they hold
+  // real value. Both have to be undone, and neither is discoverable.
+  if (input.importedTotal > 0 && input.selectorExcludesImported) {
+    findings.push({
+      severity: "limiting",
+      title: `Your ${input.importedTotal} imported wallets are not being used`,
+      detail:
+        `Copy-mint is set to spend from “${input.selector}”, which only covers generated wallets. ` +
+        `If the money is in your imported ones, it is not being reached.`,
+      fix: "Point copy-mint at any funded wallet, or at your imported ones.",
+      action: { label: "👛 Choose which wallets buy", callback: "sel:menu" },
+    });
+  } else if (input.importedTotal > 0 && input.importedArmed === 0) {
+    findings.push({
+      severity: "blocking",
+      title: `Your imported wallets are set to ask first`,
+      detail:
+        `All ${input.importedTotal} are manual-only, so copy-mint will never spend from them on its ` +
+        `own — imported keys start that way because they usually hold real money.`,
+      fix: "Arm them if you want copy-mint to buy with them automatically.",
+      action: { label: "⚡ Arm imported wallets", callback: "f:imported:on" },
+    });
+  }
+
+  // ── Per network ──
+  //
+  // Reported one chain at a time, and never as a single verdict. A funded
+  // Robinhood and an empty Ethereum is a working bot with one network switched
+  // off, not a broken one, and the old wording could not tell those apart.
+  const readable = input.chains.filter((c) => c.read);
+  const live = readable.filter((c) => c.ready > 0);
+
+  if (readable.length > 0 && live.length === 0 && anyMatched) {
+    // Nothing can act anywhere — but "has no money" and "has money and is not
+    // allowed to spend it" are opposite problems with opposite fixes, and
+    // collapsing them is exactly the mistake this module was written to stop.
+    const fundedSomewhere = readable.some((c) => c.funded > 0);
+    findings.push(
+      fundedSomewhere
+        ? {
+            severity: "blocking",
+            title: "Your funded wallets all ask before spending",
+            detail:
+              `They hold enough to mint, but every one of them is set to confirm first, so ` +
+              `copy-mint can never act on a signal by itself.`,
+            fix: "Arm the wallets you want copy-mint to buy with.",
+            action: { label: "⚡ Arm wallets", callback: "af:menu" },
+          }
+        : {
+            severity: "blocking",
+            title: "No network has a wallet that can pay",
+            detail:
+              `A wallet needs at least ${eth(input.minFundedWei)} ETH on the network it is buying ` +
+              `on. None of yours clears that anywhere.`,
+            fix: "Fund your wallets on the network you want to copy on.",
+            action: { label: "💸 Fund wallets", callback: "m:fund" },
+          }
+    );
+  } else {
+    for (const chain of readable) {
+      if (chain.ready > 0) continue;
+      // Not blocking. This chain is out; the others carry on.
       findings.push({
-        severity: "blocking",
-        title: "None of your wallets have enough for gas",
+        severity: "limiting",
+        title: `${chain.name}: nothing here can pay`,
         detail:
-          `A wallet needs at least ${eth(input.minFundedWei)} ETH set aside for gas before it can mint. ` +
-          `${input.walletsUnfunded} of ${input.walletsTotal} are below that.`,
-        fix: "Send them some ETH.",
-        action: { label: "💸 Fund wallets", callback: "m:fund" },
-      });
-    }
-    if (input.walletsUnarmed > 0) {
-      findings.push({
-        severity: "blocking",
-        title: `${input.walletsUnarmed} funded ${input.walletsUnarmed === 1 ? "wallet is" : "wallets are"} not armed`,
-        detail:
-          "They have money but are set to ask before every mint, so copy-mint will never use them on its own.",
-        fix: "Arm them for automatic firing.",
-        action: { label: "⚡ Arm wallets", callback: "af:menu" },
+          chain.funded === 0
+            ? `No wallet holds the ${eth(input.minFundedWei)} ETH needed for gas on ${chain.name}, ` +
+              `so mints there will be spotted and reported but not copied.`
+            : `${chain.funded} funded on ${chain.name}, but ${chain.unarmed} of them ask before spending, ` +
+              `so none can act on their own.`,
+        fix:
+          chain.funded === 0
+            ? `Send ETH to your wallets on ${chain.name}, or stop watching it.`
+            : `Arm them, or pick a different set of wallets.`,
+        action:
+          chain.funded === 0
+            ? { label: "💸 Fund wallets", callback: "m:fund" }
+            : { label: "⚡ Arm wallets", callback: "af:menu" },
       });
     }
   }
 
-  // ── Watchers ──
-
-  if (input.watchersUp === 0 && input.watchersTotal > 0) {
-    findings.push({
-      severity: "blocking",
-      title: "Not connected to any chain",
-      detail: "Mints cannot be spotted at all while this is true.",
-      fix: "Usually clears itself within a minute. If it does not, the RPC provider is down.",
-    });
-  } else if (input.watchersUp < input.watchersTotal) {
-    findings.push({
-      severity: "limiting",
-      title: `Connected to ${input.watchersUp} of ${input.watchersTotal} chains`,
-      detail: "Mints on the missing chains are not being spotted right now.",
-      fix: "Usually reconnects on its own.",
-    });
+  for (const chain of input.chains) {
+    if (!chain.read) {
+      findings.push({
+        severity: "limiting",
+        title: `${chain.name}: could not be reached`,
+        detail: "Balances there are unknown right now — which is not the same as empty.",
+        fix: "Usually clears on its own.",
+      });
+    } else if (!chain.watching) {
+      findings.push({
+        severity: "limiting",
+        title: `${chain.name}: not connected`,
+        detail: `Mints on ${chain.name} are not being spotted right now.`,
+        fix: "Usually reconnects within a minute.",
+      });
+    }
   }
 
   // ── Budget ──
@@ -247,13 +332,16 @@ export function diagnose(input: DiagnosisInput): Finding[] {
   // ── Nothing is wrong ──
 
   if (findings.length === 0) {
+    const ready = input.chains.reduce((n, c) => Math.max(n, c.ready), 0);
+    const on = input.chains.filter((c) => c.ready > 0).map((c) => c.name);
     if (input.journal.seen === 0) {
       findings.push({
         severity: "ok",
         title: "Set up correctly — waiting for someone to mint",
         detail:
           `Watching ${input.targets.length} ${input.targets.length === 1 ? "wallet" : "wallets"} ` +
-          `with ${input.walletsReady} ready to buy. None of them has minted anything yet.`,
+          `with up to ${ready} of yours ready to buy on ${on.join(" and ")}. ` +
+          `None of them has minted anything yet.`,
       });
     } else {
       findings.push({

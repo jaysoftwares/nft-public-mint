@@ -521,4 +521,9 @@ export class Session {
   get watcherCount(): number {
     return this.watchers.size;
   }
+
+  /** Whether one chain is being watched, so readiness can be reported per chain. */
+  hasWatcher(chainKey: string): boolean {
+    return this.watchers.has(chainKey);
+  }
 }

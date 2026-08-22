@@ -44,7 +44,8 @@ import { requiredPerWallet, shortfalls } from "../core/balances";
 import { substituteAddress, contains, selectorOf, buildReplay, ReplayError } from "../core/calldata";
 import { evaluate, PolicyCaps } from "../core/policy";
 import { decodeSeaDropMint } from "../core/copy-plan";
-import { diagnose, overallState } from "../core/diagnosis";
+import { diagnose, overallState, ChainReadiness } from "../core/diagnosis";
+import { buildDashboardSvg } from "../bot/dashboard-image";
 import { explainEmptyPool } from "../core/copy-mint";
 import { parseCollectionInput } from "../core/collection-input";
 import { openSeaChainSlug } from "../core/opensea-api";
@@ -1167,9 +1168,10 @@ async function main(): Promise<void> {
 
   const brokeCtx = emptyContext(parseEther("0.0005"));
   all.forEach((w) => brokeCtx.state.set(w.id, { balanceWei: 0n }));
-  const broke = explainEmptyPool(resolveForAutoFire("derived+funded", all, brokeCtx), "derived+funded");
+  const broke = explainEmptyPool(resolveForAutoFire("derived+funded", all, brokeCtx), "derived+funded", "Ethereum");
   check("an empty set is called unfunded", /below the 0.0005 ETH/i.test(broke), broke);
-  check("…and says how to fix it", /\/fund/.test(broke), broke);
+  check("…and names the chain it is talking about", /on Ethereum/.test(broke), broke);
+  check("…and says the other networks still work", /other networks are unaffected/i.test(broke), broke);
 
   const stuckCtx = emptyContext(parseEther("0.0005"));
   all.forEach((w) => stuckCtx.state.set(w.id, { balanceWei: parseEther("0.001"), nonceGap: true }));
@@ -1178,7 +1180,7 @@ async function main(): Promise<void> {
 
   check(
     "an empty store says so plainly",
-    /no wallets in the store/i.test(explainEmptyPool(resolveForAutoFire("all", [], ctx), "all"))
+    /you have no wallets yet/i.test(explainEmptyPool(resolveForAutoFire("all", [], ctx), "all"))
   );
 
   // An unread balance must never be reported as an empty wallet — that is the
@@ -2245,7 +2247,57 @@ async function main(): Promise<void> {
     !dear.allowed && (dear.detail ?? "").includes("0.02 ETH per NFT")
   );
 
-  // ── the health check ───────────────────────────────────────────────────
+  // ── the dashboard picture ──────────────────────────────────────────────
+  //
+  // Drawn rather than typed, because a Telegram text message has no type sizes,
+  // no colour and no alignment that survives a phone rotating — every attempt
+  // at a "designed" text card lands as the same wall of monospace rows.
+  //
+  // Only the SVG is asserted here. Rasterising needs fonts and a native module,
+  // and the layout is the part that can silently break.
+  section("dashboard picture");
+
+  const picChains: ChainReadiness[] = [
+    { key: "ethereum", name: "Ethereum", read: true, watching: true, ready: 0, funded: 0, matched: 500, unarmed: 0 },
+    { key: "robinhood", name: "Robinhood Chain", read: true, watching: true, ready: 42, funded: 42, matched: 500, unarmed: 0 },
+  ];
+  const svg = buildDashboardSvg({
+    stats: dash,
+    findings: [],
+    state: "ok",
+    chains: picChains,
+    symbols: { ethereum: "ETH", robinhood: "ETH" },
+  });
+  check("it is an SVG document", svg.startsWith("<svg") && svg.endsWith("</svg>"));
+  check("it declares a height that fits its content", svg.includes("<svg") && / height="[0-9][0-9]*"/.test(svg));
+  check("every network gets a row", svg.includes("Ethereum") && svg.includes("Robinhood Chain"));
+  check(
+    "a chain with no gas says so instead of showing a bare zero",
+    svg.includes("no gas here")
+  );
+  check("a funded chain reports what it can do", svg.includes("42 ready to buy"));
+
+  // One apostrophe in a collection name would otherwise void the whole
+  // document, and a dashboard that fails to parse renders as nothing at all.
+  const risky = buildDashboardSvg({
+    stats: dash,
+    findings: [
+      {
+        severity: "blocking",
+        title: "Bob's <wallets> & \"friends\"",
+        detail: "d",
+        fix: "f",
+      },
+    ],
+    state: "blocking",
+    chains: picChains,
+    symbols: {},
+  });
+  check("XML metacharacters in a finding are escaped", risky.includes("Bob&apos;s &lt;wallets&gt; &amp;"));
+  check("…and the raw characters never survive into the document", !/<wallets>/.test(risky));
+  check("a blocking state is drawn as blocking", risky.includes("NOT BUYING"));
+
+    // ── the health check ───────────────────────────────────────────────────
   //
   // The exact configuration the deployed bot sat in for days: copy on, wallets
   // funded and armed, watchers connected, every target following free mints
@@ -2253,16 +2305,25 @@ async function main(): Promise<void> {
   // purchases. This asserts the join gets made.
   section("health check");
 
+  const chainRow = (name: string, over: Partial<ChainReadiness> = {}): ChainReadiness => ({
+    key: name.toLowerCase(),
+    name,
+    read: true,
+    watching: true,
+    ready: 500,
+    funded: 500,
+    matched: 500,
+    unarmed: 0,
+    ...over,
+  });
   const healthyBase = {
     copyEnabled: true,
-    watchersUp: 3,
-    watchersTotal: 3,
+    chains: [chainRow("Ethereum"), chainRow("Base"), chainRow("Robinhood Chain")],
     walletsTotal: 500,
-    walletsMatched: 500,
-    walletsReady: 500,
-    walletsUnfunded: 0,
-    walletsUnarmed: 0,
     selector: "derived+funded",
+    selectorExcludesImported: false,
+    importedTotal: 0,
+    importedArmed: 0,
     maxPriceWei: parseEther("0.005"),
     perEventWei: parseEther("0.1"),
     dailyWei: parseEther("0.5"),
@@ -2307,23 +2368,77 @@ async function main(): Promise<void> {
   const noGas = diagnose({
     ...healthyBase,
     targets: [watched("both")],
-    walletsReady: 0,
-    walletsUnfunded: 500,
-    walletsUnarmed: 0,
+    chains: healthyBase.chains.map((c) => ({ ...c, ready: 0, funded: 0, unarmed: 0 })),
   });
   const notArmed = diagnose({
     ...healthyBase,
     targets: [watched("both")],
-    walletsReady: 0,
-    walletsUnfunded: 0,
-    walletsUnarmed: 500,
+    chains: healthyBase.chains.map((c) => ({ ...c, ready: 0, unarmed: 500 })),
   });
-  check("no gas is reported as needing gas", noGas.some((f) => f.title.includes("gas")));
-  check("not armed is reported as not armed", notArmed.some((f) => f.title.includes("not armed")));
+  check("no gas anywhere is reported as needing gas", noGas.some((f) => f.title.includes("can pay")));
+  check("not armed is reported as asking first", notArmed.some((f) => f.title.includes("ask before spending")));
+
+  // The finding this whole section exists for: one broke network must not read
+  // as a broken bot. Robinhood funded and Ethereum empty is a working set-up
+  // with one chain switched off, and saying otherwise is what sent the operator
+  // looking for a fault that was not there.
+  const oneChainBroke = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    chains: [
+      chainRow("Ethereum", { ready: 0, funded: 0 }),
+      chainRow("Base", { ready: 0, funded: 0 }),
+      chainRow("Robinhood Chain"),
+    ],
+  });
   check(
-    "…and the two never share a sentence",
-    !noGas.some((f) => f.title.includes("not armed")) &&
-      !notArmed.some((f) => f.title.includes("enough for gas"))
+    "an unfunded chain never blocks the whole bot",
+    overallState(oneChainBroke) === "limiting"
+  );
+  check(
+    "…it names the chain that cannot pay",
+    oneChainBroke.some((f) => f.title === "Ethereum: nothing here can pay")
+  );
+  check(
+    "…and does not claim the funded chain is broken",
+    !oneChainBroke.some((f) => f.title.includes("Robinhood"))
+  );
+
+  // An unreadable chain is not an empty one.
+  const unread = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    chains: [chainRow("Ethereum", { read: false, ready: 0, funded: 0, matched: 0 }), chainRow("Robinhood Chain")],
+  });
+  check(
+    "an unreachable chain says so rather than reporting no funds",
+    unread.some((f) => f.title.includes("could not be reached")) &&
+      !unread.some((f) => f.title.includes("Ethereum: nothing here can pay"))
+  );
+
+  // Imported wallets hold the money and are excluded twice — by the selector,
+  // and by defaulting to manual. Both have to be said, and neither used to be.
+  const importedLocked = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    selectorExcludesImported: true,
+    importedTotal: 10,
+    importedArmed: 0,
+  });
+  check(
+    "imported wallets excluded by the selector are reported",
+    importedLocked.some((f) => f.title.includes("imported wallets are not being used"))
+  );
+  const importedUnarmed = diagnose({
+    ...healthyBase,
+    targets: [watched("both")],
+    selectorExcludesImported: false,
+    importedTotal: 10,
+    importedArmed: 0,
+  });
+  check(
+    "imported wallets that are selected but manual are reported separately",
+    importedUnarmed.some((f) => f.title.includes("set to ask first"))
   );
 
   check(

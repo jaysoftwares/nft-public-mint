@@ -88,7 +88,7 @@ import {
   OpenSeaMintEvent,
   OpenSeaMintReport,
 } from "../core/mint-opensea";
-import { diagnose, overallState, Finding } from "../core/diagnosis";
+import { diagnose, overallState, Finding, ChainReadiness, Severity } from "../core/diagnosis";
 import {
   tallySkips,
   recentSignals,
@@ -96,7 +96,17 @@ import {
 } from "../core/copy-journal";
 import { StatusCard, esc, eth, bar, short, clamp, toCsv, txLink } from "./ui";
 import { renderHealth, healthMenu, renderSignals, signalsMenu } from "./health";
+import {
+  NetworkStep,
+  networkKeyboard,
+  renderNetworkChoice,
+  walletChoiceKeyboard,
+  renderWalletChoice,
+  renderReadiness,
+  readinessKeyboard,
+} from "./setup-copy";
 import { renderDashboard } from "./dashboard";
+import { buildDashboardSvg, renderDashboardPng } from "./dashboard-image";
 import { feedFor, clearFeed, contractLabel } from "./copy-feed";
 import { askPassphrase } from "../tools/tty";
 import {
@@ -441,6 +451,7 @@ whichever you're eligible for. Times are UTC.
   what you need when the address is a vault that never mints directly.
 /unwatch &lt;address&gt; · /targets — manage the watch list
 /copy on|off — autonomous firing kill switch
+/setup — guided set-up: pick a network, get told what to fund
 /why — why nothing is being bought, and how to fix it
 /signals — every mint spotted, and what came of each
 /caps — spend limits and today's usage
@@ -464,6 +475,35 @@ Your funding wallet is created automatically and kept out of autonomous minting.
  * when they land, because a tap that shows nothing for ten seconds reads as a
  * bot that has stopped.
  */
+/**
+ * The caption under the picture.
+ *
+ * Short on purpose. Anything that needs reading twice belongs on the "Why?"
+ * screen, and Telegram truncates a caption over 1024 characters without saying
+ * so — a verdict that gets cut in half is worse than no verdict.
+ */
+function blockerCaption(findings: Finding[], state: Severity): string {
+  const blockers = findings.filter((f) => f.severity === "blocking");
+  if (blockers.length === 0) {
+    return state === "limiting"
+      ? `🟡 <b>Running, with some mints skipped.</b> Tap Copy-mint → Why? for the details.`
+      : `🟢 <b>Set up correctly.</b>`;
+  }
+  const first = blockers[0];
+  return clamp(
+    [
+      `🔴 <b>${esc(first.title)}</b>`,
+      first.fix ? `→ ${esc(first.fix)}` : "",
+      blockers.length > 1
+        ? `
+<i>and ${blockers.length - 1} more — tap Copy-mint → Why?</i>`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n")
+  ).slice(0, 1000);
+}
+
 async function cmdDashboard(ctx: Context, force = false): Promise<void> {
   const chatId = ctx.chat?.id;
   if (chatId === undefined) return;
@@ -509,22 +549,48 @@ async function cmdDashboard(ctx: Context, force = false): Promise<void> {
   // disagree about whether the bot is working — which they would, eventually,
   // if the card worked its own verdict out separately.
   const findings = await currentFindings();
+  const state = overallState(findings);
+  const stats = collectDashboard({
+    wallets: session.wallets(),
+    funder: config.funder,
+    chains,
+    ledger: ledgerEntries(),
+    targets: targets.list(),
+    copyEnabled: session.copyEnabled,
+    capDailyWei: config.capDailyWei,
+  });
 
-  const text = clamp(
-    renderDashboard(
-      collectDashboard({
-        wallets: session.wallets(),
-        funder: config.funder,
-        chains,
-        ledger: ledgerEntries(),
-        targets: targets.list(),
-        copyEnabled: session.copyEnabled,
-        capDailyWei: config.capDailyWei,
-      }),
-      findings,
-      overallState(findings)
-    )
-  );
+  const text = clamp(renderDashboard(stats, findings, state));
+
+  // The picture first, the words as the safety net.
+  //
+  // Rasterising is a native dependency and a font away from failing, and on a
+  // machine with neither this must still answer the question — so any throw
+  // falls through to the text card rather than leaving the operator looking at
+  // "reading balances…" forever.
+  try {
+    const readiness = await currentReadiness();
+    const png = await renderDashboardPng(
+      buildDashboardSvg({
+        stats,
+        findings,
+        state,
+        chains: readiness,
+        symbols: Object.fromEntries(
+          session.availableChains.map((c) => [c.key, c.profile.nativeSymbol])
+        ),
+      })
+    );
+    await ctx.api.deleteMessage(chatId, messageId).catch(() => undefined);
+    await ctx.api.sendPhoto(chatId, new InputFile(png, "dashboard.png"), {
+      caption: blockerCaption(findings, state),
+      parse_mode: "HTML",
+      reply_markup: dashboardMenu(),
+    });
+    return;
+  } catch {
+    // fall through to the text card
+  }
 
   try {
     await ctx.api.editMessageText(chatId, messageId, text, {
@@ -573,29 +639,181 @@ async function respond(
  * lights and no mints. This gathers the same facts in one pass and says which
  * one is in the way.
  */
+/**
+ * Read the whole set-up once, one network at a time.
+ *
+ * Per chain, because the engine has always been per chain: each has its own
+ * watcher, its own balances and its own wallet pool, and an empty Ethereum has
+ * never actually stopped Robinhood from buying. Only the reporting pretended
+ * otherwise, and it is what made "no funds" read as total failure.
+ */
 async function currentFindings(): Promise<Finding[]> {
-  const tagCtx = await session.tagContextAnyChain();
-  const pool = resolveForAutoFire(config.copy.walletSelector, session.wallets(), tagCtx);
+  const wallets = session.wallets();
+  const selector = config.copy.walletSelector;
+
+  const chains: ChainReadiness[] = await Promise.all(
+    session.availableChains.map(async (chain) => {
+      const row = {
+        key: chain.key,
+        name: chain.name,
+        watching: session.hasWatcher(chain.key),
+      };
+      try {
+        const ctx = await session.tagContext(chain.key);
+        const pool = resolveForAutoFire(selector, wallets, ctx);
+        const matched = resolveWallets(selector, wallets, ctx);
+        const fundedHere = matched.filter((w: ManagedWallet) => {
+          const balance = ctx.state.get(w.id)?.balanceWei;
+          return balance !== undefined && balance >= ctx.minFundedWei;
+        });
+        return {
+          ...row,
+          read: true,
+          ready: pool.selected.length,
+          funded: fundedHere.length,
+          matched: matched.length,
+          unarmed: fundedHere.filter((w: ManagedWallet) => !w.autoFire).length,
+        };
+      } catch {
+        // Unreadable is not empty, and must never be reported as though it were.
+        return { ...row, read: false, ready: 0, funded: 0, matched: 0, unarmed: 0 };
+      }
+    })
+  );
+
+  // Whether the chosen set can reach imported wallets at all is a property of
+  // the selector, not of any one chain — so it is asked once, against a context
+  // that treats every wallet as fundable so only the selector decides.
+  const anyCtx = await session.tagContextAnyChain();
+  const matchedAnywhere = resolveWallets(selector, wallets, anyCtx);
+  const imported = wallets.filter((w) => w.kind !== "derived");
 
   return diagnose({
     copyEnabled: session.copyEnabled,
     targets: targets.list(),
-    watchersUp: session.watcherCount,
-    watchersTotal: session.availableChains.length,
-    walletsTotal: pool.total,
-    walletsMatched: pool.matched,
-    walletsReady: pool.selected.length,
-    walletsUnfunded: pool.unfunded,
-    walletsUnarmed: pool.excludedManual,
-    selector: config.copy.walletSelector,
+    chains,
+    walletsTotal: wallets.length,
+    selector,
+    selectorExcludesImported:
+      imported.length > 0 && !matchedAnywhere.some((w: ManagedWallet) => w.kind !== "derived"),
+    importedTotal: imported.length,
+    importedArmed: imported.filter((w) => w.autoFire).length,
     maxPriceWei: config.capMaxPriceWei,
     perEventWei: config.capPerEventWei,
     dailyWei: config.capDailyWei,
     dailySpentWei: spentSince(24, ["mint"], { autoOnly: true }),
     skips: tallySkips(),
     journal: summariseJournal(),
-    minFundedWei: pool.minFundedWei,
+    minFundedWei: anyCtx.minFundedWei,
   });
+}
+
+/**
+ * Readiness for one network, or all of them.
+ *
+ * Shares its arithmetic with the health check on purpose — two screens that
+ * count "ready" differently is how an operator ends up trusting neither.
+ */
+async function readinessFor(chainKey?: string): Promise<NetworkStep[]> {
+  const wallets = session.wallets();
+  const selector = config.copy.walletSelector;
+  const chains = chainKey
+    ? session.availableChains.filter((c) => c.key === chainKey)
+    : session.availableChains;
+
+  return Promise.all(
+    chains.map(async (chain) => {
+      const base = {
+        key: chain.key,
+        name: chain.name,
+        symbol: chain.profile.nativeSymbol,
+        minFundedWei: gasReservation(config.gasLimit, config.maxFeePerGas),
+      };
+      try {
+        const ctx = await session.tagContext(chain.key);
+        const pool = resolveForAutoFire(selector, wallets, ctx);
+        const matched = resolveWallets(selector, wallets, ctx);
+        const funded = matched.filter((w: ManagedWallet) => {
+          const balance = ctx.state.get(w.id)?.balanceWei;
+          return balance !== undefined && balance >= ctx.minFundedWei;
+        });
+        const balances = await session.balances(chain.key);
+        return {
+          ...base,
+          read: true,
+          funderWei: balances.get(config.funder) ?? 0n,
+          wallets: {
+            total: wallets.length,
+            matched: matched.length,
+            funded: funded.length,
+            unarmed: funded.filter((w: ManagedWallet) => !w.autoFire).length,
+            ready: pool.selected.length,
+          },
+        };
+      } catch {
+        return {
+          ...base,
+          read: false,
+          funderWei: 0n,
+          wallets: { total: wallets.length, matched: 0, funded: 0, unarmed: 0, ready: 0 },
+        };
+      }
+    })
+  );
+}
+
+/** The same per-network readiness the wizard shows, for the dashboard picture. */
+async function currentReadiness(): Promise<ChainReadiness[]> {
+  const steps = await readinessFor();
+  return steps.map((s) => ({
+    key: s.key,
+    name: s.name,
+    read: s.read,
+    watching: session.hasWatcher(s.key),
+    ready: s.wallets.ready,
+    funded: s.wallets.funded,
+    matched: s.wallets.matched,
+    unarmed: s.wallets.unarmed,
+  }));
+}
+
+async function cmdSetupCopy(ctx: Context): Promise<void> {
+  const steps = await readinessFor();
+  await respond(ctx, clamp(renderNetworkChoice(steps)), networkKeyboard(steps));
+}
+
+async function cmdSetupChain(ctx: Context, chainKey: string): Promise<void> {
+  const [step] = await readinessFor(chainKey);
+  if (!step) return cmdSetupCopy(ctx);
+  await respond(
+    ctx,
+    clamp(renderReadiness(step, config.copy.walletSelector, session.copyEnabled)),
+    readinessKeyboard(step, session.copyEnabled)
+  );
+}
+
+async function cmdSetupWallets(ctx: Context, chainKey: string): Promise<void> {
+  const [step] = await readinessFor(chainKey);
+  if (!step) return cmdSetupCopy(ctx);
+  await respond(
+    ctx,
+    clamp(renderWalletChoice(step, config.copy.walletSelector)),
+    walletChoiceKeyboard(chainKey, config.copy.walletSelector)
+  );
+}
+
+/** Set the wallet selector from inside the wizard, then show the effect at once. */
+async function cmdSetupSelector(ctx: Context, payload: string): Promise<void> {
+  const [chainKey, ...rest] = payload.split(":");
+  const selector = rest.join(":");
+  try {
+    updateUserSettings({ copyWalletSelector: selector });
+  } catch (err) {
+    await fail(ctx, err);
+    return;
+  }
+  config.copy.walletSelector = selector;
+  await cmdSetupChain(ctx, chainKey);
 }
 
 async function cmdWhy(ctx: Context): Promise<void> {
@@ -3462,6 +3680,19 @@ async function onCallback(ctx: Context): Promise<void> {
     case "fixall":
       return cmdFixAll(ctx, payload);
 
+    // The guided set-up. Copy-mint needs four separate things true at once and
+    // they lived on four screens; this is the one path that walks them.
+    case "cs": {
+      const parts = payload.split(":");
+      const step = parts[0];
+      const rest = parts.slice(1);
+      if (step === "start") return cmdSetupCopy(ctx);
+      if (step === "chain") return cmdSetupChain(ctx, rest.join(":"));
+      if (step === "wallets") return cmdSetupWallets(ctx, rest.join(":"));
+      if (step === "sel") return cmdSetupSelector(ctx, rest.join(":"));
+      return cmdSetupCopy(ctx);
+    }
+
     // Page through a wallet list. Stateless — the selector rides in the data.
     case "wp": {
       const [offset, ...selector] = rest;
@@ -3998,6 +4229,7 @@ async function main(): Promise<void> {
   bot.command("dashboard", (ctx) => cmdDashboard(ctx).catch((e) => fail(ctx, e)));
   bot.command("status", (ctx) => cmdStatus(ctx).catch((e) => fail(ctx, e)));
   bot.command("why", (ctx) => cmdWhy(ctx).catch((e) => fail(ctx, e)));
+  bot.command("setup", (ctx) => cmdSetupCopy(ctx).catch((e) => fail(ctx, e)));
   bot.command("signals", (ctx) => cmdSignals(ctx).catch((e) => fail(ctx, e)));
   bot.command("wallets", (ctx) => cmdWallets(ctx).catch((e) => fail(ctx, e)));
   bot.command("import", (ctx) => showWalletImport(ctx).catch((e) => fail(ctx, e)));
