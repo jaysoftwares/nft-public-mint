@@ -60,6 +60,7 @@ import { collectDashboard, ChainReading } from "../core/dashboard";
 import { probeTarget, assessMint } from "../core/target-probe";
 import * as targets from "../core/targets";
 import { CopyEvent } from "../core/copy-mint";
+import { renderCopyResult } from "./copy-report";
 import {
   fetchAllowListRoot,
   findAllowListUri,
@@ -2819,31 +2820,7 @@ function renderCopyEvent(
       feed.countFired(event.result.accepted);
       void feed.close();
       const r = event.result;
-      notify(
-        [
-          `<b>Copy-mint complete</b>`,
-          ``,
-          `${bar(r.accepted, r.walletCount)}  ${r.accepted}/${r.walletCount} accepted`,
-          r.rejected > 0 ? `${r.rejected} rejected` : ``,
-          ``,
-          `contract <code>${esc(short(r.contract))}</code>`,
-          `${r.quantity > 1 ? `${r.quantity} NFTs each · ` : ``}${eth(r.unitPriceWei)} ETH per wallet · ${eth(r.totalCommitWei)} ETH in total`,
-          esc(r.how),
-          `signal → dispatch <b>${r.elapsedMs.toFixed(0)}ms</b> (block budget 2000ms)`,
-          r.hashes.find((h) => h.accepted)
-            ? `\n${txLink(chain.chainId, r.hashes.find((h) => h.accepted)!.hash, "view transaction")}`
-            : ``,
-          r.errorSummary.length > 0
-            ? `\n<b>Failures</b>\n` +
-              r.errorSummary
-                .slice(0, 2)
-                .map((e) => `  ${e.count}× ${esc(e.reason.slice(0, 80))}`)
-                .join("\n")
-            : ``,
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      notify(renderCopyResult(r, chain));
       break;
     }
   }

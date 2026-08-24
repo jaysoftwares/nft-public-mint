@@ -77,6 +77,10 @@ import { ensureUserFundingWallet } from "../bot/user-wallet";
 import { collectDashboard, summariseMints, pct } from "../core/dashboard";
 import { LedgerEntry } from "../core/ledger";
 import { renderDashboard } from "../bot/dashboard";
+import { renderCopyResult } from "../bot/copy-report";
+import { explainRejection } from "../core/dispatcher";
+import { decodeStringReturn } from "../core/collection-name";
+import type { CopyResult } from "../core/copy-mint";
 import * as watchTargets from "../core/targets";
 import { assessMint, blocksForHours } from "../core/target-probe";
 import { rpcBatchChunked } from "../core/rpc";
@@ -2130,6 +2134,161 @@ async function main(): Promise<void> {
     paidStillCapped.allowed ? `got ${paidStillCapped.walletCount}` : ""
   );
   check("…and still says the cap did it", paidStillCapped.allowed && paidStillCapped.trimReason === "per-event cap");
+
+  // ── the message somebody actually reads ───────────────────────────────
+  //
+  // The report used to be a ratio and an aggregated node error: "8/10
+  // accepted" plus "2× insufficient funds for gas * price + value". It named
+  // neither what was bought nor which wallets missed it, so the owner could
+  // not tell which two to top up. Every check here is about a person being
+  // able to act on what they read.
+  section("copy result report");
+
+  const reportChain = { name: "Robinhood Chain", chainId: 4663 };
+  const walletA = "0x7F16615500aBC2fcca48937a32248212eBdA3636";
+  const walletB = "0xc8e0808856D457E3583D555484a69aba8A4d81d2";
+  const walletC = "0x9403F18157Db36d35f4fd7e4E19b7DF3B82fD37e";
+
+  const baseResult = {
+    target: VECTORS[0],
+    contract: "0x0d842ce4cc4e2b1c2b6f1b0a1f5a4f7e8d9c0b1a",
+    sourceTx: "0x" + "ab".repeat(32),
+    block: 1,
+    totalCommitWei: 0n,
+    unitPriceWei: 0n,
+    quantity: 1,
+    strategy: "replay",
+    how: "Copying their exact mint — same stage, same price.",
+    elapsedMs: 312,
+    dispatchMs: 90,
+    errorSummary: [],
+  };
+
+  const mixedReport = renderCopyResult(
+    {
+      ...baseResult,
+      collection: "Omrevo Genesis",
+      walletCount: 3,
+      accepted: 1,
+      rejected: 2,
+      hashes: [
+        { id: "i:a", address: walletA, hash: "0x" + "11".repeat(32), accepted: true },
+        {
+          id: "i:b",
+          address: walletB,
+          hash: "0x" + "22".repeat(32),
+          accepted: false,
+          reason: "Not enough ETH for gas",
+        },
+        {
+          id: "i:c",
+          address: walletC,
+          hash: "0x" + "33".repeat(32),
+          accepted: false,
+          reason: "Not enough ETH for gas",
+        },
+      ],
+    } as CopyResult,
+    reportChain
+  );
+
+  check("the collection is named, not just the contract", mixedReport.includes("Omrevo Genesis"));
+  check("…rather than the bare address", !mixedReport.includes("0x0d842ce4"));
+  check("the wallet that minted is named in full", mixedReport.includes(walletA));
+  check("…and so is each wallet that missed out", mixedReport.includes(walletB) && mixedReport.includes(walletC));
+  check("the reason is in plain words", mixedReport.includes("Not enough ETH for gas"));
+  check("…counted, so one cause is not repeated as many", mixedReport.includes("2 wallets"));
+  check("a free mint says free rather than 0 ETH", mixedReport.includes("free"));
+  check("the network is named", mixedReport.includes("Robinhood Chain"));
+  check("a successful mint links its transaction", mixedReport.includes("11".repeat(32)));
+
+  // Nothing landed: the headline must not say "minted".
+  const allFailed = renderCopyResult(
+    {
+      ...baseResult,
+      walletCount: 2,
+      accepted: 0,
+      rejected: 2,
+      hashes: [
+        { id: "i:b", address: walletB, hash: "0x", accepted: false, reason: "Not enough ETH for gas" },
+        { id: "i:c", address: walletC, hash: "0x", accepted: false, reason: "Not enough ETH for gas" },
+      ],
+    } as CopyResult,
+    reportChain
+  );
+  check("a total miss is not reported as a mint", !allFailed.includes("✅ Minted"));
+  check("…it says so plainly", allFailed.includes("Could not mint"));
+  check("…and falls back to the contract when unnamed", allFailed.includes("0x0d84"));
+
+  // Five hundred wallets cannot be listed inside Telegram's 4096 characters.
+  const many = renderCopyResult(
+    {
+      ...baseResult,
+      collection: "Big Drop",
+      walletCount: 500,
+      accepted: 0,
+      rejected: 500,
+      hashes: Array.from({ length: 500 }, (_, i) => ({
+        id: `d:${i}`,
+        address: `0x${i.toString(16).padStart(40, "0")}`,
+        hash: "0x",
+        accepted: false,
+        reason: "Not enough ETH for gas",
+      })),
+    } as CopyResult,
+    reportChain
+  );
+  check("a full store is summarised, not dumped", many.length < 4096, `${many.length} chars`);
+  check("…and says how many were left out", many.includes("and 488 more"));
+  check("…while still giving the total", many.includes("500 wallets"));
+
+  // ── node rejections, in words ─────────────────────────────────────────
+  section("rejection reasons");
+
+  const rejections: [string, string][] = [
+    ["insufficient funds for gas * price + value", "Not enough ETH for gas"],
+    ["sequencer: INSUFFICIENT_FUNDS", "Not enough ETH for gas"],
+    ["nonce too low: next nonce 12, tx nonce 11", "Nonce already used — another transaction got there first"],
+    ["replacement transaction underpriced", "A transaction from this wallet was already in the queue"],
+    ["max fee per gas less than block base fee", "Gas price too low for the network right now"],
+    ["execution reverted: MintQuantityExceedsMaxSupply", "The mint was rejected by the contract — usually sold out or not eligible"],
+    ["request timed out", "The network did not answer in time"],
+  ];
+  for (const [raw, expected] of rejections) {
+    check(`"${raw.slice(0, 34)}…" reads as its cause`, explainRejection([raw]) === expected, explainRejection([raw]));
+  }
+  check(
+    "an unknown rejection keeps the node's own words",
+    explainRejection(["quicknode: some brand new failure"]) === "some brand new failure"
+  );
+  check("…and an empty one still says something", explainRejection([]) === "Rejected without a reason");
+
+  // ── reading a collection's name ───────────────────────────────────────
+  section("collection name");
+
+  const encodeString = (text: string): string => {
+    const hex = Buffer.from(text, "utf8").toString("hex");
+    const padded = hex.padEnd(Math.ceil(hex.length / 64) * 64, "0");
+    return (
+      "0x" +
+      (32).toString(16).padStart(64, "0") +
+      Buffer.byteLength(text, "utf8").toString(16).padStart(64, "0") +
+      padded
+    );
+  };
+  check("a normal name decodes", decodeStringReturn(encodeString("Omrevo Genesis")) === "Omrevo Genesis");
+  check("…including one that needs two words of padding", decodeStringReturn(encodeString("A".repeat(40))) === "A".repeat(40));
+  check(
+    "a bytes32 name decodes too",
+    decodeStringReturn("0x" + Buffer.from("Punks", "utf8").toString("hex").padEnd(64, "0")) === "Punks"
+  );
+  check("an empty return is no name", decodeStringReturn("0x") === undefined);
+  check("a reverted call is no name", decodeStringReturn("") === undefined);
+  check("a nonsense offset is refused", decodeStringReturn("0x" + "ff".repeat(128)) === undefined);
+  check(
+    "a name cannot smuggle newlines into the report",
+    decodeStringReturn(encodeString("Evil\n<b>Minted</b>")) === "Evil <b>Minted</b>"
+  );
 
   // ── merkle allowlist ──────────────────────────────────────────────────
   section("merkle allowlist");

@@ -200,6 +200,53 @@ export async function dispatchAll(
 }
 
 /** Distinct failure reasons, for reporting without repeating the same line 400×. */
+/**
+ * One node rejection, in words the wallet's owner can act on.
+ *
+ * Nodes answer in their own dialects — "insufficient funds for gas * price +
+ * value", "gas required exceeds allowance", "INSUFFICIENT_FUNDS" — and the raw
+ * string went straight to the operator, who then had to know that the first of
+ * those means "put some ETH in that wallet". Every branch here names the wallet's
+ * problem, not the node's opinion of it.
+ *
+ * Anything unrecognised is returned trimmed rather than replaced: a wrong plain
+ * sentence is worse than an accurate technical one.
+ */
+export function explainRejection(errors: string[]): string {
+  const text = errors.join(" | ").toLowerCase();
+
+  // Underscores as well as spaces: some sequencers answer with the bare enum
+  // name (INSUFFICIENT_FUNDS) rather than a sentence, and that is exactly the
+  // rejection an owner most needs translated.
+  if (/insufficient[ _](funds|balance)|doesn't have enough funds/.test(text)) {
+    return "Not enough ETH for gas";
+  }
+  if (/nonce too low|already used|nonce has already been used/.test(text)) {
+    return "Nonce already used — another transaction got there first";
+  }
+  if (/replacement transaction underpriced|already have|same hash/.test(text)) {
+    return "A transaction from this wallet was already in the queue";
+  }
+  if (/underpriced|fee too low|max fee per gas less than|tip too low/.test(text)) {
+    return "Gas price too low for the network right now";
+  }
+  if (/execution reverted|revert/.test(text)) {
+    return "The mint was rejected by the contract — usually sold out or not eligible";
+  }
+  if (/exceeds block gas limit|gas limit|intrinsic gas/.test(text)) {
+    return "Gas limit rejected by the network";
+  }
+  if (/timeout|timed out|socket|econnreset|network|fetch failed/.test(text)) {
+    return "The network did not answer in time";
+  }
+  if (/rate limit|too many requests|-32007|429/.test(text)) {
+    return "The RPC provider rate-limited this send";
+  }
+
+  const first = errors[0]?.replace(/^[^:]+:\s*/, "").trim();
+  return first && first.length > 0 ? first.slice(0, 120) : "Rejected without a reason";
+}
+
 export function summariseErrors(outcomes: DispatchOutcome[]): { reason: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const outcome of outcomes) {

@@ -12,7 +12,7 @@
 import { ManagedWallet } from "./wallet-store";
 import { TagContext, resolveForCopy } from "./tags";
 import { NonceManager } from "./nonce-manager";
-import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
+import { Endpoint, dispatchAll, prepareTx, summariseErrors, explainRejection } from "./dispatcher";
 import { LogEvent } from "./log-watcher";
 import { planCopy, CopyPlanError } from "./copy-plan";
 import { inspectCalldata } from "./mint-opensea";
@@ -20,6 +20,7 @@ import { evaluate, PolicyCaps, PolicyVerdict } from "./policy";
 import { rpcCall } from "./rpc";
 import { record, spentSince } from "./ledger";
 import { recordSignal } from "./copy-journal";
+import { collectionName } from "./collection-name";
 import * as targets from "./targets";
 import { Wallet, HDNodeWallet, formatEther } from "ethers";
 import { CopyConfig } from "./config";
@@ -74,8 +75,23 @@ export interface CopyResult {
   how: string;
   elapsedMs: number;
   dispatchMs: number;
-  hashes: { id: string; address: string; hash: string; accepted: boolean }[];
+  /**
+   * Per wallet: did it get one, and if not, why not — in plain words.
+   *
+   * The report used to give a count and an aggregated error string, so "8 of
+   * 10 accepted" left the owner with no way to tell which two wallets missed
+   * out or what to do about them. `reason` is set only on a rejection.
+   */
+  hashes: {
+    id: string;
+    address: string;
+    hash: string;
+    accepted: boolean;
+    reason?: string;
+  }[];
   errorSummary: { reason: string; count: number }[];
+  /** The collection's own name(), when it has one worth showing. */
+  collection?: string;
 }
 
 export type CopyEvent =
@@ -489,11 +505,17 @@ export class CopyEngine {
         /* never let bookkeeping affect the outcome */
       }
 
+      // Asked for after the transactions are on the wire, so it costs the mint
+      // nothing, and it is what turns "0x0d842ce4…" into a name the owner
+      // recognises. Cached per contract, and undefined is fine.
+      const collection = await collectionName(this.deps.readUrl, contract).catch(() => undefined);
+
       this.emit({
         type: "result",
         result: {
           target,
           contract,
+          collection,
           sourceTx: event.transactionHash,
           block: event.blockNumber,
           walletCount: firing.length,
@@ -511,6 +533,7 @@ export class CopyEngine {
             address: o.address,
             hash: o.hash,
             accepted: o.accepted,
+            reason: o.accepted ? undefined : explainRejection(o.errors),
           })),
           errorSummary: summariseErrors(report.outcomes),
         },
