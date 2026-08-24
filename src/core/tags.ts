@@ -73,8 +73,16 @@ export function autoTags(wallet: ManagedWallet, ctx: TagContext): string[] {
   const tags: string[] = [wallet.kind];
   const state = ctx.state.get(wallet.id);
 
-  if (state?.balanceWei !== undefined) {
-    tags.push(state.balanceWei >= ctx.minFundedWei && state.balanceWei > 0n ? "funded" : "unfunded");
+  // A fresh reading if there is one, otherwise the last one we happen to hold.
+  //
+  // Without the fallback, `funded` and `unfunded` were untaggable on the copy
+  // path — it builds its context from memory and never sets balanceWei — so a
+  // selector of "funded" matched nothing and copy-mint went silently dead. It
+  // is the obvious thing to pick when you want only your funded wallets to
+  // mint, and it was the one setting guaranteed to stop them.
+  const balance = state?.balanceWei ?? state?.lastKnownBalanceWei;
+  if (balance !== undefined) {
+    tags.push(balance >= ctx.minFundedWei && balance > 0n ? "funded" : "unfunded");
   }
   if (state?.nonceGap) tags.push("stuck");
   tags.push(wallet.autoFire ? "autofire" : "manual");

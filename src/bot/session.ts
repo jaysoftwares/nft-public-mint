@@ -22,7 +22,7 @@ import { CHAINS, resolveChain, ChainProfile } from "../chains";
 import { rpcCall } from "../core/rpc";
 import { LogWatcher, LogEvent, deriveWsUrl } from "../core/log-watcher";
 import { CopyEngine, CopyEvent } from "../core/copy-mint";
-import { resolveForAutoFire } from "../core/tags";
+import { resolveForAutoFire, resolveForCopy } from "../core/tags";
 import * as targets from "../core/targets";
 
 export interface RpcSetup {
@@ -588,11 +588,21 @@ export class Session {
     return deriveWsUrl(chain.rpc.readUrl);
   }
 
-  /** Prime nonces for every wallet copy-mint could draw on, on one chain. */
+  /**
+   * Prime nonces for every wallet copy-mint could draw on, on one chain.
+   *
+   * Resolved with resolveForCopy, the same call the engine makes when a signal
+   * arrives — so the wallets that are ready are exactly the wallets that fire.
+   * It used to prime with resolveForAutoFire, which drops anything with
+   * `autoFire: false`, while firing ignored that flag entirely. Those wallets
+   * still minted; they just had to fetch a nonce first, paying a round trip at
+   * the one moment there is none to spare. Arming has not gated copy-mint for
+   * some time, and now nothing about it is left on this path.
+   */
   async primeCopyPool(chainKey?: string): Promise<void> {
     const chain = this.chain(chainKey);
     const ctx = await this.tagContext(chain.key, true);
-    const pool = resolveForAutoFire(this.config.copy.walletSelector, this.wallets(), ctx);
+    const pool = resolveForCopy(this.config.copy.walletSelector, this.wallets(), ctx);
     await this.primeNonces(pool.selected, chain.key);
 
     // One sweep over the wallets that hold money, so a transaction left in

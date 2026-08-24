@@ -141,7 +141,11 @@ export const DEFAULT_CONFIG: BotConfig = {
     // Off by default. Turning on autonomous spending should be a decision,
     // not something that happens because a config file was created.
     enabled: false,
-    tiers: { high: 50, med: 20, low: 5 },
+    // 0 = every wallet. The top tier means "follow this one properly", and a
+    // store is funded so all of it fires together — capping that at 50 sat the
+    // rest of the wallets out of every drop for no reason the operator chose.
+    // The narrower tiers stay numbers, because that is what they are for.
+    tiers: { high: 0, med: 20, low: 5 },
     dedupWindowSec: 60,
     maxFiresPerTargetPerHour: 3,
     // Every wallet, not just the generated-and-funded ones.

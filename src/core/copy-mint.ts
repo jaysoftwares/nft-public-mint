@@ -449,8 +449,11 @@ export class CopyEngine {
           chainId: this.deps.chainId,
           contract,
           walletIds: report.outcomes.filter((o) => o.accepted).map((o) => o.id),
-          // Ledger tracks committed value, which is what the daily cap measures.
-          valueWei: (verdict.unitCostWei * BigInt(report.accepted)).toString(),
+          // Money that actually left for the drop, and nothing else. Gas is not
+          // spending: it is a reservation the wallet already holds, most of which
+          // comes back, and counting it here is what made every free mint show up
+          // in the ledger at 0.0005 ETH and read as a purchase.
+          valueWei: (verdict.unitSpendWei * BigInt(report.accepted)).toString(),
           // Now knowable on both rungs, so the NFT count stops being an
           // undercount of one per transaction.
           quantity: replay.quantity,
@@ -479,7 +482,7 @@ export class CopyEngine {
               : "Usually gas or funding. Check the wallet screen, then top up with Fund.",
           walletsFired: firing.length,
           walletsAccepted: report.accepted,
-          spentWei: (verdict.unitCostWei * BigInt(report.accepted)).toString(),
+          spentWei: (verdict.unitSpendWei * BigInt(report.accepted)).toString(),
           strategy: replay.strategy,
         });
       } catch {

@@ -929,6 +929,18 @@ async function main(): Promise<void> {
     check("clearing hands it back to the tier", watchTargets.walletsFor(cleared, TIERS) === 5);
     check("…leaving no stale value behind", cleared.walletCount === undefined);
 
+    // A tier of 0 means every wallet, and it is what the top tier now ships as.
+    // The old default of 50 was a cap nobody chose on a store funded to fire
+    // all of itself at once.
+    check(
+      "a tier of zero means every wallet",
+      watchTargets.walletsFor(cleared, { high: 0, med: 20, low: 0 }) === Number.MAX_SAFE_INTEGER
+    );
+    check(
+      "…and an explicit per-target count still wins over it",
+      watchTargets.walletsFor({ walletCount: 7, tier: "low" }, { high: 0, med: 20, low: 0 }) === 7
+    );
+
     check("zero wallets is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], 0)));
     check("a negative count is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], -5)));
     check("a fraction is refused", throws(() => watchTargets.setWalletCount(VECTORS[0], 2.5)));
@@ -1420,6 +1432,30 @@ async function main(): Promise<void> {
     resolveForCopy("all", all, emptyContext(parseEther("0.0005")))
       .selected.map((w) => w.id)
       .join() === all.map((w) => w.id).join()
+  );
+
+  // "funded" is the obvious selector to reach for when you want only the
+  // wallets you topped up to mint. On the copy path it used to match nothing
+  // at all, because that context never sets balanceWei — so choosing it
+  // stopped copy-mint dead and said nothing.
+  const selectable = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => selectable.state.set(w.id, { lastKnownBalanceWei: 0n }));
+  selectable.state.set(all[0].id, { lastKnownBalanceWei: parseEther("1") });
+  check(
+    "a 'funded' selector works from a cached balance",
+    resolveForCopy("funded", all, selectable).selected.length === 1
+  );
+  check(
+    "…and 'unfunded' picks out the rest",
+    resolveForCopy("unfunded", all, selectable).selected.length === all.length - 1
+  );
+  check(
+    "…while a fresh reading still wins over the cached one",
+    (() => {
+      const fresh = emptyContext(parseEther("0.0005"));
+      fresh.state.set(all[0].id, { balanceWei: 0n, lastKnownBalanceWei: parseEther("1") });
+      return resolveForCopy("funded", [all[0]], fresh).selected.length === 0;
+    })()
   );
 
   // ── pasted input ──────────────────────────────────────────────────────
@@ -2007,7 +2043,7 @@ async function main(): Promise<void> {
   check("per-event cap trims instead of rejecting", trimmed.allowed);
   check(
     "…to exactly what the cap affords",
-    trimmed.allowed && trimmed.walletCount === 66,
+    trimmed.allowed && trimmed.walletCount === 100,
     trimmed.allowed ? `got ${trimmed.walletCount}` : ""
   );
   check("…and says why", trimmed.allowed && trimmed.trimReason === "per-event cap");
@@ -2018,7 +2054,7 @@ async function main(): Promise<void> {
     requestedWallets: 50,
     spentLast24hWei: parseEther("0.485"),
   });
-  check("daily budget trims too", nearDaily.allowed && nearDaily.walletCount === 10);
+  check("daily budget trims too", nearDaily.allowed && nearDaily.walletCount === 15);
   check("…attributed to the daily budget", nearDaily.allowed && nearDaily.trimReason === "daily budget");
 
   check(
@@ -2051,9 +2087,49 @@ async function main(): Promise<void> {
     }).allowed
   );
 
-  // A free mint still costs gas, so it must still be bounded.
+  // ── the caps bound spending, and gas is not spending ──────────────────
+  //
+  // This reverses an earlier rule, deliberately. The caps used to be measured
+  // against price + gas reservation, so a FREE mint was charged 0.0005 a wallet
+  // against a 0.0014 per-event cap and exactly two wallets were allowed to
+  // mint. Ten funded wallets, a free drop, nothing being spent, and eight of
+  // them sat it out.
+  //
+  // Gas is not a budget item: it is a reservation the wallet already holds, it
+  // is only charged on a transaction that lands, and it is bounded by the gas
+  // settings. How many wallets take part is a separate decision with its own
+  // control — `walletCount` per target, or the tier — and that is where a limit
+  // belongs. What the caps must still do is bound money leaving for a drop,
+  // which the paid cases above and below cover.
   const free = evaluate({ ...base, unitPriceWei: 0n, requestedWallets: 10_000 });
-  check("free mints are still bounded by gas", free.allowed && free.walletCount === 200);
+  check("a free mint is not trimmed by a spending cap", free.allowed && free.walletCount === 10_000);
+  check("…and reports no trim reason", free.allowed && free.trimReason === undefined);
+  check("…while still saying what a wallet must hold", free.allowed && free.unitCostWei === gasRes);
+  check("…and that it spends nothing", free.allowed && free.unitSpendWei === 0n);
+
+  // The protection that matters is unchanged: money leaving is still capped,
+  // and an over-priced mint is still refused outright rather than trimmed.
+  const freeButExhausted = evaluate({
+    ...base,
+    unitPriceWei: 0n,
+    requestedWallets: 500,
+    spentLast24hWei: parseEther("0.5"),
+  });
+  check(
+    "a free mint still fires with the day's budget spent",
+    freeButExhausted.allowed && freeButExhausted.walletCount === 500
+  );
+  const paidStillCapped = evaluate({
+    ...base,
+    unitPriceWei: parseEther("0.002"),
+    requestedWallets: 500,
+  });
+  check(
+    "a paid mint is still capped",
+    paidStillCapped.allowed && paidStillCapped.walletCount === 50,
+    paidStillCapped.allowed ? `got ${paidStillCapped.walletCount}` : ""
+  );
+  check("…and still says the cap did it", paidStillCapped.allowed && paidStillCapped.trimReason === "per-event cap");
 
   // ── merkle allowlist ──────────────────────────────────────────────────
   section("merkle allowlist");

@@ -196,7 +196,14 @@ export function walletsFor(
   target: Pick<WatchTarget, "walletCount" | "tier">,
   tiers: Record<Tier, number>
 ): number {
-  return target.walletCount ?? tiers[target.tier];
+  const configured = target.walletCount ?? tiers[target.tier];
+  // Zero means every wallet, and it is the default for the top tier.
+  //
+  // A number here is a cap on how many of your own funded wallets are allowed
+  // to take part, which is not what anyone funding five hundred wallets wants:
+  // they are funded precisely so they all mint at once. The old default of 50
+  // silently sat 90% of a full store out of every drop.
+  return configured > 0 ? configured : Number.MAX_SAFE_INTEGER;
 }
 
 /** The price ceiling this target's signals are judged against. */

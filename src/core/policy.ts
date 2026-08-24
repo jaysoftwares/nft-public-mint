@@ -51,7 +51,17 @@ export type PolicyVerdict =
   | {
       allowed: true;
       walletCount: number;
+      /** What one wallet must be holding: the mint price plus a gas reservation. */
       unitCostWei: bigint;
+      /**
+       * What one wallet actually spends on the drop — no gas.
+       *
+       * This is the number the ledger records and the daily cap measures. They
+       * used to record `unitCostWei`, which made every free mint appear in the
+       * ledger at the gas reservation and read as a paid one. Fifty-seven of
+       * sixty-four entries looked like purchases and were free.
+       */
+      unitSpendWei: bigint;
       totalCommitWei: bigint;
       trimmedFrom?: number;
       trimReason?: string;
@@ -118,49 +128,69 @@ export function evaluate(input: PolicyInput): PolicyVerdict {
     };
   }
 
-  const unitCost = input.unitPriceWei + input.gasReservationWei;
+  // Two different numbers, and conflating them is what stopped every wallet
+  // firing.
+  //
+  // `unitSpend` is money leaving for the drop. `unitCost` is what a wallet must
+  // be holding to take part, which includes a gas reservation it already owns
+  // and mostly gets back — gas is only charged for a transaction that lands,
+  // and it is bounded by the gas settings, not by a budget.
+  //
+  // The spending caps used to be measured against `unitCost`, so a FREE mint
+  // was billed 0.0005 ETH a wallet against a 0.0014 per-event cap and exactly
+  // two wallets were allowed to mint. Ten funded wallets, a free drop, nothing
+  // to spend, and eight of them sat it out — the operator funds these wallets
+  // precisely so they all fire at once. Caps bound spending; a free mint spends
+  // nothing, so it is not trimmed at all.
+  const unitSpend = input.unitPriceWei;
+  const unitCost = unitSpend + input.gasReservationWei;
   if (unitCost <= 0n) {
     return { allowed: false, reason: "Zero cost per wallet — refusing to act on that" };
   }
 
   let walletCount = input.requestedWallets;
   let trimReason: string | undefined;
-
-  const perEventMax = Number(input.caps.perEventWei / unitCost);
-  if (perEventMax < walletCount) {
-    walletCount = perEventMax;
-    trimReason = "per-event cap";
-  }
-
   const dailyRemaining = input.caps.dailyWei - input.spentLast24hWei;
-  if (dailyRemaining <= 0n) {
-    return {
-      allowed: false,
-      reason: "Out of budget for today",
-      detail: `The bot has spent its ${eth(input.caps.dailyWei)} ETH daily allowance on copies in the last 24 hours.`,
-      fix: "Raise “daily spending limit” under Copy-mint → Spending limits, or wait for the 24 hours to roll over.",
-    };
-  }
-  const dailyMax = Number(dailyRemaining / unitCost);
-  if (dailyMax < walletCount) {
-    walletCount = dailyMax;
-    trimReason = "daily budget";
+
+  if (unitSpend > 0n) {
+    const perEventMax = Number(input.caps.perEventWei / unitSpend);
+    if (perEventMax < walletCount) {
+      walletCount = perEventMax;
+      trimReason = "per-event cap";
+    }
+
+    if (dailyRemaining <= 0n) {
+      return {
+        allowed: false,
+        reason: "Out of budget for today",
+        detail: `The bot has spent its ${eth(input.caps.dailyWei)} ETH daily allowance on copies in the last 24 hours.`,
+        fix: "Raise “daily spending limit” under Copy-mint → Spending limits, or wait for the 24 hours to roll over.",
+      };
+    }
+    const dailyMax = Number(dailyRemaining / unitSpend);
+    if (dailyMax < walletCount) {
+      walletCount = dailyMax;
+      trimReason = "daily budget";
+    }
   }
 
   if (walletCount <= 0) {
     // Which of the two limits bit is the whole question here — they have
     // different fixes and the operator cannot tell them apart from "zero".
+    // Only reachable on a mint that costs money — a free one is never trimmed —
+    // so the number quoted is the mint price, not the gas the wallet already
+    // holds. Quoting the gas here sent people to raise a spending limit over a
+    // cost that was never spending.
     const blocker = input.caps.perEventWei < dailyRemaining ? "per-mint" : "daily";
     return {
       allowed: false,
       reason: "Your spending limit is smaller than one wallet's share",
       detail:
-        `One wallet would need ${eth(unitCost)} ETH (${eth(input.unitPriceWei)} to mint, ` +
-        `${eth(input.gasReservationWei)} held back for gas), which is more than the ` +
+        `One wallet would spend ${eth(unitSpend)} ETH on this mint, which is more than the ` +
         `${blocker === "per-mint" ? `${eth(input.caps.perEventWei)} ETH per-mint limit` : `${eth(dailyRemaining)} ETH left in today's budget`}.`,
       fix:
         blocker === "per-mint"
-          ? `Raise “spend per mint” under Copy-mint → Spending limits to at least ${eth(unitCost)} ETH.`
+          ? `Raise “spend per mint” under Copy-mint → Spending limits to at least ${eth(unitSpend)} ETH.`
           : `Raise “daily spending limit”, or wait for the 24 hours to roll over.`,
     };
   }
@@ -169,6 +199,7 @@ export function evaluate(input: PolicyInput): PolicyVerdict {
     allowed: true,
     walletCount,
     unitCostWei: unitCost,
+    unitSpendWei: unitSpend,
     totalCommitWei: unitCost * BigInt(walletCount),
     trimmedFrom: walletCount < input.requestedWallets ? input.requestedWallets : undefined,
     trimReason,
