@@ -80,6 +80,12 @@ import { renderDashboard } from "../bot/dashboard";
 import { renderCopyResult } from "../bot/copy-report";
 import { explainRejection } from "../core/dispatcher";
 import { decodeStringReturn } from "../core/collection-name";
+import {
+  discoverMintedHoldings,
+  confirmOwnership,
+  encodeTransferFrom,
+  TRANSFER_TOPIC,
+} from "../core/holdings";
 import type { CopyResult } from "../core/copy-mint";
 import * as watchTargets from "../core/targets";
 import { assessMint, blocksForHours } from "../core/target-probe";
@@ -2289,6 +2295,144 @@ async function main(): Promise<void> {
     "a name cannot smuggle newlines into the report",
     decodeStringReturn(encodeString("Evil\n<b>Minted</b>")) === "Evil <b>Minted</b>"
   );
+
+  // ── finding what we hold, and moving it ───────────────────────────────
+  //
+  // This had no coverage at all, which is how it shipped in a state that could
+  // not finish. The old scan walked every block since the first mint for every
+  // wallet — 1.9 million blocks, 500 addresses, both directions, twenty
+  // thousand eth_getLogs calls — so a sweep ran for the better part of an hour
+  // and was never seen to complete.
+  section("nft sweep");
+
+  const VAULT = "0x281D106770AF16c37FB5D9C94F0c513369a07fD1";
+  const OWNER_A = VECTORS[0];
+  const OWNER_B = VECTORS[1];
+  const SWEEP_NFT = "0x47556568b06674d876d95a40487449f173cf33c8";
+  const padTopic = (address: string): string => "0x" + address.slice(2).toLowerCase().padStart(64, "0");
+  const padId = (id: number): string => "0x" + id.toString(16).padStart(64, "0");
+
+  // token 1 → OWNER_A, token 2 → OWNER_B, token 3 → minted then sold on,
+  // token 4 → the mint reverted, so ownerOf has nothing to say about it.
+  const chainOwners: Record<string, string | null> = {
+    "1": OWNER_A,
+    "2": OWNER_B,
+    "3": "0x000000000000000000000000000000000000dEaD",
+    "4": null,
+  };
+  let getLogsCalls = 0;
+  const scanned: [number, number][] = [];
+
+  const nftServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (c: Buffer) => chunks.push(c));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const answer = (entry: { id: number; method: string; params: any[] }): unknown => {
+        if (entry.method === "eth_getLogs") {
+          getLogsCalls++;
+          const f = entry.params[0];
+          scanned.push([Number(BigInt(f.fromBlock)), Number(BigInt(f.toBlock))]);
+          // Every token this contract minted to the wallets asked about.
+          const wanted: string[] = ([] as string[]).concat(f.topics[2] ?? []);
+          const logs = Object.keys(chainOwners)
+            .map((id) => ({ id, to: id === "1" ? OWNER_A : OWNER_B }))
+            .filter((t) => wanted.includes(padTopic(t.to)))
+            .map((t) => ({
+              address: SWEEP_NFT,
+              blockNumber: f.fromBlock,
+              topics: [TRANSFER_TOPIC, padTopic(ZERO_ADDRESS), padTopic(t.to), padId(Number(t.id))],
+            }));
+          // Tokens 3 and 4 also went to OWNER_A at mint time.
+          if (wanted.includes(padTopic(OWNER_A))) {
+            for (const id of [3, 4]) {
+              logs.push({
+                address: SWEEP_NFT,
+                blockNumber: f.fromBlock,
+                topics: [TRANSFER_TOPIC, padTopic(ZERO_ADDRESS), padTopic(OWNER_A), padId(id)],
+              });
+            }
+          }
+          return { jsonrpc: "2.0", id: entry.id, result: logs };
+        }
+        if (entry.method === "eth_call") {
+          const tokenId = String(BigInt("0x" + (entry.params[0].data as string).slice(10)));
+          const owner = chainOwners[tokenId];
+          return owner
+            ? { jsonrpc: "2.0", id: entry.id, result: padTopic(owner) }
+            : { jsonrpc: "2.0", id: entry.id, error: { message: "execution reverted" } };
+        }
+        return { jsonrpc: "2.0", id: entry.id, error: { message: `unexpected ${entry.method}` } };
+      };
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(Array.isArray(body) ? body.map(answer) : answer(body)));
+    });
+  });
+  await new Promise<void>((resolve) => nftServer.listen(0, "127.0.0.1", resolve));
+
+  try {
+    const nftUrl = `http://127.0.0.1:${(nftServer.address() as { port: number }).port}`;
+    const owners = [
+      { id: "d:1", address: OWNER_A },
+      { id: "d:2", address: OWNER_B },
+    ];
+
+    const found = await discoverMintedHoldings(
+      nftUrl,
+      [{ contract: SWEEP_NFT, block: 42_947_362, owners }],
+      { window: 2000 }
+    );
+
+    check("a mint is found from the block the ledger recorded", found.length > 0);
+    check(
+      "…and only the tokens still held are returned",
+      found.map((h) => h.tokenId).sort().join() === "1,2",
+      found.map((h) => h.tokenId).sort().join()
+    );
+    check(
+      "a token sold on is not swept",
+      !found.some((h) => h.tokenId === "3")
+    );
+    check(
+      "a mint that reverted is not swept",
+      !found.some((h) => h.tokenId === "4")
+    );
+    check(
+      "each token is attributed to the wallet that holds it",
+      found.find((h) => h.tokenId === "1")?.owner === OWNER_A &&
+        found.find((h) => h.tokenId === "2")?.owner === OWNER_B
+    );
+
+    // The point of the rewrite: one request per recorded mint, not thousands.
+    check("one recorded mint costs one log query", getLogsCalls === 1, `${getLogsCalls} calls`);
+    check(
+      "…and looks only just past the recorded block",
+      scanned[0][1] - scanned[0][0] === 2000,
+      `scanned ${scanned[0][0]}-${scanned[0][1]}`
+    );
+
+    // ownerOf is what makes the result current rather than merely historical.
+    const confirmed = await confirmOwnership(
+      nftUrl,
+      [
+        { contract: SWEEP_NFT, tokenId: "1" },
+        { contract: SWEEP_NFT, tokenId: "3" },
+        { contract: SWEEP_NFT, tokenId: "4" },
+      ],
+      owners
+    );
+    check("ownerOf keeps what is ours", confirmed.some((h) => h.tokenId === "1"));
+    check("…drops what somebody else now owns", !confirmed.some((h) => h.tokenId === "3"));
+    check("…and drops a token that does not exist", !confirmed.some((h) => h.tokenId === "4"));
+
+    // The transfer itself must name the holder as sender, not the vault.
+    const calldata = encodeTransferFrom(OWNER_A, VAULT, "1");
+    check("the sweep transfers from the holder", calldata.includes(OWNER_A.slice(2).toLowerCase()));
+    check("…to the chosen destination", calldata.includes(VAULT.slice(2).toLowerCase()));
+    check("…and names the token", calldata.endsWith("1".padStart(64, "0")));
+  } finally {
+    await new Promise<void>((resolve) => nftServer.close(() => resolve()));
+  }
 
   // ── merkle allowlist ──────────────────────────────────────────────────
   section("merkle allowlist");

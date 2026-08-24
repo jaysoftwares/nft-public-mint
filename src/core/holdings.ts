@@ -13,7 +13,7 @@
 // amount in data and has three.
 
 import { Interface, zeroPadValue, getAddress } from "ethers";
-import { rpcCall } from "./rpc";
+import { rpcCall, rpcBatchChunked } from "./rpc";
 import { Endpoint, prepareTx, dispatchAll, DispatchOutcome } from "./dispatcher";
 import { Wallet, HDNodeWallet } from "ethers";
 
@@ -156,6 +156,130 @@ function isTooLarge(message: string): boolean {
   return /too large|too many results|response size|query returned more than|limit exceeded/i.test(
     message
   );
+}
+
+/** keccak("ownerOf(uint256)")[0..4] */
+const OWNER_OF = "0x6352211e";
+
+/**
+ * One mint the ledger recorded: which contract, into which wallets, and the
+ * block the signal came from.
+ */
+export interface MintSite {
+  contract: string;
+  /** The block the mint was triggered from. Ours lands at or shortly after it. */
+  block: number;
+  owners: HoldingTarget[];
+}
+
+export interface MintScanOptions {
+  /**
+   * How far past the recorded block to look.
+   *
+   * The ledger stores the block of the *signal*, and our own transaction lands
+   * a block or two later — more if the network was slow. Robinhood produces
+   * roughly seven blocks a second, so 2000 blocks is about five minutes of
+   * chain: far past any mint that was going to land, and still one request.
+   */
+  window?: number;
+  onProgress?: (done: number, total: number) => void;
+}
+
+/**
+ * Find what we hold by asking the ledger where to look, then asking the chain
+ * who owns it.
+ *
+ * The full-range scan below cannot be used at this deployment's size. It walks
+ * every block since the first mint for every wallet: 1.9 million blocks, 500
+ * addresses, two directions — twenty thousand eth_getLogs calls and the better
+ * part of an hour, which is why a sweep never finished.
+ *
+ * Nothing about that work was necessary. The ledger already records the exact
+ * contract, wallets and block of every mint this bot made, so the search is a
+ * few hundred blocks around each one — about sixty requests here. Ownership is
+ * then confirmed with ownerOf rather than by netting incoming against outgoing
+ * logs, which is both cheaper and strictly more accurate: it reflects the chain
+ * as it is now, including tokens already swept and mints that were accepted by
+ * the node and then reverted.
+ */
+export async function discoverMintedHoldings(
+  readUrl: string,
+  sites: MintSite[],
+  opts: MintScanOptions = {}
+): Promise<Holding[]> {
+  if (sites.length === 0) return [];
+  const window = opts.window ?? 2000;
+
+  // contract|tokenId -> the wallets that might hold it.
+  const candidates = new Map<string, { contract: string; tokenId: string }>();
+  let done = 0;
+
+  for (const site of sites) {
+    const logs = await getLogs(readUrl, {
+      fromBlock: site.block,
+      toBlock: site.block + window,
+      contracts: [site.contract],
+      // Only the wallets this contract was minted into — usually one, so the
+      // topic filter stays small however many wallets the store has.
+      topics: [TRANSFER_TOPIC, null, site.owners.map((o) => zeroPadValue(o.address, 32))],
+    });
+
+    for (const log of logs) {
+      if (log.topics.length !== 4) continue; // ERC-20 shares the topic
+      const tokenId = BigInt(log.topics[3]).toString();
+      candidates.set(`${log.address.toLowerCase()}|${tokenId}`, {
+        contract: getAddress(log.address),
+        tokenId,
+      });
+    }
+    opts.onProgress?.(++done, sites.length);
+  }
+
+  return confirmOwnership(readUrl, [...candidates.values()], sites.flatMap((s) => s.owners));
+}
+
+/**
+ * Ask the contract who owns each token, and keep the ones that are ours.
+ *
+ * This is the step that makes the result trustworthy. Logs say a token arrived;
+ * only ownerOf says it is still here. A token already swept, sold, or never
+ * actually minted because the transaction reverted after being accepted all
+ * look identical in the receiving logs and different here.
+ */
+export async function confirmOwnership(
+  readUrl: string,
+  tokens: { contract: string; tokenId: string }[],
+  targets: HoldingTarget[]
+): Promise<Holding[]> {
+  if (tokens.length === 0) return [];
+  const byAddress = new Map(targets.map((t) => [t.address.toLowerCase(), t]));
+
+  const results = await rpcBatchChunked<string>(
+    readUrl,
+    tokens.map((t) => ({
+      method: "eth_call",
+      params: [
+        { to: t.contract, data: OWNER_OF + BigInt(t.tokenId).toString(16).padStart(64, "0") },
+        "latest",
+      ],
+    }))
+  );
+
+  const held: Holding[] = [];
+  results.forEach((entry, i) => {
+    // A revert here means the token does not exist — a mint that never landed.
+    if (!entry?.result || entry.result === "0x" || entry.result.length < 66) return;
+    const owner = getAddress(`0x${entry.result.slice(-40)}`).toLowerCase();
+    const target = byAddress.get(owner);
+    if (!target) return; // Someone else's now, or never ours.
+    held.push({
+      contract: tokens[i].contract,
+      tokenId: tokens[i].tokenId,
+      ownerId: target.id,
+      owner: target.address,
+    });
+  });
+  return held;
 }
 
 /**

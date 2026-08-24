@@ -48,14 +48,10 @@ import {
   parseFundAmount,
   TRANSFER_GAS,
 } from "../core/funding";
-import { discoverHoldings, sweepNfts, latestBlock } from "../core/holdings";
+import { discoverMintedHoldings, sweepNfts, MintSite } from "../core/holdings";
+import { explainRejection } from "../core/dispatcher";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
-import {
-  earliestMintBlock,
-  entries as ledgerEntries,
-  mintedContracts,
-  spentSince,
-} from "../core/ledger";
+import { entries as ledgerEntries, spentSince } from "../core/ledger";
 import { collectDashboard, ChainReading } from "../core/dashboard";
 import { probeTarget, assessMint } from "../core/target-probe";
 import * as targets from "../core/targets";
@@ -1216,19 +1212,93 @@ async function cmdFund(ctx: Context): Promise<void> {
   }
 }
 
+/**
+ * Where a sweep is allowed to send NFTs.
+ *
+ * The vault by default. `to <address>` overrides it, because "put everything in
+ * one wallet" is the whole point of a sweep and the one wallet somebody wants
+ * is not always the one in config.json.
+ *
+ * That is a real widening: the vault used to be settable only over SSH, so a
+ * Telegram account alone could never name a destination. It is kept honest by
+ * confirming the full address before anything moves, and by the fact that this
+ * command already requires a whitelisted chat.
+ */
+function sweepDestination(ctx: Context): { to: string; label: string } | { error: string } {
+  const words = args(ctx);
+  const at = words.findIndex((w) => w.toLowerCase() === "to");
+  if (at === -1) {
+    if (!config.vault || config.vault === ZeroAddress) {
+      return {
+        error:
+          "No destination. Set a vault over SSH, or say where to send it:\n" +
+          "<code>/sweep all to 0x…</code>",
+      };
+    }
+    return { to: config.vault, label: "vault" };
+  }
+
+  const raw = words[at + 1];
+  if (!raw) return { error: "Say where to send it: <code>/sweep all to 0x…</code>" };
+  try {
+    const to = getAddress(raw);
+    const own = session.wallets().find((w) => w.address.toLowerCase() === to.toLowerCase());
+    return { to, label: own ? `your wallet ${own.id}` : "external wallet" };
+  } catch {
+    return { error: `That is not a valid address: <code>${esc(raw.slice(0, 60))}</code>` };
+  }
+}
+
 async function cmdSweep(ctx: Context): Promise<void> {
-  const [selector = "all", contractArg] = args(ctx);
+  // "to 0x…" is consumed by sweepDestination, so it must not be read as the
+  // contract argument.
+  const words = args(ctx).filter((w, i, a) => {
+    const at = a.findIndex((x) => x.toLowerCase() === "to");
+    return at === -1 || (i !== at && i !== at + 1);
+  });
+  const [selector = "all", contractArg] = words;
+
+  const destination = sweepDestination(ctx);
+  if ("error" in destination) {
+    await ctx.reply(destination.error, { parse_mode: "HTML" });
+    return;
+  }
+
   const chain = await chainFor(ctx, contractArg);
   const matched = await select(selector, ctx, chain.key, true);
   if (!matched) return;
 
-  const contracts = contractArg
-    ? [getAddress(contractArg)]
-    : mintedContracts(chain.chainId);
+  // Where to look, taken from the ledger rather than from the whole chain.
+  //
+  // Each recorded mint gives a contract, the wallets it went to and the block
+  // it happened in, which turns the search from "every block since we started"
+  // into a few hundred blocks per mint. On this deployment that is the
+  // difference between sixty requests and twenty thousand.
+  const mine = new Set(matched.map((w) => w.id));
+  const sites = new Map<string, MintSite>();
+  for (const entry of ledgerEntries()) {
+    if (entry.kind !== "mint" || entry.chainId !== chain.chainId || !entry.contract) continue;
+    if (entry.fromBlock === undefined) continue;
+    if (contractArg && entry.contract.toLowerCase() !== contractArg.toLowerCase()) continue;
 
-  if (contracts.length === 0) {
+    const owners = matched
+      .filter((w) => mine.has(w.id) && entry.walletIds.includes(w.id))
+      .map((w) => ({ id: w.id, address: w.address }));
+    if (owners.length === 0) continue;
+
+    const key = `${entry.contract.toLowerCase()}|${entry.fromBlock}`;
+    const existing = sites.get(key);
+    if (existing) {
+      const seen = new Set(existing.owners.map((o) => o.id));
+      for (const o of owners) if (!seen.has(o.id)) existing.owners.push(o);
+    } else {
+      sites.set(key, { contract: entry.contract, block: entry.fromBlock, owners });
+    }
+  }
+
+  if (sites.size === 0) {
     await ctx.reply(
-      "Nothing to scan — this bot has no recorded mints on this chain.\n" +
+      "Nothing to scan — no recorded mints for those wallets on this chain.\n" +
         "Pass a contract explicitly: <code>/sweep all 0x…</code>",
       { parse_mode: "HTML" }
     );
@@ -1236,39 +1306,49 @@ async function cmdSweep(ctx: Context): Promise<void> {
   }
 
   const status = new StatusCard(bot, ctx.chat!.id);
-  await status.start(`<b>Sweep</b>\n\nscanning ${contracts.length} contract(s)…`);
+  await status.start(`<b>Sweep</b>\n\nchecking ${sites.size} mint(s) on ${esc(chain.name)}…`);
 
   try {
-    const head = await latestBlock(chain.rpc.readUrl);
-    // Bound the scan: the ledger knows when we first minted, so there is no
-    // reason to walk the chain further back than that.
-    const from = earliestMintBlock(chain.chainId) ?? Math.max(0, head - 50_000);
-
-    const holdings = await discoverHoldings(
-      chain.rpc.readUrl,
-      matched.map((w) => ({ id: w.id, address: w.address })),
-      {
-        fromBlock: from,
-        toBlock: head,
-        contracts,
-        onProgress: (done, total) =>
-          status.update(`<b>Sweep</b>\n\n${bar(done, total)}  scanning ${done}/${total}`),
-      }
-    );
+    const holdings = await discoverMintedHoldings(chain.rpc.readUrl, [...sites.values()], {
+      onProgress: (done, total) =>
+        status.update(`<b>Sweep</b>\n\n${bar(done, total)}  checking ${done}/${total}`),
+    });
 
     if (holdings.length === 0) {
-      await status.finish("<b>Sweep</b>\n\nNo NFTs found in the selected wallets.");
+      await status.finish(
+        "<b>Sweep</b>\n\nNo NFTs found. Every token from those mints has either " +
+          "already been moved, or the mint did not land."
+      );
       return;
     }
 
-    await session.primeNonces(matched, chain.key);
-    status.update(`<b>Sweep</b>\n\nfound ${holdings.length} NFT(s) — signing…`);
+    // Nothing that already sits at the destination needs moving, and a
+    // self-transfer would burn gas to achieve nothing.
+    const toMove = holdings.filter(
+      (h) => h.owner.toLowerCase() !== destination.to.toLowerCase()
+    );
+    if (toMove.length === 0) {
+      await status.finish(
+        `<b>Sweep</b>\n\nAll ${holdings.length} NFT(s) are already in ` +
+          `<code>${esc(destination.to)}</code>.`
+      );
+      return;
+    }
+
+    const owners = [...new Set(toMove.map((h) => h.ownerId))];
+    await session.primeNonces(
+      matched.filter((w) => owners.includes(w.id)),
+      chain.key
+    );
+    status.update(
+      `<b>Sweep</b>\n\nfound ${toMove.length} NFT(s) in ${owners.length} wallet(s) — signing…`
+    );
 
     const result = await sweepNfts(
-      holdings,
+      toMove,
       {
         signerFor: session.signerFor,
-        vault: config.vault,
+        vault: destination.to,
         chainId: chain.chainId,
         endpoints: chain.rpc.endpoints,
         maxFeePerGas: config.maxFeePerGas,
@@ -1279,15 +1359,26 @@ async function cmdSweep(ctx: Context): Promise<void> {
         status.update(`<b>Sweep</b>\n\n${bar(done, total)}  signing ${done}/${total}`)
     );
 
+    const failed = result.outcomes.filter((o) => !o.accepted);
     await status.finish(
       [
-        `<b>Sweep complete</b>`,
+        result.accepted > 0
+          ? `<b>✅ Swept ${result.accepted} NFT(s)</b>`
+          : `<b>❌ Sweep failed</b>`,
         ``,
-        `${bar(result.accepted, result.dispatched)}  ${result.accepted}/${result.dispatched} accepted`,
-        result.rejected > 0 ? `${result.rejected} rejected` : ``,
-        `→ vault <code>${esc(short(config.vault))}</code>`,
+        `Sent to ${esc(destination.label)}`,
+        `<code>${esc(destination.to)}</code>`,
         ``,
-        `<i>ETH left in place — wallets stay armed.</i>`,
+        `${result.accepted} of ${result.dispatched} transfers accepted, from ${owners.length} wallet(s).`,
+        failed.length > 0
+          ? `\n<b>Did not move</b>\n` +
+            [...new Set(failed.map((o) => explainRejection(o.errors)))]
+              .slice(0, 3)
+              .map((r) => `  ${esc(r)}`)
+              .join("\n")
+          : ``,
+        ``,
+        `<i>ETH left in place — wallets stay armed for the next mint.</i>`,
       ]
         .filter(Boolean)
         .join("\n")

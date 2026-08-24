@@ -46,7 +46,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "generate", description: "Make more wallets" },
   { command: "import", description: "Import a private key or seed phrase" },
   { command: "autofire", description: "Let wallets buy without asking you first" },
-  { command: "sweep", description: "Move NFTs to your vault" },
+  { command: "sweep", description: "Collect your NFTs into one wallet" },
   { command: "drain", description: "Send leftover ETH back to your funding wallet" },
 
   // ── Minting by hand ──
