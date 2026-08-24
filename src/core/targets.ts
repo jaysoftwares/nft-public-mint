@@ -135,7 +135,10 @@ export function find(address: string): WatchTarget | undefined {
 export function add(
   address: string,
   tier: Tier,
-  mintMode: MintMode = "both",
+  // Free unless the operator says otherwise. A target added without an explicit
+  // answer must not start spending on its own — the standing instruction is
+  // free-only, and every caller that means "any mint" passes "both" and says so.
+  mintMode: MintMode = "free",
   label?: string,
   payer: PayerMode = "self"
 ): WatchTarget {

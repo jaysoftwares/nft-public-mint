@@ -103,6 +103,21 @@ export class NonceManager {
   private faults = new Map<string, FaultObservation>();
   /** Addresses whose fault has cleared every confirmation bar. */
   private confirmed = new Set<string>();
+  /**
+   * Wallets with something outstanding worth watching.
+   *
+   * Reconcile exists to catch two things — a transaction we sent that got
+   * dropped, and one that is wedged in the pool. Both require us to have sent
+   * something. A wallet the bot has never signed from cannot be in either
+   * state, so polling it is two RPC calls an hour spent proving nothing.
+   *
+   * That sounds academic and is not: with five hundred derived wallets across
+   * three chains this was 1.7 million calls a day, which is what actually
+   * consumed the provider quota. Membership is added by next() and retired by
+   * reconcile() the moment a wallet is observed settled, so the working set is
+   * normally empty.
+   */
+  private active = new Set<string>();
 
   constructor(readUrl: string, now: () => number = Date.now) {
     this.readUrl = readUrl;
@@ -140,6 +155,8 @@ export class NonceManager {
       throw new Error(`No primed nonce for ${address} — call prime() before signing.`);
     }
     this.local.set(address, current + 1);
+    // From here until it is seen settled, this wallet has something in flight.
+    this.active.add(address);
     return current;
   }
 
@@ -147,6 +164,26 @@ export class NonceManager {
   rollback(address: string): void {
     const current = this.local.get(address);
     if (current !== undefined && current > 0) this.local.set(address, current - 1);
+  }
+
+  /**
+   * Put a wallet back under observation without sending from it.
+   *
+   * Used once at startup: a transaction left in flight across a restart is
+   * invisible to next(), because the counter that recorded it did not survive.
+   * Marking the funded wallets covers that gap for one sweep, after which the
+   * settled ones retire themselves.
+   */
+  markActive(address: string): void {
+    if (this.local.has(address)) this.active.add(address);
+  }
+
+  /**
+   * The wallets reconcile should actually look at. Empty is the normal state
+   * and means the loop makes no requests at all.
+   */
+  activeAddresses(): Set<string> {
+    return new Set(this.active);
   }
 
   async reconcile(targets: NonceTarget[]): Promise<ReconcileReport> {
@@ -179,6 +216,9 @@ export class NonceManager {
         this.clearFault(target.address);
         // Chain moved ahead of us (a tx we didn't send, or a restart) — trust it.
         if (pending > local) this.local.set(target.address, pending);
+        // Nothing pending, nothing dropped, nothing to heal: stop watching it
+        // until it sends again. This is what keeps the reconcile set small.
+        if (latest === pending) this.active.delete(target.address);
         return;
       }
 

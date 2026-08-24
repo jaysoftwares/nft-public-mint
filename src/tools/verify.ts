@@ -310,6 +310,62 @@ async function main(): Promise<void> {
       queued.peek(ADDR) === 23,
       `counter is ${queued.peek(ADDR)}, expected 23`
     );
+
+    // ── what the reconciler is allowed to poll ──────────────────────────
+    //
+    // This loop was the provider bill. Every primed wallet was reconciled
+    // forever at two calls each — a hundred a cycle, three chains, every
+    // thirty seconds, which is 1.7 million requests a day against a store
+    // where one wallet had ever sent anything. A wallet that has not sent
+    // cannot have a dropped or a stuck transaction, so there is nothing for
+    // those calls to find.
+    section("the reconciler only watches wallets in flight");
+
+    const idle = new NonceManager(nodeUrl, () => clock);
+    await idle.prime(targetsToCheck);
+    check(
+      "priming a wallet does not put it under observation",
+      idle.activeAddresses().size === 0
+    );
+
+    idle.next(ADDR);
+    check("sending from it does", idle.activeAddresses().has(ADDR));
+
+    nonceState.latest = 30;
+    nonceState.pending = 30;
+    await idle.reconcile(targetsToCheck);
+    check(
+      "…and it is retired once the chain shows it settled",
+      idle.activeAddresses().size === 0
+    );
+
+    // The 49-of-50 case: copy-mint signs from every candidate and the node
+    // rejects the empty ones. Those must not be left under observation, or
+    // one busy drop re-creates the standing bill this change removed.
+    const rejected = new NonceManager(nodeUrl, () => clock);
+    await rejected.prime(targetsToCheck);
+    rejected.next(ADDR);
+    rejected.rollback(ADDR);
+    await rejected.reconcile(targetsToCheck);
+    check(
+      "a wallet whose send was rejected stops being watched",
+      rejected.activeAddresses().size === 0
+    );
+
+    // A restart loses the counter that recorded an in-flight transaction, so
+    // the funded wallets are swept once at startup to cover exactly that.
+    const restarted = new NonceManager(nodeUrl, () => clock);
+    await restarted.prime(targetsToCheck);
+    restarted.markActive(ADDR);
+    check("a restart can put a funded wallet back under observation", restarted.activeAddresses().has(ADDR));
+    check(
+      "…but never one it knows nothing about",
+      (restarted.markActive("0x" + "ab".repeat(20)), restarted.activeAddresses().size === 1)
+    );
+
+    nonceState.pending = 31; // one still in the pool
+    await restarted.reconcile(targetsToCheck);
+    check("…and an unsettled one stays under observation", restarted.activeAddresses().has(ADDR));
   } finally {
     await new Promise<void>((resolve) => nodeServer.close(() => resolve()));
   }
@@ -1292,6 +1348,79 @@ async function main(): Promise<void> {
   check("…and counted", jammedPool.stuck === all.length);
 
   check("the selector still decides membership", resolveForCopy("imported", all, ctx).matched < all.length);
+
+  // ── the funder never mints ────────────────────────────────────────────
+  //
+  // The one exclusion that survived. Arming and funding were dropped because
+  // they were preferences dressed as safety; this is neither — the funder is
+  // the wallet every other wallet is topped up from, so it is the only one
+  // reliably holding money, and "all" therefore reaches it first. On the live
+  // deployment it sent all fifty-six copy mints while five hundred derived
+  // wallets sat idle, and both gates that should have stopped it (a "funder"
+  // tag and autoFire: false) were the ones that had just been removed.
+  section("the funder is not a minting wallet");
+
+  const guarded = emptyContext(parseEther("0.0005"));
+  guarded.protectedAddresses = new Set([all[0].address.toLowerCase()]);
+  const guardedPool = resolveForCopy("all", all, guarded);
+  check(
+    "the funding wallet is kept out of the copy pool",
+    !guardedPool.selected.some((w) => w.address === all[0].address)
+  );
+  check("…and the exclusion is counted", guardedPool.excludedProtected === 1);
+  check("…while every other wallet is untouched", guardedPool.selected.length === all.length - 1);
+  check(
+    "…and naming it explicitly does not get round the rule",
+    resolveForCopy(all[0].address, all, guarded).selected.length === 0
+  );
+  check(
+    "…nor does the auto-fire pool disagree with the copy pool",
+    !resolveForAutoFire("all", all, guarded).selected.some((w) => w.address === all[0].address)
+  );
+  check(
+    "with no funder configured nothing is excluded",
+    resolveForCopy("all", all, emptyContext(parseEther("0.0005"))).excludedProtected === 0
+  );
+
+  // ── who gets tried first ──────────────────────────────────────────────
+  //
+  // A signal takes the first N of the pool, so order decides who mints. Live,
+  // the only wallets holding gas were the last ten in the store and were never
+  // reached; the fifty at the front had never been funded. Nothing is excluded
+  // here — an unread balance is not evidence of an empty wallet — but a wallet
+  // known to hold gas is asked before one known to be empty.
+  section("the funded wallets are tried first");
+
+  const ordering = emptyContext(parseEther("0.0005"));
+  all.forEach((w) => ordering.state.set(w.id, { lastKnownBalanceWei: 0n }));
+  const last = all[all.length - 1];
+  ordering.state.set(last.id, { lastKnownBalanceWei: parseEther("1") });
+  const ordered = resolveForCopy("all", all, ordering);
+  check("a wallet known to hold gas leads the queue", ordered.selected[0]?.id === last.id);
+  check("…and nothing is dropped for being empty", ordered.selected.length === all.length);
+
+  const mixedCtx = emptyContext(parseEther("0.0005"));
+  mixedCtx.state.set(all[0].id, { lastKnownBalanceWei: 0n });
+  const mixedOrder = resolveForCopy("all", all, mixedCtx);
+  check(
+    "an unread balance outranks a known-empty wallet",
+    mixedOrder.selected[mixedOrder.selected.length - 1]?.id === all[0].id
+  );
+  check(
+    "…and dust below the gas reservation counts as empty",
+    (() => {
+      const dusty = emptyContext(parseEther("0.0005"));
+      dusty.state.set(all[0].id, { lastKnownBalanceWei: parseEther("0.0001") });
+      const pool = resolveForCopy("all", all, dusty);
+      return pool.selected[pool.selected.length - 1]?.id === all[0].id;
+    })()
+  );
+  check(
+    "equal ranks keep store order",
+    resolveForCopy("all", all, emptyContext(parseEther("0.0005")))
+      .selected.map((w) => w.id)
+      .join() === all.map((w) => w.id).join()
+  );
 
   // ── pasted input ──────────────────────────────────────────────────────
   section("collection input");

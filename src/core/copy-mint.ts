@@ -253,6 +253,11 @@ export class CopyEngine {
       // short of gas has its transaction rejected by the node for nothing,
       // which is the same outcome as excluding it, reached without spending the
       // drop working out which wallets those are.
+      //
+      // Two things do still shape this pool, and neither costs a request: the
+      // funder and vault are removed outright, and the rest are ordered so
+      // wallets last seen holding gas are asked before wallets last seen empty.
+      // Order matters because only the first `walletLimit` of them are used.
       const ctx = this.deps.copyContext();
       const pool = resolveForCopy(this.deps.copy.walletSelector, this.deps.wallets(), ctx);
       // This target's own number when it has one, the tier's shared default
@@ -261,16 +266,25 @@ export class CopyEngine {
       const candidates = pool.selected.slice(0, walletLimit);
 
       if (candidates.length === 0) {
+        // "Nothing matched" and "the only match was your funder" have the same
+        // shape and completely different fixes, so they are never merged.
+        const onlyProtected = pool.matched === 0 && pool.excludedProtected > 0;
         skip(
           "No wallets to buy with",
           pool.total === 0
             ? "You have no wallets yet."
+            : onlyProtected
+              ? `The only wallet matching "${this.deps.copy.walletSelector}" is your funding ` +
+                `wallet, which is never allowed to mint — it is the float everything else ` +
+                `is topped up from.`
+              : pool.matched === 0
+                ? `None of your ${pool.total} wallets match "${this.deps.copy.walletSelector}".`
+                : `All ${pool.matched} matching wallets are behind a nonce gap and cannot send right now.`,
+          onlyProtected
+            ? "Send gas to your minting wallets under Wallets → Fund, then copy-mint has something to buy with."
             : pool.matched === 0
-              ? `None of your ${pool.total} wallets match "${this.deps.copy.walletSelector}".`
-              : `All ${pool.matched} matching wallets are behind a nonce gap and cannot send right now.`,
-          pool.matched === 0
-            ? "Change which wallets copy-mint buys with, under Copy-mint."
-            : "The reconciler clears nonce gaps on its own within a minute."
+              ? "Change which wallets copy-mint buys with, under Copy-mint."
+              : "The reconciler clears nonce gaps on its own within a minute."
         );
         return;
       }

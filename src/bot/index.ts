@@ -35,6 +35,7 @@ import { ensureUserFundingWallet } from "./user-wallet";
 import {
   resolve as resolveWallets,
   resolveForAutoFire,
+  withoutProtected,
   summarise,
   SelectorError,
 } from "../core/tags";
@@ -670,7 +671,10 @@ async function currentFindings(): Promise<Finding[]> {
       };
       try {
         const ctx = await session.tagContext(chain.key);
-        const matched = resolveWallets(selector, wallets, ctx);
+        // The funder is filtered out here for the same reason copy-mint filters
+        // it out: it cannot mint. Counting its balance would report a network as
+        // ready to buy when every wallet that is allowed to buy is empty.
+        const matched = withoutProtected(resolveWallets(selector, wallets, ctx), ctx);
         const fundedHere = matched.filter((w: ManagedWallet) => {
           const balance = ctx.state.get(w.id)?.balanceWei;
           return balance !== undefined && balance >= ctx.minFundedWei;
@@ -3348,9 +3352,11 @@ function notify(html: string): void {
 
 /** Nonce hygiene and the copy-mint watcher — both need a live session. */
 async function startBackground(): Promise<void> {
-  session.startReconcile(30_000, (message) => {
+  session.startReconcile(30_000, (message, level) => {
     console.log(`  ${message}`);
-    notify(`🔧 ${esc(message)}`);
+    // "log" is infrastructure detail: it belongs in journalctl, not in a chat
+    // window belonging to somebody who wants to know whether they got the NFT.
+    if (level === "report") notify(`🔧 ${esc(message)}`);
   });
 
   // Telegram I/O happens only after bytes are on the wire.

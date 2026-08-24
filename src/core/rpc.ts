@@ -147,8 +147,16 @@ export async function rpcBatch<T>(
     throw new RpcError(`HTTP ${res.status} from ${hostOf(url)} (non-JSON batch response)`);
   }
   if (!Array.isArray(parsed)) {
+    // A batch answered with a single object rather than an array. Usually a
+    // provider-level rejection — rate limit, credit exhaustion, or an expired
+    // endpoint — and those arrive without a JSON-RPC `error` member, which is
+    // how this used to degrade to a bare "Batch rejected by <host>" that said
+    // nothing about which of them it was. The HTTP status distinguishes them,
+    // so carry it.
     const single = parsed as unknown as JsonRpcResponse<T>;
-    throw new RpcError(single.error?.message ?? `Batch rejected by ${hostOf(url)}`);
+    throw new RpcError(
+      single.error?.message ?? `${hostOf(url)} rejected the batch (HTTP ${res.status})`
+    );
   }
 
   // Responses may come back in any order; id is the only reliable index.

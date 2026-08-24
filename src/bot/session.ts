@@ -10,7 +10,7 @@
 // given. Wallets are the same addresses everywhere, but their balances and
 // nonces are not, so anything derived from chain state is keyed by chain.
 
-import { HDNodeWallet, Wallet } from "ethers";
+import { HDNodeWallet, Wallet, ZeroAddress } from "ethers";
 import { ResolvedConfig } from "../core/config";
 import { UnlockedStore, ManagedWallet, unlock } from "../core/wallet-store";
 import { NonceManager } from "../core/nonce-manager";
@@ -43,7 +43,26 @@ export interface ChainContext {
   nonces: NonceManager;
 }
 
-export type ReconcileNotice = (message: string) => void;
+/**
+ * Where reconcile reports go.
+ *
+ * `level` decides whether a human is told. Anything the bot did to somebody's
+ * money is "report"; a provider that failed to answer is "log", because it is
+ * infrastructure noise the operator can neither act on nor interpret, and it
+ * arrives many times a day. A genuine outage is escalated to "report" once, by
+ * reconcileChain, after it has persisted.
+ */
+export type ReconcileNotice = (message: string, level: "report" | "log") => void;
+
+/**
+ * Consecutive failed cycles on one chain before the operator hears about it.
+ *
+ * Six cycles is three minutes at the default interval. Under that, a reconcile
+ * failure means one RPC request did not land and the next one will — the loop
+ * is idempotent and the following pass re-reads the same wallets, so nothing
+ * is lost by staying quiet.
+ */
+const RECONCILE_ALERT_AFTER = 6;
 
 export class Session {
   readonly config: ResolvedConfig;
@@ -63,6 +82,8 @@ export class Session {
   private codeCache = new Map<string, string[]>();
   /** Where the rolling reconcile got to on each chain. */
   private reconcileCursors = new Map<string, number>();
+  /** Chain key → consecutive failed reconcile cycles. Reset by the first success. */
+  private reconcileFailures = new Map<string, number>();
 
   /**
    * Runtime kill switch, seeded from the user's persisted config. Telegram
@@ -213,6 +234,25 @@ export class Session {
   }
 
   /**
+   * The wallets that hold the float, and so must never be spent automatically.
+   *
+   * The funder tops every other wallet up, which makes it the one address in
+   * the store that is reliably in funds — and therefore the one an unfiltered
+   * "all" selector reaches for first. On this deployment it sent every copy
+   * mint that has ever fired. The vault is the withdrawal destination and has
+   * no business signing a mint either.
+   *
+   * ZeroAddress is the unset default for both, and is never a real wallet.
+   */
+  private protectedAddresses(): Set<string> {
+    return new Set(
+      [this.config.funder, this.config.vault]
+        .filter((address) => address && address !== ZeroAddress)
+        .map((address) => address.toLowerCase())
+    );
+  }
+
+  /**
    * The context selectors resolve against, for one chain. `funded` means "can
    * cover the gas reservation here" — a wallet flush on Base is not funded on
    * Ethereum, and a selector must reflect that.
@@ -225,6 +265,7 @@ export class Session {
     const ctx: TagContext = {
       minFundedWei: gasReservation(this.config.gasLimit, this.config.maxFeePerGas),
       state: new Map(),
+      protectedAddresses: this.protectedAddresses(),
     };
     for (const wallet of this.wallets()) {
       ctx.state.set(wallet.id, {
@@ -252,6 +293,7 @@ export class Session {
     const ctx: TagContext = {
       minFundedWei: gasReservation(this.config.gasLimit, this.config.maxFeePerGas),
       state: new Map(),
+      protectedAddresses: this.protectedAddresses(),
     };
 
     const perChain = await Promise.all(
@@ -323,8 +365,18 @@ export class Session {
 
   private async reconcileChain(chain: ChainContext, notify: ReconcileNotice): Promise<void> {
     try {
+      // Only wallets with something outstanding. A wallet the bot has never
+      // sent from cannot have a dropped or a stuck transaction, so asking the
+      // chain about it twice a cycle answers a question nobody has.
+      //
+      // This is the whole of the provider bill. Reconciling every primed wallet
+      // was 100 wallets × 2 calls × 3 chains every 30 seconds — 1.7 million
+      // requests a day, against a store where sixty wallets held any balance at
+      // all and one had ever sent anything.
+      const active = chain.nonces.activeAddresses();
+      if (active.size === 0) return;
       const tracked = this.wallets()
-        .filter((w) => chain.nonces.has(w.address))
+        .filter((w) => active.has(w.address))
         .map((w) => ({ id: w.id, address: w.address }));
       if (tracked.length === 0) return;
 
@@ -344,6 +396,7 @@ export class Session {
       this.reconcileCursors.set(chain.key, (cursor + window.length) % tracked.length);
 
       const report = await chain.nonces.reconcile(window);
+      this.clearReconcileFailure(chain, notify);
       if (report.faults.length === 0) return;
 
       const results = await chain.nonces.heal(report.faults, {
@@ -358,14 +411,70 @@ export class Session {
       const replaced = results.filter((r) => r.action === "replaced").length;
       const failed = results.filter((r) => r.action === "failed");
 
+      // Plain English, because this reaches somebody who did not write it.
+      // "3 counter(s) rewound at 2× tip" is accurate and tells a non-engineer
+      // nothing about whether their money is safe, which is the only thing
+      // they are reading it to find out.
       const parts: string[] = [];
-      if (rewound > 0) parts.push(`${rewound} counter(s) rewound`);
-      if (replaced > 0) parts.push(`${replaced} stuck tx replaced at 2× tip`);
-      if (failed.length > 0) parts.push(`${failed.length} could not be healed`);
-      if (parts.length > 0) notify(`${chain.name} nonce reconcile: ${parts.join(", ")}.`);
-      for (const failure of failed) notify(`  ${failure.address} — ${failure.detail}`);
+      if (rewound > 0) {
+        parts.push(
+          `${rewound} wallet${rewound === 1 ? "" : "s"} had a transaction vanish from the ` +
+            `queue — put back in line, nothing lost`
+        );
+      }
+      if (replaced > 0) {
+        parts.push(
+          `${replaced} stuck transaction${replaced === 1 ? "" : "s"} re-sent at a higher fee`
+        );
+      }
+      if (failed.length > 0) {
+        parts.push(
+          `${failed.length} could not be sorted out automatically and may need a look`
+        );
+      }
+      if (parts.length > 0) notify(`${chain.name}: ${parts.join("; ")}.`, "report");
+      for (const failure of failed) notify(`  ${failure.address} — ${failure.detail}`, "report");
     } catch (err) {
-      notify(`${chain.name} nonce reconcile failed: ${(err as Error).message}`);
+      this.noteReconcileFailure(chain, (err as Error).message, notify);
+    }
+  }
+
+  /**
+   * A cycle failed. Count it, and tell the operator only once it has stopped
+   * looking like weather.
+   *
+   * The old behaviour sent every failure straight to Telegram, which produced a
+   * steady drip of "nonce reconcile failed: Batch rejected by
+   * spring-cosmological-meme.ethereum-mainnet.quiknode.pro" — a sentence with
+   * no action in it, naming a host the reader did not choose, about a loop they
+   * do not know exists. It is a provider hiccup, and the next cycle re-reads the
+   * same wallets, so a single one is genuinely not worth a message.
+   */
+  private noteReconcileFailure(
+    chain: ChainContext,
+    detail: string,
+    notify: ReconcileNotice
+  ): void {
+    const streak = (this.reconcileFailures.get(chain.key) ?? 0) + 1;
+    this.reconcileFailures.set(chain.key, streak);
+    notify(`${chain.name} nonce check failed (${streak}× in a row): ${detail}`, "log");
+
+    if (streak === RECONCILE_ALERT_AFTER) {
+      notify(
+        `${chain.name} is not answering. Your wallets and funds are untouched — the bot ` +
+          `simply cannot check them on this network right now, and it keeps retrying. ` +
+          `Minting on other networks is unaffected.`,
+        "report"
+      );
+    }
+  }
+
+  /** A cycle succeeded. Say so only if the operator was told it was broken. */
+  private clearReconcileFailure(chain: ChainContext, notify: ReconcileNotice): void {
+    const streak = this.reconcileFailures.get(chain.key) ?? 0;
+    this.reconcileFailures.set(chain.key, 0);
+    if (streak >= RECONCILE_ALERT_AFTER) {
+      notify(`${chain.name} is answering again. Wallet checks have resumed.`, "report");
     }
   }
 
@@ -485,6 +594,16 @@ export class Session {
     const ctx = await this.tagContext(chain.key, true);
     const pool = resolveForAutoFire(this.config.copy.walletSelector, this.wallets(), ctx);
     await this.primeNonces(pool.selected, chain.key);
+
+    // One sweep over the wallets that hold money, so a transaction left in
+    // flight by a restart is still seen and healed. next() cannot know about
+    // those — the counter that recorded them died with the old process. Each
+    // one retires itself on the first cycle that finds it settled, so this
+    // costs a single pass over the funded set rather than a standing bill.
+    for (const wallet of pool.selected) {
+      const balance = ctx.state.get(wallet.id)?.balanceWei;
+      if (balance !== undefined && balance > 0n) chain.nonces.markActive(wallet.address);
+    }
   }
 
   async retargetWatchers(): Promise<void> {
@@ -547,11 +666,20 @@ export class Session {
     const ctx: TagContext = {
       minFundedWei: gasReservation(this.config.gasLimit, this.config.maxFeePerGas),
       state: new Map(),
+      protectedAddresses: this.protectedAddresses(),
     };
+    // Whatever balances we already happen to hold, at whatever age. Read from
+    // the cache and never fetched: a copy signal has one block to work with,
+    // and five hundred balance reads do not fit in it.
+    const known = this.balanceCache.get(chain.key)?.balances;
     for (const wallet of this.wallets()) {
       // No balanceWei: absent means unknown, so `funded`/`unfunded` simply do
-      // not apply rather than resolving to a guess.
-      ctx.state.set(wallet.id, { nonceGap: stuck.has(wallet.address) });
+      // not apply rather than resolving to a guess. lastKnownBalanceWei is a
+      // separate field precisely so that stays true — it only sorts the queue.
+      ctx.state.set(wallet.id, {
+        nonceGap: stuck.has(wallet.address),
+        lastKnownBalanceWei: known?.get(wallet.address),
+      });
     }
     return ctx;
   }

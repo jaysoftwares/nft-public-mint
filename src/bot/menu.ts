@@ -467,23 +467,26 @@ export function tierKeyboard(): InlineKeyboard {
 /**
  * Which of their mints to follow.
  *
- * Order and wording both changed after this setting silently disabled the
- * product. "Free only" sat at the top, reads like the cautious choice, and was
- * picked for every watched wallet — at which point the bot ignored every drop
- * that cost money, which is nearly all of them. Nineteen wallets were followed
- * for days and bought nothing, and the only trace was a skip line in a card
- * that rotates every ten minutes.
+ * This setting has now been wrong in both directions, so the wording carries
+ * the history. "Free only" led here once, read like the cautious choice, was
+ * picked for all nineteen wallets, and silently disabled the product — every
+ * drop that cost money went past unbought. The fix was to lead with "any mint",
+ * which then did the opposite: the bot spent real ETH on drops nobody had
+ * looked at.
  *
- * So the useful answer is first and labelled as the one to take, and the two
- * narrowing filters say what they will cost you rather than just what they are.
- * The price ceiling is the real protection against overspending; this setting
- * was never that, and presenting it as a safety choice was the mistake.
+ * Free-only leads again because that is the operator's standing instruction,
+ * but it is no longer presented as the safe default with the consequence
+ * hidden. Each option says what it will cost or miss, and every skip now lands
+ * in the journal behind /why, so "it is watching and buying nothing" is a
+ * question with an answer rather than a silence.
+ *
+ * The price ceiling, not this setting, is what actually bounds spending.
  */
 export function mintModeKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text("✅ Any mint they make  ·  recommended", "pm:both")
+    .text("✅ Only free mints  ·  current policy", "pm:free")
     .row()
-    .text("🆓 Only free ones (ignores paid drops)", "pm:free")
+    .text("💳 Any mint they make (will spend, up to your price cap)", "pm:both")
     .row()
     .text("💳 Only paid ones (ignores free drops)", "pm:paid")
     .row()

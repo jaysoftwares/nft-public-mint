@@ -29,12 +29,33 @@ export interface WalletState {
   balanceWei?: bigint;
   /** Local nonce has run ahead of chain — this wallet cannot land a tx. */
   nonceGap?: boolean;
+  /**
+   * The last balance we happen to have for this wallet, however stale.
+   *
+   * Ordering only. It is deliberately NOT `balanceWei`: that one is absent on
+   * the copy path so `funded`/`unfunded` do not resolve against a guess, and
+   * that distinction is load-bearing. This field never gates anything — it only
+   * decides who gets tried first when a signal arrives and there is no time to
+   * ask the chain who is in funds.
+   */
+  lastKnownBalanceWei?: bigint;
 }
 
 export interface TagContext {
   /** Below this balance a wallet counts as unfunded and is skipped by default. */
   minFundedWei: bigint;
   state: Map<string, WalletState>;
+  /**
+   * Addresses that hold the float and must never be spent by an automatic
+   * mint — the configured funder and vault, lowercased.
+   *
+   * These are roles, not preferences. The funder is the wallet everything else
+   * is topped up from, so it is the one wallet that reliably has money in it,
+   * which is exactly why an unfiltered "all" selector picks it first and drains
+   * it. It happened: the funder sent every copy-mint this deployment has ever
+   * made while five hundred derived wallets sat empty and idle.
+   */
+  protectedAddresses?: Set<string>;
 }
 
 export class SelectorError extends Error {
@@ -204,15 +225,73 @@ export function resolveForCopy(
   selector: string,
   wallets: ManagedWallet[],
   ctx: TagContext
-): { selected: ManagedWallet[]; matched: number; stuck: number; total: number } {
+): {
+  selected: ManagedWallet[];
+  matched: number;
+  stuck: number;
+  total: number;
+  excludedProtected: number;
+} {
   const matched = resolve(selector, wallets, ctx);
-  const selected = matched.filter((w) => !ctx.state.get(w.id)?.nonceGap);
+  // The funder and the vault come out before anything else looks at this pool.
+  // Every other exclusion here is a preference the operator can overrule from
+  // the keyboard; this one is structural, so it is applied first and is not
+  // reachable by widening the selector to "all".
+  const spendable = withoutProtected(matched, ctx);
+  const selected = byLikelihoodOfLanding(
+    spendable.filter((w) => !ctx.state.get(w.id)?.nonceGap),
+    ctx
+  );
   return {
     selected,
-    matched: matched.length,
-    stuck: matched.length - selected.length,
+    matched: spendable.length,
+    stuck: spendable.length - selected.length,
     total: wallets.length,
+    excludedProtected: matched.length - spendable.length,
   };
+}
+
+/**
+ * Put the wallets most likely to land a transaction at the front.
+ *
+ * A copy signal takes the first N of this list, where N is the tier's wallet
+ * limit — so order is not cosmetic, it decides who actually mints. Store order
+ * put d:1…d:50 at the front, none of which had ever been funded, while the ten
+ * wallets holding all the gas sat at the end of the list and were never
+ * reached. The only reason anything minted at all was that the funder sits at
+ * index zero, which is the bug this ordering exists to make unnecessary.
+ *
+ * Nothing is excluded here. A wallet whose balance was never read ranks above
+ * one known to be empty but below one known to be in funds, because "unknown"
+ * is not evidence either way — the deliberate choice not to gate on funding
+ * stands, and this only changes who is asked first.
+ */
+function byLikelihoodOfLanding(wallets: ManagedWallet[], ctx: TagContext): ManagedWallet[] {
+  const rank = (w: ManagedWallet): number => {
+    const known = ctx.state.get(w.id)?.lastKnownBalanceWei;
+    if (known === undefined) return 1;
+    return known >= ctx.minFundedWei && known > 0n ? 0 : 2;
+  };
+  // Stable: equal ranks keep store order, so a funded set stays in a
+  // predictable, reproducible sequence from one signal to the next.
+  return wallets
+    .map((wallet, index) => ({ wallet, index, rank: rank(wallet) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((entry) => entry.wallet);
+}
+
+/**
+ * Drop the wallets whose job is to hold money, not to spend it.
+ *
+ * Exported because anything that *reports* on the minting pool has to agree
+ * with what actually mints. Counting the funder as a funded, ready wallet is
+ * how "you have money on this network" and "nothing can buy anything" end up
+ * on the same screen.
+ */
+export function withoutProtected(wallets: ManagedWallet[], ctx: TagContext): ManagedWallet[] {
+  const guarded = ctx.protectedAddresses;
+  if (!guarded || guarded.size === 0) return wallets;
+  return wallets.filter((w) => !guarded.has(w.address.toLowerCase()));
 }
 
 export function resolveForAutoFire(
@@ -220,7 +299,10 @@ export function resolveForAutoFire(
   wallets: ManagedWallet[],
   ctx: TagContext
 ): AutoFirePool {
-  const matched = resolve(selector, wallets, ctx);
+  // Same structural exclusion as resolveForCopy — the two must agree about who
+  // is allowed to spend, or the wallets that get primed are not the wallets
+  // that fire.
+  const matched = withoutProtected(resolve(selector, wallets, ctx), ctx);
   const excludedManual = matched.filter((w) => !w.autoFire).length;
   const afterAutoFire = matched.filter((w) => w.autoFire);
   const excludedStuck = afterAutoFire.filter((w) => ctx.state.get(w.id)?.nonceGap).length;
