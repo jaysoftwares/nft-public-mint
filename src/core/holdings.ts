@@ -150,12 +150,32 @@ export async function discoverHoldings(
   return holdings;
 }
 
-/** Providers reject on response *size*, not block count — so the usable range
- *  depends on how busy those blocks were, not on a fixed number. */
+/**
+ * Providers reject on response *size*, not block count — so the usable range
+ * depends on how busy those blocks were, not on a fixed number.
+ *
+ * Except when they also cap the range outright: QuickNode's Robinhood endpoint
+ * answers "eth_getLogs is limited to a 10,000 range", which matched none of
+ * these patterns and so was thrown instead of being split. A sweep that asked
+ * for one block too many failed outright rather than halving and succeeding.
+ */
 function isTooLarge(message: string): boolean {
-  return /too large|too many results|response size|query returned more than|limit exceeded/i.test(
+  return /too large|too many results|response size|query returned more than|limit exceeded|limited to a [\d,]+ range|exceeds? the max/i.test(
     message
   );
+}
+
+/**
+ * QuickNode occasionally answers HTTP 200 with neither `result` nor `error`,
+ * which rpc.ts surfaces as "Empty result for …". It is transient and the same
+ * request succeeds immediately afterwards.
+ *
+ * Worth retrying here specifically because a sweep is not on any critical path
+ * and the alternative is telling somebody their NFTs could not be found when
+ * the truth is one packet went missing. Seen live while tracing this module.
+ */
+function isTransient(message: string): boolean {
+  return /empty result|timed out|timeout|socket|ECONNRESET|fetch failed|502|503|504/i.test(message);
 }
 
 /** keccak("ownerOf(uint256)")[0..4] */
@@ -176,12 +196,25 @@ export interface MintScanOptions {
   /**
    * How far past the recorded block to look.
    *
-   * The ledger stores the block of the *signal*, and our own transaction lands
-   * a block or two later — more if the network was slow. Robinhood produces
-   * roughly seven blocks a second, so 2000 blocks is about five minutes of
-   * chain: far past any mint that was going to land, and still one request.
+   * A copy-mint records the block of the *signal*, and our own transaction
+   * lands a block or two later — more if the network was slow. Robinhood makes
+   * roughly seven blocks a second, so 8000 blocks is about twenty minutes of
+   * chain: far past any mint that was going to land.
    */
-  window?: number;
+  forward?: number;
+  /**
+   * How far *before* the recorded block to look.
+   *
+   * Not symmetry for its own sake — the two kinds of mint record the block at
+   * opposite ends of the work. A copy-mint stores the signal's block, before
+   * ours lands. A manual mint calls currentBlock() *after* dispatching, so its
+   * recorded block is already past the mint. Measured on this deployment: a
+   * manual mint sat nine blocks behind its recorded block, and a forward-only
+   * window missed all ten wallets involved while finding every copy-mint
+   * correctly — the kind of gap that looks like "the sweep works" until
+   * somebody counts.
+   */
+  back?: number;
   onProgress?: (done: number, total: number) => void;
 }
 
@@ -208,7 +241,10 @@ export async function discoverMintedHoldings(
   opts: MintScanOptions = {}
 ): Promise<Holding[]> {
   if (sites.length === 0) return [];
-  const window = opts.window ?? 2000;
+  // Kept under the 10,000-block ceiling QuickNode enforces, so one site is
+  // still one request.
+  const forward = opts.forward ?? 8000;
+  const back = opts.back ?? 1000;
 
   // contract|tokenId -> the wallets that might hold it.
   const candidates = new Map<string, { contract: string; tokenId: string }>();
@@ -216,8 +252,8 @@ export async function discoverMintedHoldings(
 
   for (const site of sites) {
     const logs = await getLogs(readUrl, {
-      fromBlock: site.block,
-      toBlock: site.block + window,
+      fromBlock: Math.max(0, site.block - back),
+      toBlock: site.block + forward,
       contracts: [site.contract],
       // Only the wallets this contract was minted into — usually one, so the
       // topic filter stays small however many wallets the store has.
@@ -311,7 +347,7 @@ async function getLogs(
     return filter;
   };
 
-  const fetchRange = async (from: number, to: number): Promise<RawLog[]> => {
+  const fetchRange = async (from: number, to: number, attempt = 0): Promise<RawLog[]> => {
     try {
       return await rpcCall<RawLog[]>(readUrl, "eth_getLogs", [build(from, to)], 30_000);
     } catch (err) {
@@ -323,6 +359,13 @@ async function getLogs(
           fetchRange(mid + 1, to),
         ]);
         return [...left, ...right];
+      }
+      // Bounded, and only for the failures that pass on their own. A wrong
+      // filter or a dead endpoint must still fail on the first attempt rather
+      // than three times as slowly.
+      if (isTransient(message) && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        return fetchRange(from, to, attempt + 1);
       }
       throw new Error(`eth_getLogs failed for blocks ${from}-${to}: ${message}`);
     }

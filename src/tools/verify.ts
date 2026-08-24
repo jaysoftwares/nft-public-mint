@@ -2380,7 +2380,7 @@ async function main(): Promise<void> {
     const found = await discoverMintedHoldings(
       nftUrl,
       [{ contract: SWEEP_NFT, block: 42_947_362, owners }],
-      { window: 2000 }
+      { forward: 8000, back: 1000 }
     );
 
     check("a mint is found from the block the ledger recorded", found.length > 0);
@@ -2406,9 +2406,34 @@ async function main(): Promise<void> {
     // The point of the rewrite: one request per recorded mint, not thousands.
     check("one recorded mint costs one log query", getLogsCalls === 1, `${getLogsCalls} calls`);
     check(
-      "…and looks only just past the recorded block",
-      scanned[0][1] - scanned[0][0] === 2000,
+      "…and looks a little either side of the recorded block",
+      scanned[0][1] - scanned[0][0] === 9000,
       `scanned ${scanned[0][0]}-${scanned[0][1]}`
+    );
+
+    // A manual mint records its block *after* dispatching, so the mint sits
+    // behind the recorded number. Live, one sat nine blocks back and a
+    // forward-only window lost all ten wallets involved while every copy-mint
+    // was found correctly — which reads as a working sweep until someone counts.
+    scanned.length = 0;
+    await discoverMintedHoldings(
+      nftUrl,
+      [{ contract: SWEEP_NFT, block: 43_126_140, owners }],
+      { forward: 8000, back: 1000 }
+    );
+    check(
+      "the scan starts before the recorded block",
+      scanned[0][0] < 43_126_140,
+      `started at ${scanned[0][0]}`
+    );
+    check(
+      "…far enough back to catch a manual mint",
+      43_126_140 - scanned[0][0] >= 100,
+      `only ${43_126_140 - scanned[0][0]} blocks`
+    );
+    check(
+      "…and the whole span stays inside a 10,000-block provider cap",
+      scanned[0][1] - scanned[0][0] <= 10_000
     );
 
     // ownerOf is what makes the result current rather than merely historical.
