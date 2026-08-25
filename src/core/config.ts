@@ -127,6 +127,26 @@ export function chainOverrideFrom(parts: string[]): string | undefined {
   return value && value.trim().length > 0 ? value.trim().toLowerCase() : undefined;
 }
 
+/**
+ * Drop `on <chain>` and `to <address>` from an argument list.
+ *
+ * Both are read by name elsewhere — the chain by chainFor, the destination by
+ * sweepDestination — and whatever is left is positional. Removing only one of
+ * them left the other's keyword sitting in the contract slot, so
+ * `/sweep all on robinhood` tried to look up a collection called "on".
+ */
+export function withoutKeywordPairs(parts: string[]): string[] {
+  const drop = new Set<number>();
+  parts.forEach((word, i) => {
+    const key = word.toLowerCase();
+    if (key === "on" || key === "to") {
+      drop.add(i);
+      if (i + 1 < parts.length) drop.add(i + 1);
+    }
+  });
+  return parts.filter((_, i) => !drop.has(i));
+}
+
 export const DEFAULT_CONFIG: BotConfig = {
   chain: "base",
   // Setup sentinel. The Telegram flow refuses wallet creation until each user

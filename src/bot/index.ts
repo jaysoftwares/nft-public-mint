@@ -16,6 +16,7 @@ import {
   writeConfigIfMissing,
   updateUserSettings,
   chainOverrideFrom,
+  withoutKeywordPairs,
   BotConfig,
   ResolvedConfig,
   ConfigError,
@@ -1250,13 +1251,7 @@ function sweepDestination(ctx: Context): { to: string; label: string } | { error
 }
 
 async function cmdSweep(ctx: Context): Promise<void> {
-  // "to 0x…" is consumed by sweepDestination, so it must not be read as the
-  // contract argument.
-  const words = args(ctx).filter((w, i, a) => {
-    const at = a.findIndex((x) => x.toLowerCase() === "to");
-    return at === -1 || (i !== at && i !== at + 1);
-  });
-  const [selector = "all", contractArg] = words;
+  const [selector = "all", contractArg] = withoutKeywordPairs(args(ctx));
 
   const destination = sweepDestination(ctx);
   if ("error" in destination) {
@@ -3543,6 +3538,91 @@ async function askChain(ctx: Context, flow: Flow, title: string): Promise<void> 
   );
 }
 
+/**
+ * Which chain to sweep, labelled with what is actually there.
+ *
+ * Not askChain: that one shows the funder's ETH, which says nothing about
+ * where the NFTs are. The ledger knows how many mints landed on each chain,
+ * and that is the number that decides which button to press — on this
+ * deployment every NFT is on Robinhood while the configured chain is Base,
+ * so a picker without these counts points at the wrong one.
+ */
+async function askSweepChain(ctx: Context, flow: Flow): Promise<void> {
+  flow.step = "chain";
+
+  const ledger = ledgerEntries();
+  const rows = session.availableChains.map((chain) => {
+    const mints = ledger.filter(
+      (e) => e.kind === "mint" && e.chainId === chain.chainId && e.contract
+    );
+    const collections = new Set(mints.map((e) => e.contract!.toLowerCase())).size;
+    return {
+      key: chain.key,
+      name: chain.name,
+      balanceLabel:
+        collections === 0
+          ? "no mints recorded"
+          : `${collections} collection${collections === 1 ? "" : "s"}`,
+    };
+  });
+
+  await ctx.reply(
+    [
+      `<b>Sweep NFTs</b>`,
+      ``,
+      `Which network are the NFTs on?`,
+      ``,
+      `<i>Counts are collections this bot minted there.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: chainKeyboard(rows) }
+  );
+}
+
+/**
+ * Where the NFTs should end up.
+ *
+ * Offers the vault and the wallets that actually hold something on the chosen
+ * chain, because "collect everything into one wallet" usually means one of
+ * your own. Any other address can still be typed.
+ */
+async function askSweepDestination(ctx: Context, flow: Flow): Promise<void> {
+  flow.step = "address";
+  const chain = session.chain(flow.chain);
+
+  // Wallets the ledger says minted on this chain — the plausible destinations,
+  // and the ones somebody is most likely to want everything gathered into.
+  const minted = new Set(
+    ledgerEntries()
+      .filter((e) => e.kind === "mint" && e.chainId === chain.chainId)
+      .flatMap((e) => e.walletIds)
+  );
+  const candidates = session.wallets().filter((w) => minted.has(w.id));
+
+  const keyboard = new InlineKeyboard();
+  if (config.vault && config.vault !== ZeroAddress) {
+    keyboard.text(`🏦 Vault — ${short(config.vault)}`, `sd:${config.vault}`).row();
+  }
+  for (const wallet of candidates.slice(0, 8)) {
+    keyboard.text(`${wallet.id} — ${short(wallet.address)}`, `sd:${wallet.address}`).row();
+  }
+  keyboard.text("✕ Cancel", "x");
+
+  await ctx.reply(
+    [
+      `<b>Sweep NFTs</b>  ·  ${esc(chain.name)}`,
+      ``,
+      `Which wallet should they all go to?`,
+      ``,
+      candidates.length > 0
+        ? `<i>Wallets below are yours, and hold NFTs on this network.</i>`
+        : `<i>No wallets here have minted anything yet.</i>`,
+      ``,
+      `Or send any address in your next message.`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: keyboard }
+  );
+}
+
 /** Move a flow to its next step, asking for whatever is still missing. */
 async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
   const label =
@@ -3553,6 +3633,35 @@ async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
   // chain is known.
   if ((flow.kind === "fund" || flow.kind === "drain") && !flow.chain) {
     return askChain(ctx, flow, flow.kind === "fund" ? "Fund wallets" : "Reclaim ETH");
+  }
+
+  // Sweep asks two things, in the order they constrain each other: which chain
+  // the NFTs are on, then which wallet they should end up in.
+  if (flow.kind === "sweep") {
+    if (!flow.chain) return askSweepChain(ctx, flow);
+    if (!flow.address) return askSweepDestination(ctx, flow);
+
+    flow.step = "ready";
+    const destination = session
+      .wallets()
+      .find((w) => w.address.toLowerCase() === flow.address!.toLowerCase());
+    await ctx.reply(
+      [
+        `<b>Sweep</b>  ·  ${esc(session.chain(flow.chain).name)}`,
+        ``,
+        `Move every NFT found in your wallets to:`,
+        `<code>${esc(flow.address)}</code>`,
+        destination
+          ? `<i>your own wallet ${esc(destination.id)}</i>`
+          : flow.address.toLowerCase() === config.vault.toLowerCase()
+            ? `<i>your configured vault</i>`
+            : `<i>⚠️ not one of your wallets — check this address carefully</i>`,
+        ``,
+        `<i>ETH is left in place so wallets stay armed.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: simpleConfirm("Sweep") }
+    );
+    return;
   }
 
   // Draining has nothing else to collect — the chain was the missing piece.
@@ -3677,7 +3786,11 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
         cmdFund
       );
     case "sweep":
-      return runWithArgs(ctx, ["all"], cmdSweep);
+      return runWithArgs(
+        ctx,
+        ["all", ...(flow.chain ? ["on", flow.chain] : []), ...(flow.address ? ["to", flow.address] : [])],
+        cmdSweep
+      );
     case "drain":
       return runWithArgs(
         ctx,
@@ -3963,17 +4076,12 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "i": {
       const kind = payload as Flow["kind"];
-      const flow = startFlow(chatId, kind, kind === "sweep" ? "ready" : "contract");
-      if (kind === "sweep") {
-        await ctx.reply(
-          `<b>Sweep</b>\n\nMove every NFT found in your wallets to the vault:\n<code>${esc(config.vault)}</code>\n\n<i>ETH is left in place so wallets stay armed.</i>`,
-          { parse_mode: "HTML", reply_markup: simpleConfirm("Sweep") }
-        );
-        return;
-      }
-      // Both move money and neither has a contract to infer a chain from, so
-      // both start by asking which one.
-      if (kind === "drain" || kind === "fund") {
+      const flow = startFlow(chatId, kind, "contract");
+      // Sweep, fund and drain carry no contract, so none of them can work out
+      // which chain they mean. Sweep used to skip straight to a confirmation
+      // and then fail inside the command with "this command needs a chain —
+      // or run it from the menu, which asks", from the menu, which did not ask.
+      if (kind === "sweep" || kind === "drain" || kind === "fund") {
         return advanceFlow(ctx, flow);
       }
       if (kind === "watch") {
@@ -4009,6 +4117,21 @@ async function onCallback(ctx: Context): Promise<void> {
         flow.chain = session.chain(payload).key;
       } catch (err) {
         await fail(ctx, err);
+        return;
+      }
+      return advanceFlow(ctx, flow);
+    }
+
+    case "sd": {
+      const flow = getFlow(chatId);
+      if (!flow) {
+        await ctx.reply("That selection expired — start again from the menu.");
+        return;
+      }
+      try {
+        flow.address = getAddress(payload);
+      } catch {
+        await ctx.reply("That destination is not a valid address.");
         return;
       }
       return advanceFlow(ctx, flow);
@@ -4149,6 +4272,19 @@ async function onText(ctx: Context): Promise<void> {
       { parse_mode: "HTML", reply_markup: destinationConfirm(flow.address, !isReady()) }
     );
     return;
+  }
+
+  // A sweep destination typed by hand rather than picked off the keyboard.
+  // Everything the buttons offer is already known-good, so this is the only
+  // path that can name an address outside the wallet set — and the confirmation
+  // advanceFlow builds says so in as many words before anything moves.
+  if (flow.kind === "sweep" && flow.step === "address") {
+    if (!isAddress(text)) {
+      await ctx.reply("That doesn't look like an address. Send a 0x… address, or tap Cancel.");
+      return;
+    }
+    flow.address = getAddress(text);
+    return advanceFlow(ctx, flow);
   }
 
   // A wallet to mirror is an address and nothing else — a collection link here

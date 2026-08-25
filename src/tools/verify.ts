@@ -68,6 +68,7 @@ import {
   writeDefaultConfig,
   updateUserSettings,
   chainOverrideFrom,
+  withoutKeywordPairs,
   parseCapAmount,
   ConfigError,
 } from "../core/config";
@@ -2294,6 +2295,49 @@ async function main(): Promise<void> {
   check(
     "a name cannot smuggle newlines into the report",
     decodeStringReturn(encodeString("Evil\n<b>Minted</b>")) === "Evil <b>Minted</b>"
+  );
+
+  // ── how a sweep is told what to do ────────────────────────────────────
+  //
+  // The Sweep button passed only ["all"], so chainFor found no chain and threw
+  // "this command needs a chain — or run it from the menu, which asks", from
+  // the menu, which did not ask. The button was unusable, and the wallet
+  // holding every NFT could not sweep. The flow now asks for both, and both
+  // reach the command as keyword pairs, so this parser decides what they mean.
+  section("sweep arguments");
+
+  check(
+    "a plain selector is left alone",
+    withoutKeywordPairs(["all"]).join(" ") === "all"
+  );
+  check(
+    "the chain keyword and its value are removed",
+    withoutKeywordPairs(["all", "on", "robinhood"]).join(" ") === "all"
+  );
+  check(
+    "…so the chain is never mistaken for a contract",
+    withoutKeywordPairs(["all", "on", "robinhood"])[1] === undefined
+  );
+  check(
+    "the destination keyword and its value are removed",
+    withoutKeywordPairs(["all", "to", VECTORS[0]]).join(" ") === "all"
+  );
+  check(
+    "both together still leave the selector",
+    withoutKeywordPairs(["all", "on", "robinhood", "to", VECTORS[0]]).join(" ") === "all"
+  );
+  check(
+    "a contract survives alongside both",
+    withoutKeywordPairs(["funded", "0xabc", "on", "base", "to", VECTORS[0]]).join(" ") ===
+      "funded 0xabc"
+  );
+  check(
+    "the chain is still readable after stripping",
+    chainOverrideFrom(["all", "on", "robinhood", "to", VECTORS[0]]) === "robinhood"
+  );
+  check(
+    "a trailing keyword with no value does not eat a real argument",
+    withoutKeywordPairs(["all", "on"]).join(" ") === "all"
   );
 
   // ── finding what we hold, and moving it ───────────────────────────────
