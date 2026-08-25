@@ -386,6 +386,15 @@ export interface NftSweepDeps {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
   nonceFor(address: string): number;
+  /**
+   * Called as each transfer settles, so a long sweep can be watched.
+   *
+   * Signing progress alone is misleading: it finishes in a second or two and
+   * then nothing happens on screen while every transfer is actually in flight.
+   * On a 279-token sweep that is the whole wait, spent looking at a card
+   * claiming to be done.
+   */
+  onSettled?(outcome: DispatchOutcome, done: number, total: number): void;
 }
 
 export interface NftSweepResult {
@@ -440,7 +449,9 @@ export async function sweepNfts(
     onProgress?.(i + 1, holdings.length);
   }
 
-  const report = await dispatchAll(prepared, deps.endpoints);
+  const report = await dispatchAll(prepared, deps.endpoints, {
+    onSettled: deps.onSettled,
+  });
   return {
     dispatched: prepared.length,
     accepted: report.accepted,

@@ -51,6 +51,7 @@ import {
 } from "../core/funding";
 import { discoverMintedHoldings, sweepNfts, MintSite } from "../core/holdings";
 import { explainRejection } from "../core/dispatcher";
+import { collectionName } from "../core/collection-name";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
 import { entries as ledgerEntries, spentSince } from "../core/ledger";
 import { collectDashboard, ChainReading } from "../core/dashboard";
@@ -1336,8 +1337,26 @@ async function cmdSweep(ctx: Context): Promise<void> {
       chain.key
     );
     status.update(
-      `<b>Sweep</b>\n\nfound ${toMove.length} NFT(s) in ${owners.length} wallet(s) — signing…`
+      `<b>Sweep</b>\n\nfound ${toMove.length} NFT(s) in ${owners.length} wallet(s) — reading names…`
     );
+
+    // Names once per collection, not once per token — cached, and 279 tokens
+    // are usually fewer than sixty collections. Worth the few seconds: "moved
+    // 40 of 279" says nothing about what is actually moving.
+    const names = new Map<string, string>();
+    for (const contract of new Set(toMove.map((h) => h.contract))) {
+      const name = await collectionName(chain.rpc.readUrl, contract).catch(() => undefined);
+      if (name) names.set(contract.toLowerCase(), name);
+    }
+    const label = (contract: string): string =>
+      names.get(contract.toLowerCase()) ?? short(contract);
+
+    // Which collection each transfer belongs to, keyed the way dispatch ids are
+    // built in sweepNfts ("<walletId>#<tokenId>").
+    const collectionFor = new Map(toMove.map((h) => [`${h.ownerId}#${h.tokenId}`, h.contract]));
+
+    const moved = new Map<string, number>();
+    let settled = 0;
 
     const result = await sweepNfts(
       toMove,
@@ -1349,27 +1368,71 @@ async function cmdSweep(ctx: Context): Promise<void> {
         maxFeePerGas: config.maxFeePerGas,
         maxPriorityFeePerGas: config.maxPriorityFeePerGas,
         nonceFor: (a: string) => session.nonceFor(a, chain.key),
+        // Every tenth transfer, and always the last one. The card edits in
+        // place so this never fills the chat, and a batch of ten is often
+        // enough to add a new collection to the list — one per transfer would
+        // be the same picture redrawn 279 times.
+        onSettled: (outcome, done, total) => {
+          settled = done;
+          if (outcome.accepted) {
+            const contract = collectionFor.get(outcome.id);
+            if (contract) {
+              const key = label(contract);
+              moved.set(key, (moved.get(key) ?? 0) + 1);
+            }
+          }
+          if (done % 10 !== 0 && done !== total) return;
+          status.update(
+            [
+              `<b>Sweeping ${total} NFT(s)</b>`,
+              ``,
+              `${bar(done, total)}  ${done} of ${total} sent`,
+              ``,
+              ...[...moved.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10)
+                .map(([name, count]) => `  ✅ ${esc(name)} × ${count}`),
+              moved.size > 10 ? `  …and ${moved.size - 10} more collection(s)` : ``,
+            ]
+              .filter(Boolean)
+              .join("\n")
+          );
+        },
       },
       (done, total) =>
-        status.update(`<b>Sweep</b>\n\n${bar(done, total)}  signing ${done}/${total}`)
+        status.update(`<b>Sweep</b>\n\n${bar(done, total)}  preparing ${done}/${total}`)
     );
 
     const failed = result.outcomes.filter((o) => !o.accepted);
+    // Failures grouped by cause the same way the mint report does it, so the
+    // reason arrives attached to the collections it stopped.
+    const byReason = new Map<string, number>();
+    for (const outcome of failed) {
+      const reason = explainRejection(outcome.errors);
+      byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    }
+
     await status.finish(
       [
         result.accepted > 0
           ? `<b>✅ Swept ${result.accepted} NFT(s)</b>`
-          : `<b>❌ Sweep failed</b>`,
+          : `<b>❌ Nothing could be moved</b>`,
         ``,
         `Sent to ${esc(destination.label)}`,
         `<code>${esc(destination.to)}</code>`,
         ``,
-        `${result.accepted} of ${result.dispatched} transfers accepted, from ${owners.length} wallet(s).`,
-        failed.length > 0
+        result.accepted > 0 ? `<b>What moved</b>` : ``,
+        ...[...moved.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 20)
+          .map(([name, count]) => `  ${esc(name)} × ${count}`),
+        moved.size > 20 ? `  …and ${moved.size - 20} more collection(s)` : ``,
+        byReason.size > 0
           ? `\n<b>Did not move</b>\n` +
-            [...new Set(failed.map((o) => explainRejection(o.errors)))]
+            [...byReason.entries()]
+              .sort((a, b) => b[1] - a[1])
               .slice(0, 3)
-              .map((r) => `  ${esc(r)}`)
+              .map(([reason, count]) => `  ${esc(reason)} — ${count}`)
               .join("\n")
           : ``,
         ``,

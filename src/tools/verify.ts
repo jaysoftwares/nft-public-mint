@@ -85,6 +85,7 @@ import {
   discoverMintedHoldings,
   confirmOwnership,
   encodeTransferFrom,
+  sweepNfts,
   TRANSFER_TOPIC,
 } from "../core/holdings";
 import type { CopyResult } from "../core/copy-mint";
@@ -2406,6 +2407,9 @@ async function main(): Promise<void> {
             ? { jsonrpc: "2.0", id: entry.id, result: padTopic(owner) }
             : { jsonrpc: "2.0", id: entry.id, error: { message: "execution reverted" } };
         }
+        if (entry.method === "eth_sendRawTransaction") {
+          return { jsonrpc: "2.0", id: entry.id, result: "0x" + "cd".repeat(32) };
+        }
         return { jsonrpc: "2.0", id: entry.id, error: { message: `unexpected ${entry.method}` } };
       };
       response.setHeader("content-type", "application/json");
@@ -2493,6 +2497,43 @@ async function main(): Promise<void> {
     check("ownerOf keeps what is ours", confirmed.some((h) => h.tokenId === "1"));
     check("…drops what somebody else now owns", !confirmed.some((h) => h.tokenId === "3"));
     check("…and drops a token that does not exist", !confirmed.some((h) => h.tokenId === "4"));
+
+    // Watching a long sweep.
+    //
+    // Signing progress finishes in a second or two; the wait is the transfers
+    // themselves, and reporting only the first left a card claiming to be done
+    // while 279 tokens were still in flight. onSettled is what the status card
+    // counts in tens.
+    const seen: number[] = [];
+    const totals = new Set<number>();
+    const swept = await sweepNfts(
+      found,
+      {
+        signerFor: () => new Wallet(TEST_KEY),
+        vault: VAULT,
+        chainId: 4663,
+        endpoints: classifyEndpoints([nftUrl]),
+        maxFeePerGas: 2_000_000_000n,
+        maxPriorityFeePerGas: 50_000_000n,
+        nonceFor: () => 0,
+        onSettled: (_outcome, done, total) => {
+          seen.push(done);
+          totals.add(total);
+        },
+      }
+    );
+    check("a sweep dispatches one transfer per token", swept.dispatched === found.length);
+    check("…and reports progress for each of them", seen.length === found.length);
+    check(
+      "…counting up rather than repeating",
+      seen.join() === found.map((_, i) => i + 1).join(),
+      seen.join()
+    );
+    check(
+      "…against a total that never moves",
+      totals.size === 1 && totals.has(found.length)
+    );
+    check("…and the transfers are accepted", swept.accepted === found.length);
 
     // The transfer itself must name the holder as sender, not the vault.
     const calldata = encodeTransferFrom(OWNER_A, VAULT, "1");
