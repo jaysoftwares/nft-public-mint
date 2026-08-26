@@ -2202,10 +2202,16 @@ async function main(): Promise<void> {
 
   check("the collection is named, not just the contract", mixedReport.includes("Omrevo Genesis"));
   check("…rather than the bare address", !mixedReport.includes("0x0d842ce4"));
+  check("the copied wallet is named", mixedReport.includes(VECTORS[0]));
   check("the wallet that minted is named in full", mixedReport.includes(walletA));
-  check("…and so is each wallet that missed out", mixedReport.includes(walletB) && mixedReport.includes(walletC));
   check("the reason is in plain words", mixedReport.includes("Not enough ETH for gas"));
   check("…counted, so one cause is not repeated as many", mixedReport.includes("2 wallets"));
+  // The misses are a count, never a list. Printing an address per miss is what
+  // pushed the message past Telegram's limit and made a successful copy silent.
+  check(
+    "…and the wallets that missed are counted, not listed",
+    !mixedReport.includes(walletB) && !mixedReport.includes(walletC)
+  );
   check("a free mint says free rather than 0 ETH", mixedReport.includes("free"));
   check("the network is named", mixedReport.includes("Robinhood Chain"));
   check("a successful mint links its transaction", mixedReport.includes("11".repeat(32)));
@@ -2224,7 +2230,7 @@ async function main(): Promise<void> {
     } as CopyResult,
     reportChain
   );
-  check("a total miss is not reported as a mint", !allFailed.includes("✅ Minted"));
+  check("a total miss is not reported as a mint", !allFailed.includes("✅"));
   check("…it says so plainly", allFailed.includes("Could not mint"));
   check("…and falls back to the contract when unnamed", allFailed.includes("0x0d84"));
 
@@ -2247,8 +2253,49 @@ async function main(): Promise<void> {
     reportChain
   );
   check("a full store is summarised, not dumped", many.length < 4096, `${many.length} chars`);
-  check("…and says how many were left out", many.includes("and 488 more"));
   check("…while still giving the total", many.includes("500 wallets"));
+
+  // The regression that made a working bot silent. Five hundred wallets are
+  // not turned down for one reason — some are short of gas, some are rate
+  // limited, some time out — and the report used to print an address list per
+  // cause. At four distinct causes it reached 4,218 characters, Telegram
+  // refused it with a 400, and notify() swallowed that. So the bound has to
+  // hold against the *variety* of failures, not just the number of wallets.
+  const manyCauses = renderCopyResult(
+    {
+      ...baseResult,
+      collection: "Big Drop",
+      walletCount: 510,
+      accepted: 10,
+      rejected: 500,
+      hashes: Array.from({ length: 510 }, (_, i) => ({
+        id: `d:${i}`,
+        address: `0x${i.toString(16).padStart(40, "0")}`,
+        hash: `0x${i.toString(16).padStart(64, "0")}`,
+        accepted: i < 10,
+        reason:
+          i < 10
+            ? undefined
+            : [
+                "Not enough ETH for gas",
+                "The RPC provider rate-limited this send",
+                "The network did not answer in time",
+                "Nonce already used — another transaction got there first",
+                "A transaction from this wallet was already in the queue",
+                "Gas price too low for the network right now",
+              ][i % 6],
+      })),
+    } as CopyResult,
+    reportChain
+  );
+  check(
+    "six different rejections still fit in one message",
+    manyCauses.length < 4096,
+    `${manyCauses.length} chars`
+  );
+  check("…the top causes are named", manyCauses.includes("Not enough ETH for gas"));
+  check("…and the rest are counted as other", manyCauses.includes("other ("));
+  check("…while the wallets that did mint are still listed", manyCauses.includes("0x".padEnd(42, "0")));
 
   // ── node rejections, in words ─────────────────────────────────────────
   section("rejection reasons");

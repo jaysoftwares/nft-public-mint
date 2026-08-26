@@ -3467,12 +3467,29 @@ function ensureFundingWallet(): ManagedWallet {
   return result.wallet;
 }
 
+/**
+ * Send something to the chat this runtime belongs to.
+ *
+ * Two rules learned the hard way, both from the same incident — copy-mint
+ * buying an NFT every six minutes and saying nothing:
+ *
+ *   · `clamp` it. Telegram refuses anything over 4,096 characters, and a
+ *     renderer that grows with the wallet store crosses that line without
+ *     anyone deciding it should.
+ *   · never swallow the rejection. A dropped notification must not break the
+ *     pipeline, but a silent one is indistinguishable from a bot that never
+ *     fired, which is exactly how the mystery lasted. It goes to the log.
+ */
 function notify(html: string): void {
   const chat = currentRuntime().chatId;
+  const text = clamp(html);
   void bot.api
-    .sendMessage(chat, html, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })
-    .catch(() => {
-      /* a dropped notification must never break the pipeline */
+    .sendMessage(chat, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } })
+    .catch((err) => {
+      console.log(
+        `  Telegram refused a notification for chat ${chat} (${text.length} chars): ` +
+          `${(err as Error).message}`
+      );
     });
 }
 

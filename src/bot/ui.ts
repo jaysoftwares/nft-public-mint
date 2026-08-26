@@ -39,9 +39,21 @@ export function bar(done: number, total: number, width = 16): string {
   return "█".repeat(filled) + "░".repeat(width - filled);
 }
 
+/**
+ * Cut a message down to something Telegram will accept.
+ *
+ * The cut lands on a line boundary on purpose. Slicing mid-line can land in
+ * the middle of `<code>` or an `<a href=…>`, and Telegram answers a broken tag
+ * with the same 400 it gives an over-long message — so a naive truncation
+ * turns "too long" into "still rejected, now for a second reason". Every
+ * renderer here opens and closes its tags on one line, so a line boundary is
+ * always a safe place to stop.
+ */
 export function clamp(text: string): string {
   if (text.length <= MAX_MESSAGE) return text;
-  return `${text.slice(0, MAX_MESSAGE - 40)}\n…(truncated)`;
+  const cut = text.slice(0, MAX_MESSAGE - 40);
+  const boundary = cut.lastIndexOf("\n");
+  return `${boundary > 0 ? cut.slice(0, boundary) : cut}\n…(truncated)`;
 }
 
 /**
