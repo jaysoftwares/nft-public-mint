@@ -49,7 +49,7 @@ import {
   parseFundAmount,
   TRANSFER_GAS,
 } from "../core/funding";
-import { discoverMintedHoldings, sweepNfts, MintSite } from "../core/holdings";
+import { discoverMintedHoldings, sweepNfts, Holding, MintSite } from "../core/holdings";
 import { explainRejection } from "../core/dispatcher";
 import { collectionName } from "../core/collection-name";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
@@ -435,6 +435,8 @@ const HELP = `<b>Copymint</b>
 
 <b>Money</b>
 /fund &lt;selector&gt; &lt;eth&gt; — top wallets up to a target balance
+/nfts [selector] [contract] [on &lt;chain&gt;] — which wallets hold NFTs right now.
+  Checks every network unless you name one. Reads only; sweep nothing.
 /sweep [selector] [contract] — move NFTs to the vault, leave gas
 /drain [selector] — send ETH back to the funder, leave nothing
 
@@ -1215,6 +1217,280 @@ async function cmdFund(ctx: Context): Promise<void> {
 }
 
 /**
+ * Every ledger-recorded mint that could have put an NFT in these wallets.
+ *
+ * The sweep and the holdings check search from here rather than from the chain.
+ * The ledger already knows the contract, the wallets and the block of every
+ * mint this bot made, which turns "walk 1.9 million blocks for 500 addresses"
+ * into a few hundred blocks per mint.
+ *
+ * Shared between the two on purpose. A check that looked somewhere else would
+ * be a preview of a different sweep, and its "nothing here" would be worthless
+ * as an answer to "will the sweep find anything?".
+ */
+function mintSitesFor(
+  chainId: number,
+  wallets: ManagedWallet[],
+  contractFilter?: string
+): MintSite[] {
+  const mine = new Map(wallets.map((w) => [w.id, w.address]));
+  const sites = new Map<string, MintSite>();
+
+  for (const entry of ledgerEntries()) {
+    if (entry.kind !== "mint" || entry.chainId !== chainId || !entry.contract) continue;
+    if (entry.fromBlock === undefined) continue;
+    if (contractFilter && entry.contract.toLowerCase() !== contractFilter.toLowerCase()) continue;
+
+    const owners = entry.walletIds
+      .filter((id) => mine.has(id))
+      .map((id) => ({ id, address: mine.get(id) as string }));
+    if (owners.length === 0) continue;
+
+    const key = `${entry.contract.toLowerCase()}|${entry.fromBlock}`;
+    const existing = sites.get(key);
+    if (existing) {
+      const seen = new Set(existing.owners.map((o) => o.id));
+      for (const owner of owners) if (!seen.has(owner.id)) existing.owners.push(owner);
+    } else {
+      sites.set(key, { contract: entry.contract, block: entry.fromBlock, owners });
+    }
+  }
+  return [...sites.values()];
+}
+
+/** One chain's answer to "what is still held here?". */
+interface ChainHoldings {
+  chain: ChainContext;
+  /** Recorded mints looked at. Zero means there was nowhere to look. */
+  sites: number;
+  holdings: Holding[];
+  /** Set when the chain could not be read at all — not the same as none held. */
+  error?: string;
+}
+
+/**
+ * Which wallets are holding what, most-loaded first.
+ *
+ * Per wallet rather than per collection because the question this answers is
+ * "is there anything to sweep, and where is it?" — and the wallet is the thing
+ * a sweep acts on. Collections ride along on a second line so the list still
+ * says what the NFTs actually are.
+ */
+function renderWalletHoldings(
+  holdings: Holding[],
+  label: (contract: string) => string,
+  limit = 12
+): string[] {
+  const byWallet = new Map<
+    string,
+    { address: string; total: number; collections: Map<string, number> }
+  >();
+
+  for (const holding of holdings) {
+    let row = byWallet.get(holding.ownerId);
+    if (!row) {
+      row = { address: holding.owner, total: 0, collections: new Map() };
+      byWallet.set(holding.ownerId, row);
+    }
+    row.total += 1;
+    const name = label(holding.contract);
+    row.collections.set(name, (row.collections.get(name) ?? 0) + 1);
+  }
+
+  const ranked = [...byWallet.entries()].sort((a, b) => b[1].total - a[1].total);
+  const lines: string[] = [];
+
+  for (const [id, row] of ranked.slice(0, limit)) {
+    const collections = [...row.collections.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, count]) => `${esc(name)} × ${count}`)
+      .join(", ");
+    const more = row.collections.size > 3 ? ` +${row.collections.size - 3} more` : ``;
+    lines.push(`  <b>${esc(id)}</b>  <code>${esc(short(row.address))}</code>  —  ${row.total} NFT(s)`);
+    lines.push(`      <i>${collections}${more}</i>`);
+  }
+
+  if (ranked.length > limit) {
+    const rest = ranked.slice(limit).reduce((sum, [, row]) => sum + row.total, 0);
+    lines.push(`  <i>…and ${rest} NFT(s) in ${ranked.length - limit} more wallet(s)</i>`);
+  }
+  return lines;
+}
+
+/**
+ * What the wallets are holding, before anything moves.
+ *
+ * A sweep that found nothing and a sweep that never managed to look are the
+ * same silence from outside, and that is what "the sweep didn't work" meant:
+ * no way to tell an empty set of wallets from a broken scan. This is the
+ * read-only half of the sweep — the same ledger sites, the same ownerOf
+ * confirmation, no transaction signed — and it always answers, including when
+ * the answer is none.
+ *
+ * Two deliberate differences from /sweep. It defaults to *every* configured
+ * chain, because "have I got anything?" should not require knowing which
+ * network to ask about first — on this deployment the NFTs are on Robinhood
+ * while the configured chain is Base. And it needs no destination, so nothing
+ * can stop it before it has looked.
+ */
+async function cmdNfts(ctx: Context): Promise<void> {
+  const words = withoutKeywordPairs(args(ctx));
+  const contractArg = words.find((word) => isAddress(word));
+  const selector = words.find((word) => !isAddress(word)) ?? "all";
+
+  // No chain key is passed to select: this reads and never spends, so `funded`
+  // here means funded anywhere rather than on one nominated network.
+  //
+  // Cached balances, unlike /sweep. Forcing a refresh here would read 500
+  // addresses on every chain before looking at a single NFT — a large slice of
+  // the RPC quota spent on a number that cannot change which tokens are held.
+  const matched = await select(selector, ctx, undefined, false);
+  if (!matched) return;
+
+  const override = chainOverrideFrom(args(ctx));
+  const chains = override ? [session.chain(override)] : session.availableChains;
+
+  const plan = chains.map((chain) => ({
+    chain,
+    sites: mintSitesFor(chain.chainId, matched, contractArg),
+  }));
+  const totalSites = plan.reduce((sum, entry) => sum + entry.sites.length, 0);
+
+  const status = new StatusCard(bot, ctx.chat!.id);
+  await status.start(
+    [
+      `<b>Checking ${matched.length} wallet(s) for NFTs</b>`,
+      ``,
+      totalSites === 0
+        ? `<i>nothing recorded to check…</i>`
+        : `<i>${totalSites} recorded mint(s) across ${plan.length} network(s)…</i>`,
+    ].join("\n")
+  );
+
+  let done = 0;
+  const results: ChainHoldings[] = [];
+
+  // Sequential, not Promise.all. Three chains scanning at once is three times
+  // the request rate against one quota, and this is not a race.
+  for (const { chain, sites } of plan) {
+    if (sites.length === 0) {
+      results.push({ chain, sites: 0, holdings: [] });
+      continue;
+    }
+    try {
+      const holdings = await discoverMintedHoldings(chain.rpc.readUrl, sites, {
+        onProgress: () => {
+          done += 1;
+          status.update(
+            [
+              `<b>Checking ${matched.length} wallet(s) for NFTs</b>`,
+              ``,
+              `${bar(done, totalSites)}  ${done}/${totalSites}`,
+              `<i>${esc(chain.name)}</i>`,
+            ].join("\n")
+          );
+        },
+      });
+      results.push({ chain, sites: sites.length, holdings });
+    } catch (err) {
+      // One unreachable chain must not hide what the others found, and must not
+      // be reported as "no NFTs" either — those are different answers.
+      results.push({
+        chain,
+        sites: sites.length,
+        holdings: [],
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  const total = results.reduce((sum, result) => sum + result.holdings.length, 0);
+  const withHoldings = results.filter((result) => result.holdings.length > 0);
+
+  // Names once per collection, read from the chain that collection is on.
+  const names = new Map<string, string>();
+  for (const result of withHoldings) {
+    for (const contract of new Set(result.holdings.map((h) => h.contract))) {
+      if (names.has(contract.toLowerCase())) continue;
+      const name = await collectionName(result.chain.rpc.readUrl, contract).catch(() => undefined);
+      if (name) names.set(contract.toLowerCase(), name);
+    }
+  }
+  const label = (contract: string): string => names.get(contract.toLowerCase()) ?? short(contract);
+
+  const perChainStatus = (result: ChainHoldings): string => {
+    if (result.error) {
+      return `  ⚠️ <b>${esc(result.chain.name)}</b> — could not be read: ${esc(result.error.slice(0, 140))}`;
+    }
+    if (result.sites === 0) return `  • <b>${esc(result.chain.name)}</b> — no mints recorded here`;
+    return `  • <b>${esc(result.chain.name)}</b> — ${result.sites} recorded mint(s), none still held`;
+  };
+
+  if (total === 0) {
+    const unreadable = results.filter((result) => result.error);
+    await status.finish(
+      [
+        `<b>No NFTs found — nothing to sweep</b>`,
+        ``,
+        contractArg
+          ? `None of the ${matched.length} wallet(s) checked is holding an NFT from ` +
+            `<code>${esc(short(contractArg))}</code>.`
+          : `None of the ${matched.length} wallet(s) checked is holding an NFT from any ` +
+            `mint this bot recorded.`,
+        ``,
+        ...results.map(perChainStatus),
+        ``,
+        unreadable.length > 0
+          ? `<i>${unreadable.length} network(s) above failed to answer, so this is not a ` +
+            `complete "no" — try again in a moment.</i>`
+          : `<i>Ownership is read from the chain with ownerOf, so this is what is true ` +
+            `now. Already swept, sold, or a mint the node accepted and then reverted all ` +
+            `look like this.</i>`,
+        ``,
+        totalSites === 0
+          ? `<i>Nothing was scanned: no mint is recorded against these wallets on ` +
+            `${override ? esc(chains[0].name) : `any network`}. Name a contract to check ` +
+            `one directly — <code>/nfts all 0x…</code></i>`
+          : `<i>Only mints this bot made are searched. For a collection it did not mint, ` +
+            `name it: <code>/nfts all 0x…</code></i>`,
+      ].join("\n"),
+      new InlineKeyboard().text("🔄 Check again", "a:nfts").row().text("‹ Money", "m:money")
+    );
+    return;
+  }
+
+  const keyboard = new InlineKeyboard();
+  for (const result of withHoldings.slice(0, 3)) {
+    keyboard
+      .text(`🧹 Sweep ${result.chain.name} (${result.holdings.length})`, `ns:${result.chain.key}`)
+      .row();
+  }
+  keyboard.text("🔄 Check again", "a:nfts").row().text("‹ Money", "m:money");
+
+  const wallets = new Set(
+    results.flatMap((result) => result.holdings.map((holding) => holding.ownerId))
+  ).size;
+
+  await status.finish(
+    [
+      `<b>${total} NFT(s) in ${wallets} wallet(s)</b>`,
+      ``,
+      ...withHoldings.flatMap((result) => [
+        `<b>${esc(result.chain.name)}</b>  —  ${result.holdings.length} NFT(s)`,
+        ...renderWalletHoldings(result.holdings, label),
+        ``,
+      ]),
+      ...results.filter((result) => result.holdings.length === 0).map(perChainStatus),
+      ``,
+      `<i>Confirmed on-chain with ownerOf. Sweeping moves these into one wallet and`,
+      `leaves the gas where it is.</i>`,
+    ].join("\n"),
+    keyboard
+  );
+}
+
+/**
  * Where a sweep is allowed to send NFTs.
  *
  * The vault by default. `to <address>` overrides it, because "put everything in
@@ -1264,56 +1540,54 @@ async function cmdSweep(ctx: Context): Promise<void> {
   const matched = await select(selector, ctx, chain.key, true);
   if (!matched) return;
 
-  // Where to look, taken from the ledger rather than from the whole chain.
-  //
-  // Each recorded mint gives a contract, the wallets it went to and the block
-  // it happened in, which turns the search from "every block since we started"
-  // into a few hundred blocks per mint. On this deployment that is the
-  // difference between sixty requests and twenty thousand.
-  const mine = new Set(matched.map((w) => w.id));
-  const sites = new Map<string, MintSite>();
-  for (const entry of ledgerEntries()) {
-    if (entry.kind !== "mint" || entry.chainId !== chain.chainId || !entry.contract) continue;
-    if (entry.fromBlock === undefined) continue;
-    if (contractArg && entry.contract.toLowerCase() !== contractArg.toLowerCase()) continue;
+  // Where to look, taken from the ledger rather than from the whole chain —
+  // the same sites /nfts reports, so the check and the sweep can never disagree.
+  const sites = mintSitesFor(chain.chainId, matched, contractArg);
 
-    const owners = matched
-      .filter((w) => mine.has(w.id) && entry.walletIds.includes(w.id))
-      .map((w) => ({ id: w.id, address: w.address }));
-    if (owners.length === 0) continue;
-
-    const key = `${entry.contract.toLowerCase()}|${entry.fromBlock}`;
-    const existing = sites.get(key);
-    if (existing) {
-      const seen = new Set(existing.owners.map((o) => o.id));
-      for (const o of owners) if (!seen.has(o.id)) existing.owners.push(o);
-    } else {
-      sites.set(key, { contract: entry.contract, block: entry.fromBlock, owners });
-    }
-  }
-
-  if (sites.size === 0) {
+  if (sites.length === 0) {
     await ctx.reply(
-      "Nothing to scan — no recorded mints for those wallets on this chain.\n" +
-        "Pass a contract explicitly: <code>/sweep all 0x…</code>",
+      [
+        `<b>Nothing to scan on ${esc(chain.name)}</b>`,
+        ``,
+        `No mint is recorded against those wallets on this network, so a sweep has`,
+        `nowhere to look — it is not that your wallets are empty, it is that this`,
+        `chain was never where they minted.`,
+        ``,
+        `Check every network first: <code>/nfts</code>`,
+        `Or name the collection: <code>/sweep all 0x…</code>`,
+      ].join("\n"),
       { parse_mode: "HTML" }
     );
     return;
   }
 
   const status = new StatusCard(bot, ctx.chat!.id);
-  await status.start(`<b>Sweep</b>\n\nchecking ${sites.size} mint(s) on ${esc(chain.name)}…`);
+  await status.start(`<b>Sweep</b>\n\nchecking ${sites.length} mint(s) on ${esc(chain.name)}…`);
 
   try {
-    const holdings = await discoverMintedHoldings(chain.rpc.readUrl, [...sites.values()], {
+    const holdings = await discoverMintedHoldings(chain.rpc.readUrl, sites, {
       onProgress: (done, total) =>
         status.update(`<b>Sweep</b>\n\n${bar(done, total)}  checking ${done}/${total}`),
     });
 
     if (holdings.length === 0) {
+      // Said in full rather than in one line, because "no NFTs found" on its own
+      // is indistinguishable from the sweep having failed — which is how it was
+      // read.
       await status.finish(
-        "<b>Sweep</b>\n\nNo NFTs found. Every token from those mints has either " +
-          "already been moved, or the mint did not land."
+        [
+          `<b>No NFTs to sweep on ${esc(chain.name)}</b>`,
+          ``,
+          `Checked ${sites.length} recorded mint(s) across ${matched.length} wallet(s)`,
+          `and asked each contract who owns the tokens. None of them is yours now.`,
+          ``,
+          `  • already swept to <code>${esc(short(destination.to))}</code>, or`,
+          `  • the mint was accepted by the node and then reverted`,
+          ``,
+          `<i>Nothing was sent and nothing was spent. <code>/nfts</code> checks every`,
+          `network at once.</i>`,
+        ].join("\n"),
+        new InlineKeyboard().text("🔎 Check every network", "a:nfts")
       );
       return;
     }
@@ -3739,7 +4013,18 @@ async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
         ``,
         `<i>ETH is left in place so wallets stay armed.</i>`,
       ].join("\n"),
-      { parse_mode: "HTML", reply_markup: simpleConfirm("Sweep") }
+      {
+        parse_mode: "HTML",
+        // "Check first" sits beside the confirm because the sweep cannot say
+        // what it will find until it runs, and a sweep that finds nothing looks
+        // exactly like a sweep that failed.
+        reply_markup: new InlineKeyboard()
+          .text("✅ Sweep", "go")
+          .row()
+          .text("🔎 Check what I hold first", "a:nfts")
+          .row()
+          .text("✕ Cancel", "x"),
+      }
     );
     return;
   }
@@ -3960,6 +4245,8 @@ async function onCallback(ctx: Context): Promise<void> {
           return runWithArgs(ctx, ["funded"], cmdWallets);
         case "csv":
           return cmdWalletsCsv(ctx);
+        case "nfts":
+          return runWithArgs(ctx, ["all"], cmdNfts);
         case "autofire":
           return runWithArgs(ctx, ["autofire"], cmdWallets);
         case "targets":
@@ -3974,6 +4261,14 @@ async function onCallback(ctx: Context): Promise<void> {
           return;
       }
       return;
+
+    // Sweep the chain the holdings check just found something on. The chain is
+    // already answered, so the flow resumes at the one question left.
+    case "ns": {
+      const flow = startFlow(chatId, "sweep", "chain");
+      flow.chain = payload;
+      return advanceFlow(ctx, flow);
+    }
 
     case "g":
       return runWithArgs(ctx, [payload], cmdGenerate);
@@ -4577,6 +4872,7 @@ async function main(): Promise<void> {
   bot.command("tag", (ctx) => cmdTag(ctx, false).catch((e) => fail(ctx, e)));
   bot.command("untag", (ctx) => cmdTag(ctx, true).catch((e) => fail(ctx, e)));
   bot.command("fund", (ctx) => cmdFund(ctx).catch((e) => fail(ctx, e)));
+  bot.command("nfts", (ctx) => cmdNfts(ctx).catch((e) => fail(ctx, e)));
   bot.command("sweep", (ctx) => cmdSweep(ctx).catch((e) => fail(ctx, e)));
   bot.command("drain", (ctx) => cmdDrain(ctx).catch((e) => fail(ctx, e)));
   bot.command("mint", (ctx) => cmdMint(ctx).catch((e) => fail(ctx, e)));

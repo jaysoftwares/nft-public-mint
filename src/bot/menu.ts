@@ -259,6 +259,10 @@ export function moneyMenu(): InlineKeyboard {
   return new InlineKeyboard()
     .text("⛽ Fund wallets", "i:fund")
     .row()
+    // Above the sweep, because it answers the question the sweep silently
+    // assumed: is there anything in the wallets to move?
+    .text("🔎 What NFTs do I hold?", "a:nfts")
+    .row()
     .text("🧹 Sweep NFTs → vault", "i:sweep")
     .row()
     .text("💧 Reclaim ETH → funder", "i:drain")
