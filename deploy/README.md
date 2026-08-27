@@ -35,8 +35,26 @@ that needs a decision from you.
 
 ## The three steps setup.sh leaves to you
 
-**1. Secrets** — `nano /etc/copymint/env`. Bot token, OpenSea key, RPC URLs, and
-`COPYMINT_PASSPHRASE`.
+**1. Secrets** — `nano /etc/copymint/env`. Bot token, OpenSea key, RPC URLs,
+`COPYMINT_PASSPHRASE`, and `COPYMINT_ALLOWED_CHATS`.
+
+`COPYMINT_ALLOWED_CHATS` is the access list: comma-separated private chat ids,
+and nobody outside it gets past the first middleware — not a menu, not a setup
+screen, not a state directory. **The service refuses to start while it is
+empty.** That is deliberate: a bot that falls open when its list is missing
+hands a wallet to whoever finds it, and nothing in the logs would say so.
+
+To find an id, message the bot from the account and read it out of the refusal
+line in `journalctl -u copymint -f`:
+
+```
+Blocked chat 2101670897 (@someone) — not in COPYMINT_ALLOWED_CHATS.
+```
+
+Then `COPYMINT_ALLOWED_CHATS=2101670897,6234299825,6540926563` and
+`systemctl restart copymint`. Removing an id stops that chat immediately and
+also stops its watchers and reconcile timers from being resumed at the next
+boot; their encrypted store is left on disk untouched.
 
 Set the passphrase before first start. It is the server master secret: the bot
 derives a different encryption key for each Telegram chat, so one user's

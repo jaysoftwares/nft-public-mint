@@ -48,6 +48,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "autofire", description: "Let wallets buy without asking you first" },
   { command: "nfts", description: "Which of your wallets are holding NFTs right now" },
   { command: "sweep", description: "Collect your NFTs into one wallet" },
+  { command: "autosweep", description: "Collect copied NFTs automatically, as they land" },
   { command: "drain", description: "Send leftover ETH back to your funding wallet" },
 
   // ── Minting by hand ──
@@ -56,6 +57,9 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "probe", description: "Check a drop's stages and prices before minting" },
   { command: "check", description: "See which of your wallets are on an allowlist" },
   { command: "allowlist", description: "Mint an allowlist drop" },
+  { command: "schedule", description: "Book a mint for a time — it fires without you" },
+  { command: "scheduled", description: "Booked mints, and cancel any of them" },
+  { command: "unschedule", description: "Cancel a booked mint by its id" },
 
   // ── Housekeeping ──
   { command: "status", description: "Connection and wallet health" },

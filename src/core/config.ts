@@ -47,6 +47,30 @@ export interface CopyConfig {
   wsUrl: string;
 }
 
+export interface AutoSweepConfig {
+  /**
+   * Move NFTs to the vault as soon as a copy-mint lands, without being asked.
+   *
+   * On by default, which is a deliberate exception to the rule that governs
+   * `copy.enabled`. That switch turns on autonomous *spending* and must be a
+   * decision. This one turns on autonomous *tidying* between two addresses the
+   * same person already owns — it cannot buy anything, and the only cost is the
+   * gas of a transfer the operator was going to make by hand anyway. Leaving it
+   * off by default would mean the wallets that just spent money sit holding the
+   * proceeds until somebody remembers.
+   */
+  enabled: boolean;
+  /**
+   * Seconds to wait for the mint receipts before giving up.
+   *
+   * The wait is not a guess at block time — it is a ceiling on how long to keep
+   * asking. Robinhood answers in a second, Ethereum can take a minute when the
+   * tip is low, and a transaction that never lands must not hold the sweep
+   * queue open forever.
+   */
+  waitSec: number;
+}
+
 export interface SignedConfig {
   enabled: boolean;
   /**
@@ -88,6 +112,7 @@ export interface BotConfig {
   gas: GasConfig;
   caps: CapsConfig;
   copy: CopyConfig;
+  autoSweep: AutoSweepConfig;
   signed: SignedConfig;
   /** Optional endpoint overrides; empty falls back to chains.ts + .env. */
   rpc: { read: string[]; send: string[] };
@@ -179,6 +204,7 @@ export const DEFAULT_CONFIG: BotConfig = {
     walletSelector: "all",
     wsUrl: "",
   },
+  autoSweep: { enabled: true, waitSec: 180 },
   signed: {
     enabled: false,
     api: { nonceUrl: "", loginUrl: "", signatureUrl: "", headers: {} },
@@ -228,6 +254,24 @@ function requireGwei(value: unknown, field: string): bigint {
   }
 }
 
+/**
+ * The auto-sweep wait, clamped rather than validated.
+ *
+ * A wait is not a safety limit — nothing about a wrong one spends money — so
+ * refusing to boot over it would be the wrong trade. But a hand-edited zero
+ * would give up before the first poll and make auto-sweep look broken, and a
+ * hand-edited hour would hold a queue slot open for one dead transaction. Both
+ * are pulled back into a range where the feature still works.
+ */
+const MIN_SWEEP_WAIT_SEC = 10;
+const MAX_SWEEP_WAIT_SEC = 900;
+
+function sweepWaitSec(value: unknown): number {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return DEFAULT_CONFIG.autoSweep.waitSec;
+  return Math.min(MAX_SWEEP_WAIT_SEC, Math.max(MIN_SWEEP_WAIT_SEC, Math.round(seconds)));
+}
+
 export function writeDefaultConfig(): string {
   return writeConfigIfMissing(DEFAULT_CONFIG);
 }
@@ -262,6 +306,15 @@ export interface UserSettingsUpdate {
   caps?: { perEventEth?: string; maxPriceEth?: string; dailyEth?: string };
   /** Which wallets copy-mint may draw on. */
   copyWalletSelector?: string;
+  /**
+   * Whether a finished copy-mint moves itself to the vault.
+   *
+   * Chat-settable for the same reason the caps are: the person whose wallets
+   * these are usually has no shell, and a setting they cannot reach is not a
+   * choice they made. It cannot buy anything or name a new destination — it
+   * only decides whether the vault they already confirmed is used automatically.
+   */
+  autoSweep?: boolean;
 }
 
 /**
@@ -309,6 +362,7 @@ export function updateUserSettings(update: UserSettingsUpdate): {
   copyEnabled?: boolean;
   caps?: BotConfig["caps"];
   copyWalletSelector?: string;
+  autoSweep?: boolean;
 } {
   const path = FILES.config();
   if (!existsSync(path)) {
@@ -328,6 +382,7 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     copyEnabled?: boolean;
     caps?: BotConfig["caps"];
     copyWalletSelector?: string;
+    autoSweep?: boolean;
   } = {};
 
   if (update.destination !== undefined) {
@@ -394,12 +449,25 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     result.copyWalletSelector = selector;
   }
 
+  if (update.autoSweep !== undefined) {
+    if (typeof update.autoSweep !== "boolean") {
+      throw new ConfigError("Auto-sweep must be on or off.");
+    }
+    raw.autoSweep = {
+      ...DEFAULT_CONFIG.autoSweep,
+      ...(raw.autoSweep ?? {}),
+      enabled: update.autoSweep,
+    };
+    result.autoSweep = update.autoSweep;
+  }
+
   if (
     result.destination === undefined &&
     result.funder === undefined &&
     result.copyEnabled === undefined &&
     result.caps === undefined &&
-    result.copyWalletSelector === undefined
+    result.copyWalletSelector === undefined &&
+    result.autoSweep === undefined
   ) {
     throw new ConfigError("No user setting was supplied.");
   }
@@ -444,6 +512,10 @@ export function loadConfig(): ResolvedConfig {
       ...DEFAULT_CONFIG.copy,
       ...(raw.copy ?? {}),
       tiers: { ...DEFAULT_CONFIG.copy.tiers, ...(raw.copy?.tiers ?? {}) },
+    },
+    autoSweep: {
+      enabled: raw.autoSweep?.enabled ?? DEFAULT_CONFIG.autoSweep.enabled,
+      waitSec: sweepWaitSec(raw.autoSweep?.waitSec),
     },
     signed: {
       ...DEFAULT_CONFIG.signed,

@@ -99,6 +99,12 @@ if [[ ! -f "$SECRET_DIR/env" ]]; then
 TELEGRAM_BOT_TOKEN=
 OPENSEA_API_KEY=
 
+# Who may use the bot. Comma-separated private chat ids; nobody else gets past
+# the door, and the service refuses to start while this is empty rather than
+# falling open to whoever finds it. Message the bot from each account and read
+# the id out of the "Blocked chat <id>" line in journalctl.
+COPYMINT_ALLOWED_CHATS=
+
 # Unlocks seed.enc at boot. Without it the service starts and immediately
 # exits, because there is no terminal to prompt at.
 COPYMINT_PASSPHRASE=

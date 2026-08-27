@@ -18,6 +18,7 @@ import { InlineKeyboard } from "grammy";
 export type FlowKind =
   | "mint"
   | "fcfs"
+  | "schedule"
   | "fund"
   | "watch"
   | "sweep"
@@ -33,7 +34,7 @@ export type FlowKind =
 export interface Flow {
   kind: FlowKind;
   /** What the flow is currently waiting for. */
-  step: "contract" | "amount" | "address" | "secret" | "chain" | "ready";
+  step: "contract" | "amount" | "address" | "secret" | "chain" | "time" | "ready";
   contract?: string;
   quantity?: number;
   selector?: string;
@@ -53,6 +54,8 @@ export interface Flow {
   importCount?: number;
   address?: string;
   waitForOpen?: boolean;
+  /** Raw text of a scheduled mint's firing time, as typed, before parsing. */
+  when?: string;
   startedAt: number;
 }
 
@@ -121,11 +124,15 @@ export function dashboardMenu(): InlineKeyboard {
     .text("‹ Back", "m:main");
 }
 
-export function settingsMenu(duringSetup = false): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("🎯 Change NFT vault", "cfg:destination")
-    .row()
-    .text("‹ Back", duringSetup ? "s:cancel" : "m:main");
+export function settingsMenu(duringSetup = false, autoSweepOn = true): InlineKeyboard {
+  const keyboard = new InlineKeyboard().text("🎯 Change NFT vault", "cfg:destination").row();
+  // Not during setup. Someone who has not yet confirmed a vault has nothing to
+  // sweep into, and a switch for a destination that does not exist is a
+  // question they cannot answer.
+  if (!duringSetup) {
+    keyboard.text(`🤖 Auto-sweep: ${autoSweepOn ? "ON" : "OFF"}`, "a:autosweep").row();
+  }
+  return keyboard.text("‹ Back", duringSetup ? "s:cancel" : "m:main");
 }
 
 export function destinationConfirm(address: string, duringSetup = false): InlineKeyboard {
@@ -135,15 +142,59 @@ export function destinationConfirm(address: string, duringSetup = false): Inline
     .text("✕ Cancel", duringSetup ? "cfg:menu" : "m:main");
 }
 
-export function mintMenu(): InlineKeyboard {
+export function mintMenu(scheduled = 0): InlineKeyboard {
   return new InlineKeyboard()
     .text("🎯 Public mint", "i:mint")
     .row()
     .text("🔥 FCFS via OpenSea", "i:fcfs")
     .row()
+    // First among the things you do ahead of time, and labelled with the count
+    // because a booking made yesterday is invisible otherwise — which is how a
+    // scheduled mint gets forgotten and fires as a surprise.
+    .text("⏰ Schedule a mint", "i:schedule")
+    .row()
+    .text(scheduled > 0 ? `📅 Booked (${scheduled})` : "📅 Booked mints", "a:scheduled")
+    .row()
     .text("🔎 Probe a drop", "i:check")
     .row()
     .text("‹ Back", "m:main");
+}
+
+/**
+ * The buttons under a booking that is waiting to fire.
+ *
+ * Cancel is the whole point: a mint agreed to yesterday for a drop that turned
+ * out to be a rug has to be stoppable from a phone, and hunting for an id to
+ * type is not stopping it.
+ */
+export function scheduledKeyboard(ids: string[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const id of ids.slice(0, 8)) {
+    keyboard.text(`✕ Cancel ${id}`, `sch:cancel:${id}`).row();
+  }
+  return keyboard.text("⏰ Schedule another", "i:schedule").row().text("‹ Back", "m:mint");
+}
+
+/** Shown under the details card, before anything is committed to. */
+export function scheduleConfirm(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Book it", "sch:go")
+    .row()
+    .text("✕ Cancel", "sch:drop");
+}
+
+/** Times people actually mint at, relative to now, plus a way to type one. */
+export function scheduleTimeKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("in 5m", "st:in 5m")
+    .text("in 15m", "st:in 15m")
+    .text("in 1h", "st:in 1h")
+    .row()
+    .text("in 6h", "st:in 6h")
+    .text("in 12h", "st:in 12h")
+    .text("in 24h", "st:in 24h")
+    .row()
+    .text("✕ Cancel", "x");
 }
 
 export function walletsMenu(): InlineKeyboard {
@@ -255,7 +306,7 @@ export function walletSelectorMenu(current: string): InlineKeyboard {
     .text("‹ Back", "a:caps");
 }
 
-export function moneyMenu(): InlineKeyboard {
+export function moneyMenu(autoSweepOn: boolean): InlineKeyboard {
   return new InlineKeyboard()
     .text("⛽ Fund wallets", "i:fund")
     .row()
@@ -265,11 +316,26 @@ export function moneyMenu(): InlineKeyboard {
     .row()
     .text("🧹 Sweep NFTs → vault", "i:sweep")
     .row()
+    // Directly under the manual sweep, where somebody who has just done it by
+    // hand is looking, and labelled with its state so the screen answers "is
+    // this already happening?" without a tap.
+    .text(`🤖 Auto-sweep: ${autoSweepOn ? "ON" : "OFF"}`, "a:autosweep")
+    .row()
     .text("💧 Reclaim ETH → funder", "i:drain")
     .row()
     .text("📈 Spend caps", "a:caps")
     .row()
     .text("‹ Back", "m:main");
+}
+
+/** The one-tap switch behind the auto-sweep screen. */
+export function autoSweepMenu(on: boolean): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(on ? "🛑 Turn OFF" : "▶️ Turn ON", on ? "as:off" : "as:on")
+    .row()
+    .text("🎯 Change NFT vault", "cfg:destination")
+    .row()
+    .text("‹ Back", "m:money");
 }
 
 /**

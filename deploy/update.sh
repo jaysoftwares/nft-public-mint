@@ -24,6 +24,7 @@ REPO_URL=${REPO_URL:-https://github.com/jaysoftwares/nft-public-mint}
 BRANCH=${BRANCH:-main}
 CLONE_DIR=${CLONE_DIR:-/opt/copymint-src}
 APP_DIR=/opt/copymint
+STATE_DIR=/var/lib/copymint
 SECRET_DIR=/etc/copymint
 SERVICE=copymint
 
@@ -86,6 +87,11 @@ add_key() {
   note "added $key"
 }
 
+# The access list. Empty on purpose: the bot refuses to start until somebody
+# decides who may use it, and a default filled in by a script would not be a
+# decision. Existing deployments keep whatever is already there.
+add_key COPYMINT_ALLOWED_CHATS ""   "Comma-separated private chat ids allowed to use the bot. Empty = nobody, and the service will not start."
+
 # The copy-mint watcher subscribes over WebSocket and falls back to polling when
 # the endpoint cannot serve one. Most public RPCs cannot: mainnet.base.org
 # answers the upgrade with 405 and both Robinhood endpoints with 400. These two
@@ -107,6 +113,36 @@ if ! grep -qE "^[[:space:]]*#?[[:space:]]*WS_URL_ROBINHOOD=" "$SECRET_DIR/env" 2
   } >> "$SECRET_DIR/env"
   note "noted WS_URL_ROBINHOOD (commented — needs your provider key)"
 fi
+
+# ── The access list must be a decision ─────────────────────────────────
+#
+# The bot refuses to start with an empty COPYMINT_ALLOWED_CHATS, on purpose: an
+# allowlist that falls open when it is missing hands a wallet to whoever finds
+# the bot. That makes an unset key an outage, so it is caught here — before the
+# restart — with the ids already on disk offered ready to paste, rather than as
+# a service that quietly fails to come back.
+say "Access list"
+ALLOWED=$(grep -E "^[[:space:]]*COPYMINT_ALLOWED_CHATS=" "$SECRET_DIR/env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')
+if [[ -z "$ALLOWED" ]]; then
+  KNOWN=$(find "$STATE_DIR/users" -maxdepth 1 -mindepth 1 -type d -printf '%f
+' 2>/dev/null |
+    grep -E '^[0-9]+$' | sort -n | paste -sd, -)
+  warn "COPYMINT_ALLOWED_CHATS is empty — the bot will refuse to start."
+  warn ""
+  if [[ -n "$KNOWN" ]]; then
+    warn "The chats that already have state on this host are:"
+    warn ""
+    warn "    COPYMINT_ALLOWED_CHATS=$KNOWN"
+    warn ""
+    warn "Put that line in $SECRET_DIR/env and run this again."
+  else
+    warn "No chat has state here yet. Message the bot once from each account you"
+    warn "want to allow, read the id from the \"Blocked chat <id>\" line in"
+    warn "journalctl -u $SERVICE, then set the key and run this again."
+  fi
+  exit 1
+fi
+note "access list: $ALLOWED"
 
 # ── Build and install ──────────────────────────────────────────────────
 say "Build"

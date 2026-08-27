@@ -49,6 +49,22 @@ import { diagnose, overallState, ChainReadiness } from "../core/diagnosis";
 import { buildDashboardSvg } from "../bot/dashboard-image";
 import { BOT_COMMANDS, UNLISTED_ALIASES, validateCommands } from "../bot/commands";
 import { parseCollectionInput } from "../core/collection-input";
+import {
+  parseAllowedChats,
+  AccessList,
+  AccessError,
+  DenialThrottle,
+  describeMissingList,
+} from "../core/access";
+import {
+  tokensFromReceipt,
+  collectMintedTokens,
+  decideSweep,
+  TxReceipt,
+} from "../core/auto-sweep";
+import * as bookings from "../core/schedule";
+import { ScheduleError, parseWhen, untilText, whenText, MIN_LEAD_MS } from "../core/schedule";
+import { mergePreview, pickStage, StageFacts } from "../core/drop-preview";
 import { openSeaChainSlug } from "../core/opensea-api";
 import { CHAINS } from "../chains";
 import {
@@ -3324,6 +3340,473 @@ async function main(): Promise<void> {
     ) === true
   );
 
+
+  // ── who may use the bot at all ────────────────────────────────────────
+  //
+  // Every private chat used to be a new user: the first message created a state
+  // directory and offered a wallet store. The list below is the only thing
+  // between a stranger and that, so the failure mode that matters is a parse
+  // that quietly widens it — a bad entry must stop the bot, never be skipped.
+  section("access list");
+
+  check(
+    "a comma-separated list parses to its ids",
+    JSON.stringify(parseAllowedChats("2101670897,6234299825,6540926563")) ===
+      JSON.stringify([2101670897, 6234299825, 6540926563])
+  );
+  check(
+    "spaces, newlines and semicolons separate just as well",
+    JSON.stringify(parseAllowedChats(" 111 , 222\n333;444 ")) ===
+      JSON.stringify([111, 222, 333, 444])
+  );
+  check(
+    "a repeated id is one entry, and order is normalised",
+    JSON.stringify(parseAllowedChats("333,111,333")) === JSON.stringify([111, 333])
+  );
+  check(
+    "anything that is not digits is refused rather than skipped",
+    throws(() => parseAllowedChats("2101670897,not-an-id"), AccessError)
+  );
+  check(
+    "a group id is refused by name — wallets never belong in a shared chat",
+    throws(() => parseAllowedChats("-1001234567890"), AccessError)
+  );
+  check("an unset list is empty, not open", parseAllowedChats(undefined).length === 0);
+  check("an empty string is empty, not open", parseAllowedChats("   ").length === 0);
+
+  const list = new AccessList([2101670897, 6540926563]);
+  check("a listed chat is allowed", list.allows(2101670897));
+  check("an unlisted chat is not", !list.allows(999));
+  check("a near-miss id is not allowed", !list.allows(210167089));
+  check("an undefined chat id is not allowed", !list.allows(undefined));
+  check(
+    "the list reads back from the environment",
+    AccessList.fromEnv({ COPYMINT_ALLOWED_CHATS: "42, 43" } as NodeJS.ProcessEnv).size === 2
+  );
+  check(
+    "an empty environment yields a list that allows nobody",
+    AccessList.fromEnv({} as NodeJS.ProcessEnv).allows(2101670897) === false
+  );
+  check(
+    "the boot message hands back the ids already on disk",
+    describeMissingList([111, 222]).includes("COPYMINT_ALLOWED_CHATS=111,222")
+  );
+  check(
+    "…and says what to do when there are none",
+    describeMissingList([]).includes("Message the bot once")
+  );
+
+  // A refusal that answered every message would hand a stranger an oracle and
+  // spend the bot's rate limit doing it; one that answered none would leave a
+  // real user staring at silence.
+  const throttle = new DenialThrottle(1000);
+  check("a blocked chat is told once", throttle.shouldReply(7, 0));
+  check("…and not again immediately", !throttle.shouldReply(7, 500));
+  check("…but again once the interval passes", throttle.shouldReply(7, 1100));
+  check("a different chat is not silenced by the first", throttle.shouldReply(8, 500));
+
+  // ── sweeping what a copy just bought ──────────────────────────────────
+  //
+  // dispatchAll returns on acceptance, which is neither mined nor successful.
+  // Everything here exists because a transfer signed against a token that does
+  // not exist yet is a wasted fee and a message saying the sweep worked.
+  section("auto-sweep");
+
+  const OWNER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+  const MINTED_NFT = "0x0000000000000000000000000000000000000ABC";
+  const sweepPad = (address: string): string => `0x${address.slice(2).toLowerCase().padStart(64, "0")}`;
+  const mintLog = (contract: string, to: string, tokenId: number) => ({
+    address: contract,
+    topics: [
+      TRANSFER_TOPIC,
+      sweepPad(ZERO_ADDRESS),
+      sweepPad(to),
+      `0x${tokenId.toString(16).padStart(64, "0")}`,
+    ],
+  });
+  const owners = [{ id: "w1", address: OWNER }];
+
+  const minted = tokensFromReceipt(
+    { status: "0x1", logs: [mintLog(MINTED_NFT, OWNER, 7)] } as TxReceipt,
+    owners
+  );
+  check(
+    "a mint receipt yields the token it minted",
+    minted.length === 1 && minted[0].tokenId === "7" && minted[0].ownerId === "w1"
+  );
+  check(
+    "the NFT contract comes from the log, not from whatever we called",
+    minted[0]?.contract.toLowerCase() === MINTED_NFT.toLowerCase()
+  );
+  check(
+    "a reverted mint yields nothing at all",
+    tokensFromReceipt({ status: "0x0", logs: [mintLog(MINTED_NFT, OWNER, 7)] } as TxReceipt, owners)
+      .length === 0
+  );
+  check(
+    "a receipt with no status is treated as no proof",
+    tokensFromReceipt({ logs: [mintLog(MINTED_NFT, OWNER, 7)] } as TxReceipt, owners).length === 0
+  );
+  check(
+    "an ERC-20 transfer sharing the topic is not mistaken for an NFT",
+    tokensFromReceipt(
+      {
+        status: "0x1",
+        logs: [
+          {
+            address: MINTED_NFT,
+            topics: [TRANSFER_TOPIC, sweepPad(ZERO_ADDRESS), sweepPad(OWNER)],
+          },
+        ],
+      } as TxReceipt,
+      owners
+    ).length === 0
+  );
+  check(
+    "a mint credited to somebody else is not ours to sweep",
+    tokensFromReceipt(
+      { status: "0x1", logs: [mintLog(MINTED_NFT, VECTORS[2], 7)] } as TxReceipt,
+      owners
+    ).length === 0
+  );
+  // A router that mints into our wallet and forwards it on in the same call
+  // leaves us holding nothing — and a sweep of it would sign a transfer the
+  // chain rejects.
+  check(
+    "a token forwarded out in the same transaction is not counted",
+    tokensFromReceipt(
+      {
+        status: "0x1",
+        logs: [
+          mintLog(MINTED_NFT, OWNER, 7),
+          {
+            address: MINTED_NFT,
+            topics: [TRANSFER_TOPIC, sweepPad(OWNER), sweepPad(VECTORS[2]), `0x${(7).toString(16).padStart(64, "0")}`],
+          },
+        ],
+      } as TxReceipt,
+      owners
+    ).length === 0
+  );
+  check(
+    "several tokens in one mint all come through",
+    tokensFromReceipt(
+      { status: "0x1", logs: [mintLog(MINTED_NFT, OWNER, 1), mintLog(MINTED_NFT, OWNER, 2)] } as TxReceipt,
+      owners
+    ).length === 2
+  );
+
+  const hashes = (accepted: boolean) => [
+    { id: "w1", address: OWNER, hash: "0xaa", accepted },
+  ];
+  check(
+    "auto-sweep off does nothing",
+    decideSweep({
+      enabled: false,
+      destination: VECTORS[0],
+      zeroAddress: ZERO_ADDRESS,
+      hashes: hashes(true),
+    }).skip?.kind === "disabled"
+  );
+  // The zero address is this bot's "no vault yet" sentinel, and a transfer to
+  // it is a burn. This is the one mistake in auto-sweep that could not be undone.
+  check(
+    "an unset vault stops the sweep rather than burning the token",
+    decideSweep({
+      enabled: true,
+      destination: ZERO_ADDRESS,
+      zeroAddress: ZERO_ADDRESS,
+      hashes: hashes(true),
+    }).skip?.kind === "no-destination"
+  );
+  check(
+    "a copy where nothing was accepted has nothing to wait for",
+    decideSweep({
+      enabled: true,
+      destination: VECTORS[0],
+      zeroAddress: ZERO_ADDRESS,
+      hashes: hashes(false),
+    }).skip?.kind === "nothing-accepted"
+  );
+  check(
+    "a wallet that is already the vault is not made to pay to send to itself",
+    decideSweep({
+      enabled: true,
+      destination: OWNER,
+      zeroAddress: ZERO_ADDRESS,
+      hashes: hashes(true),
+    }).skip?.kind === "already-there"
+  );
+  const goes = decideSweep({
+    enabled: true,
+    destination: VECTORS[0],
+    zeroAddress: ZERO_ADDRESS,
+    hashes: hashes(true),
+  });
+  check("otherwise it proceeds with the accepted wallets", goes.proceed && goes.sent.length === 1);
+
+  // The wait is the substance of the feature: a receipt that is not there yet
+  // is not a failure, and must be asked for again rather than written off.
+  let asked = 0;
+  const patient = await collectMintedTokens({
+    sent: [{ id: "w1", address: OWNER, hash: "0xaa" }],
+    getReceipt: async () => {
+      asked++;
+      return asked < 3 ? null : ({ status: "0x1", logs: [mintLog(MINTED_NFT, OWNER, 9)] } as TxReceipt);
+    },
+    waitMs: 60_000,
+    pollMs: 1,
+    sleep: async () => undefined,
+  });
+  check(
+    "a pending transaction is polled until it lands",
+    asked === 3 && patient.tokens.length === 1 && patient.mined === 1
+  );
+
+  let sweepClock = 0;
+  const gaveUp = await collectMintedTokens({
+    sent: [{ id: "w1", address: OWNER, hash: "0xaa" }],
+    getReceipt: async () => null,
+    waitMs: 100,
+    pollMs: 10,
+    sleep: async () => undefined,
+    now: () => (sweepClock += 40),
+  });
+  check(
+    "a transaction that never lands is reported pending, not swept",
+    gaveUp.pending === 1 && gaveUp.tokens.length === 0
+  );
+
+  const wasted = await collectMintedTokens({
+    sent: [{ id: "w1", address: OWNER, hash: "0xaa" }],
+    getReceipt: async () => ({ status: "0x0", logs: [] }) as TxReceipt,
+    waitMs: 1000,
+    pollMs: 1,
+    sleep: async () => undefined,
+  });
+  check(
+    "a mint that reverted is counted as reverted, not as nothing minted",
+    wasted.reverted === 1 && wasted.pending === 0 && wasted.tokens.length === 0
+  );
+
+  let attempts = 0;
+  const flaky = await collectMintedTokens({
+    sent: [{ id: "w1", address: OWNER, hash: "0xaa" }],
+    getReceipt: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("provider rate limit");
+      return { status: "0x1", logs: [mintLog(MINTED_NFT, OWNER, 4)] } as TxReceipt;
+    },
+    waitMs: 60_000,
+    pollMs: 1,
+    sleep: async () => undefined,
+  });
+  check(
+    "a failed read is retried rather than taken as an answer",
+    flaky.tokens.length === 1 && flaky.pending === 0
+  );
+
+  // ── booking a mint for later ──────────────────────────────────────────
+  //
+  // The parser is the safety here. A mint fired twelve hours late costs gas and
+  // buys nothing, and "at 3" means 03:00 to a clock and 15:00 to the person
+  // typing it — so every accepted form is unambiguous and everything else is
+  // refused by name rather than guessed at.
+  section("scheduled mints");
+
+  const NOON = Date.UTC(2026, 7, 27, 12, 0, 0);
+
+  check(
+    "a clock time later today is today",
+    parseWhen("15:30", NOON) === Date.UTC(2026, 7, 27, 15, 30, 0)
+  );
+  check(
+    "a clock time that has passed rolls to tomorrow",
+    parseWhen("09:00", NOON) === Date.UTC(2026, 7, 28, 9, 0, 0)
+  );
+  check(
+    "seconds are honoured when given",
+    parseWhen("15:30:45", NOON) === Date.UTC(2026, 7, 27, 15, 30, 45)
+  );
+  check(
+    "a full date and time is taken exactly",
+    parseWhen("2026-08-29 15:30", NOON) === Date.UTC(2026, 7, 29, 15, 30, 0)
+  );
+  check(
+    "ISO with a Z parses the same way",
+    parseWhen("2026-08-29T15:30:00Z", NOON) === Date.UTC(2026, 7, 29, 15, 30, 0)
+  );
+  check("a relative minute count works", parseWhen("in 45m", NOON) === NOON + 45 * 60_000);
+  check(
+    "a compound duration adds up",
+    parseWhen("in 1h30m", NOON) === NOON + 90 * 60_000
+  );
+  check("days are understood", parseWhen("in 3d", NOON) === NOON + 3 * 86_400_000);
+  check(
+    "epoch seconds are accepted — it is what a countdown script contains",
+    parseWhen(String(Math.floor((NOON + 3_600_000) / 1000)), NOON) === NOON + 3_600_000
+  );
+
+  // Each of these is a way somebody actually gets a time wrong, and every one
+  // of them would otherwise book a mint for a moment nobody meant.
+  check("a bare hour is refused rather than guessed", throws(() => parseWhen("3", NOON), ScheduleError));
+  check(
+    "a date with no time of day is refused, and says why",
+    throws(() => parseWhen("2026-08-29", NOON), ScheduleError)
+  );
+  check("a 25th hour is refused", throws(() => parseWhen("25:00", NOON), ScheduleError));
+  check(
+    "the 30th of February is refused rather than rolled into March",
+    throws(() => parseWhen("2026-02-30 12:00", NOON), ScheduleError)
+  );
+  check(
+    "a duration with a junk unit is refused, not read as its number",
+    throws(() => parseWhen("in 30x", NOON), ScheduleError)
+  );
+  check("a moment already past is refused", throws(() => parseWhen("2020-01-01 12:00", NOON), ScheduleError));
+  check(
+    "a time too soon to prepare for is refused with the reason",
+    throws(() => parseWhen(String(NOON + MIN_LEAD_MS / 2), NOON), ScheduleError)
+  );
+  check(
+    "a time more than a month out is refused",
+    throws(() => parseWhen("in 60d", NOON), ScheduleError)
+  );
+
+  check("a countdown reads in the largest useful unit", untilText(3 * 3_600_000 + 60_000) === "3h 1m");
+  check("…and seconds when that is all there is", untilText(45_000) === "45s");
+  check("one time format everywhere", whenText(Date.UTC(2026, 7, 29, 15, 30)) === "2026-08-29 15:30 UTC");
+
+  const booked = bookings.add({
+    contract: VECTORS[0],
+    chainKey: "base",
+    chainId: 8453,
+    quantity: 2,
+    selector: "derived+funded",
+    path: "public",
+    fireAt: Date.now() + 3_600_000,
+    collection: "Test Drop",
+  });
+  check("a booking survives a round trip to disk", bookings.find(booked.id)?.quantity === 2);
+  check("…and is listed as waiting", bookings.pending().some((m) => m.id === booked.id));
+  check(
+    "a booking an hour out is not armed yet",
+    bookings.due(Date.now(), 150_000).every((m) => m.id !== booked.id)
+  );
+  check(
+    "…and is armed once it falls inside the lead time",
+    bookings.due(Date.now() + 3_500_000, 150_000).some((m) => m.id === booked.id)
+  );
+  // The one that was actually missing before: a booking whose moment passed
+  // while the process was not running must be buried, not fired hours late.
+  check(
+    "a booking whose moment passed long ago counts as missed",
+    bookings.missed(Date.now() + 7_200_000, 120_000).some((m) => m.id === booked.id)
+  );
+  check(
+    "…but not while it is still inside the grace window",
+    bookings.missed(Date.now() + 3_600_000 + 60_000, 120_000).every((m) => m.id !== booked.id)
+  );
+  // A booking interrupted mid-arm is claimed by a runner that no longer exists.
+  // Without reclaiming it, it sits in a status neither `due` nor `missed` looks
+  // at: never fired, never buried, and invisible to somebody expecting a mint.
+  bookings.update(booked.id, { status: "running" });
+  check(
+    "a mid-flight booking is invisible to the arming pass",
+    bookings.due(Date.now() + 3_500_000, 150_000).every((m) => m.id !== booked.id)
+  );
+  check("…until a restart hands it back", bookings.reclaimRunning().some((m) => m.id === booked.id));
+  check(
+    "…after which it arms normally again",
+    bookings.due(Date.now() + 3_500_000, 150_000).some((m) => m.id === booked.id)
+  );
+
+  bookings.cancel(booked.id);
+  check("cancelling takes it out of the waiting list", !bookings.pending().some((m) => m.id === booked.id));
+  check("…but keeps it as history", bookings.find(booked.id)?.status === "cancelled");
+  check("cancelling twice does not resurrect it", bookings.cancel(booked.id)?.status === "cancelled");
+
+  // ── what the operator is shown before agreeing ────────────────────────
+  //
+  // Two sources answer, neither answers all of it, and where they disagree the
+  // contract wins — because the contract is the code that runs. The point of
+  // the merge is that a disagreement is *shown* rather than silently resolved.
+  section("drop preview");
+
+  const chainStage: StageFacts = {
+    label: "public",
+    priceWei: 8_000_000_000_000_000n,
+    startsAt: Date.UTC(2026, 7, 29, 15, 0),
+    endsAt: Date.UTC(2026, 7, 30, 15, 0),
+    live: false,
+    source: "chain",
+  };
+  const seaStage: StageFacts = {
+    label: "public stage",
+    priceWei: 5_000_000_000_000_000n,
+    startsAt: Date.UTC(2026, 7, 29, 14, 0),
+    endsAt: Date.UTC(2026, 7, 30, 15, 0),
+    live: false,
+    source: "opensea",
+  };
+  const previewBase = {
+    contract: VECTORS[0],
+    chainKey: "previewBase",
+    chainName: "Base",
+    chainId: 8453,
+    now: Date.UTC(2026, 7, 27, 12, 0),
+  };
+
+  const both = mergePreview({
+    ...previewBase,
+    chain: { stage: chainStage, name: "On-chain Name", totalSupply: "120", maxSupply: "500" },
+    opensea: { slug: "a-drop", name: "Marketplace Name", stage: seaStage },
+  });
+  check("the contract's price is the one shown", both.stage?.priceWei === chainStage.priceWei);
+  check("the contract's own name wins over the listing", both.collection === "On-chain Name");
+  check("a SeaDrop stage means the pre-signable path", both.path === "public");
+  check(
+    "an hour of drift between the two published times is called out",
+    both.notes.some((n) => n.includes("The contract is what runs"))
+  );
+  check(
+    "a price that disagrees is called out too",
+    both.notes.some((n) => n.includes("You pay the contract's price"))
+  );
+
+  const seaOnly = mergePreview({
+    ...previewBase,
+    chain: { stage: null },
+    opensea: { slug: "a-drop", name: "Marketplace Name", stage: seaStage },
+  });
+  check("no SeaDrop stage but a slug means the OpenSea path", seaOnly.path === "fcfs");
+  check("…and the listing's name is used when the chain has none", seaOnly.collection === "Marketplace Name");
+  check(
+    "…and it is said that calldata cannot be fetched early",
+    seaOnly.notes.some((n) => n.includes("refuses"))
+  );
+
+  const neither = mergePreview({ ...previewBase, chain: { stage: null }, opensea: {} });
+  check("nothing resolvable is reported as unmintable", neither.path === "unknown");
+
+  const live: StageFacts = { ...chainStage, startsAt: previewBase.now - 1000, endsAt: previewBase.now + 1000 };
+  const later: StageFacts = { ...chainStage, startsAt: previewBase.now + 86_400_000 };
+  check(
+    "an open stage is the one shown, not the next one",
+    pickStage([later, live], previewBase.now)?.startsAt === live.startsAt
+  );
+  check(
+    "…and with none open, the soonest to come",
+    pickStage([{ ...later, startsAt: previewBase.now + 200_000 }, later], previewBase.now)?.startsAt ===
+      previewBase.now + 200_000
+  );
+
+  check(
+    "every scheduling command is declared to Telegram",
+    ["schedule", "scheduled", "unschedule"].every((name) =>
+      BOT_COMMANDS.some((c) => c.command === name)
+    )
+  );
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   cleanup();

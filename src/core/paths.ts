@@ -27,6 +27,24 @@ export function userStateDir(chatId: number): string {
   return join(rootStateDir(), "users", String(chatId));
 }
 
+/**
+ * Every chat that has state here, whether or not it got as far as a wallet.
+ *
+ * Distinct from storedUserChatIds on purpose: a chat that opened the bot and
+ * stopped at the setup screen has a config and no seed, so it is invisible to
+ * the resume path — and is exactly the chat somebody building an access list
+ * needs to see, because it is a real person mid-setup rather than a stranger.
+ */
+export function knownUserChatIds(): number[] {
+  const users = join(rootStateDir(), "users");
+  if (!existsSync(users)) return [];
+  return readdirSync(users, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+    .map((entry) => Number(entry.name))
+    .filter((chatId) => Number.isSafeInteger(chatId) && chatId > 0)
+    .sort((a, b) => a - b);
+}
+
 /** Users whose encrypted stores should resume background work after a reboot. */
 export function storedUserChatIds(): number[] {
   const users = join(rootStateDir(), "users");

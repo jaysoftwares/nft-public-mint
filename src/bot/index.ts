@@ -21,7 +21,7 @@ import {
   ResolvedConfig,
   ConfigError,
 } from "../core/config";
-import { storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
+import { knownUserChatIds, storedUserChatIds, userStateDir, withStateDir } from "../core/paths";
 import { deriveUserPassphrase } from "../core/user-key";
 import { Session, ChainContext } from "./session";
 import { ManagedWallet } from "../core/wallet-store";
@@ -50,14 +50,27 @@ import {
   TRANSFER_GAS,
 } from "../core/funding";
 import { discoverMintedHoldings, sweepNfts, Holding, MintSite } from "../core/holdings";
+import {
+  collectMintedTokens,
+  decideSweep,
+  SkipReason,
+  TxReceipt,
+} from "../core/auto-sweep";
+import {
+  AccessList,
+  AccessError,
+  DenialThrottle,
+  ALLOWED_CHATS_ENV,
+  describeMissingList,
+} from "../core/access";
 import { explainRejection } from "../core/dispatcher";
 import { collectionName } from "../core/collection-name";
 import { executePublicMint, MintEvent, MintReport } from "../core/mint-public";
-import { entries as ledgerEntries, spentSince } from "../core/ledger";
+import { entries as ledgerEntries, record, spentSince } from "../core/ledger";
 import { collectDashboard, ChainReading } from "../core/dashboard";
 import { probeTarget, assessMint } from "../core/target-probe";
 import * as targets from "../core/targets";
-import { CopyEvent } from "../core/copy-mint";
+import { CopyEvent, CopyResult } from "../core/copy-mint";
 import { renderCopyResult } from "./copy-report";
 import {
   fetchAllowListRoot,
@@ -82,6 +95,19 @@ import {
   OpenSeaApiError,
 } from "../core/opensea-api";
 import { resolveCollectionInput } from "../core/collection-input";
+import * as schedule from "../core/schedule";
+import { ScheduledMint, ScheduleError, untilText, whenText } from "../core/schedule";
+import {
+  mergePreview,
+  pickStage,
+  readSupply,
+  readName,
+  DropPreview,
+  StageFacts,
+  ChainFacts,
+  OpenSeaFacts,
+} from "../core/drop-preview";
+import { fetchPublicDrop, DropReadError } from "../seadrop-public";
 import { rpcCall } from "../core/rpc";
 import {
   executeOpenSeaMint,
@@ -123,6 +149,9 @@ import {
   mainMenu,
   dashboardMenu,
   mintMenu,
+  scheduledKeyboard,
+  scheduleConfirm,
+  scheduleTimeKeyboard,
   walletsMenu,
   walletImportMenu,
   moneyMenu,
@@ -145,6 +174,7 @@ import {
   backTo,
   describeFlow,
   autoFireMenu,
+  autoSweepMenu,
   walletsPager,
   targetsKeyboard,
   setupMenu,
@@ -179,6 +209,16 @@ interface UserRuntime {
  * there is no argument to re-read before it runs.
  */
 const MAX_FUND_PER_WALLET_WEI = parseEther("0.5");
+
+/**
+ * Who may use this bot at all.
+ *
+ * Filled once at boot from the environment and never afterwards, so nothing
+ * reachable from a chat can widen it. Boot refuses to start on an empty list
+ * rather than falling open — see core/access.ts.
+ */
+let access: AccessList;
+const denials = new DenialThrottle();
 
 const runtimeContext = new AsyncLocalStorage<UserRuntime>();
 const runtimePromises = new Map<number, Promise<UserRuntime>>();
@@ -230,6 +270,7 @@ function initialUserConfig(): BotConfig {
       enabled: false,
       tiers: { ...bootstrapConfig.copy.tiers },
     },
+    autoSweep: { ...bootstrapConfig.autoSweep },
     signed: {
       ...bootstrapConfig.signed,
       api: {
@@ -277,6 +318,36 @@ function userRuntime(chatId: number): Promise<UserRuntime> {
   return creating;
 }
 
+/**
+ * The door.
+ *
+ * Runs before anything else, and specifically before runForUser — which creates
+ * a state directory, a config and a setup screen for whatever chat id it is
+ * handed. That side effect is the reason this cannot be a check further down:
+ * by the time a handler could refuse a stranger, the stranger would already
+ * have a wallet store waiting for them on disk.
+ *
+ * A blocked chat is always logged, because a genuine user who has changed
+ * account or was never added looks identical to a stranger from in here, and
+ * the id in the log is the only way the operator can tell the difference and
+ * act on it.
+ */
+async function gateAccess(ctx: Context, next: () => Promise<void>): Promise<void> {
+  const chat = ctx.chat;
+  if (!chat) return;
+  if (access.allows(chat.id)) return next();
+
+  const who = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ?? "unknown");
+  console.log(`  Blocked chat ${chat.id} (${who}) — not in ${ALLOWED_CHATS_ENV}.`);
+
+  // Answer the spinner regardless, or their client sits on a loading button.
+  if (ctx.callbackQuery) await ctx.answerCallbackQuery("Not authorised.").catch(() => undefined);
+  if (!denials.shouldReply(chat.id)) return;
+  await ctx
+    .reply("This bot is private and your account is not on its access list.")
+    .catch(() => undefined);
+}
+
 async function runForUser(ctx: Context, next: () => Promise<void>): Promise<void> {
   const chat = ctx.chat;
   if (!chat) return;
@@ -299,7 +370,16 @@ async function runForUser(ctx: Context, next: () => Promise<void>): Promise<void
 }
 
 async function resumeStoredUsers(): Promise<void> {
-  const ids = storedUserChatIds();
+  // Filtered by the same list the door uses. A chat removed from the allowlist
+  // must not keep a watcher, a reconcile timer and an armed copy engine running
+  // on the strength of a store it created before it was removed — that would be
+  // the bot still spending their money after being told to stop serving them.
+  const all = storedUserChatIds();
+  const ids = all.filter((chatId) => access.allows(chatId));
+  const dropped = all.length - ids.length;
+  if (dropped > 0) {
+    console.log(`  ${dropped} stored user(s) not on the access list — not resumed.`);
+  }
   for (let offset = 0; offset < ids.length; offset += 3) {
     const batch = ids.slice(offset, offset + 3);
     await Promise.all(
@@ -438,12 +518,21 @@ const HELP = `<b>Copymint</b>
 /nfts [selector] [contract] [on &lt;chain&gt;] — which wallets hold NFTs right now.
   Checks every network unless you name one. Reads only; sweep nothing.
 /sweep [selector] [contract] — move NFTs to the vault, leave gas
+/autosweep on|off — do that by itself whenever a copy-mint lands
 /drain [selector] — send ETH back to the funder, leave nothing
 
 <b>Minting</b>
 /mint &lt;contract&gt; &lt;qty&gt; [selector] [wait] — public SeaDrop mint
 /check &lt;contract&gt; [listUrl] — who's on the allowlist
 /allowlist &lt;contract&gt; &lt;qty&gt; [selector] [wait] — FCFS allowlist mint
+
+<b>Scheduled mints</b>
+/schedule &lt;link|contract&gt; [qty] [selector] at &lt;time&gt; — book it and walk away.
+  Shows the collection, chain, price, supply and total cost before booking.
+  Times are UTC: <code>at 15:30</code>, <code>at 2026-08-29 15:30</code>, <code>at in 45m</code>.
+  A SeaDrop drop is signed minutes early and held, so T-0 is socket writes.
+/scheduled — what is booked, with a cancel button on each
+/unschedule &lt;id&gt; — call one off
 
 <b>FCFS via OpenSea</b> <i>(needs OPENSEA_API_KEY)</i>
 /probe &lt;contract&gt; — stages, and what OpenSea will issue now
@@ -465,7 +554,7 @@ whichever you're eligible for. Times are UTC.
 /caps — spend limits and today's usage
 
 <b>Settings</b>
-/settings — change your NFT vault
+/settings — change your NFT vault, and see whether auto-sweep is on
 
 <b>Selectors</b>
 <code>all</code> <code>derived</code> <code>imported</code> <code>funded</code> <code>stuck</code> <code>autofire</code> <code>manual</code>
@@ -1676,6 +1765,10 @@ async function cmdSweep(ctx: Context): Promise<void> {
       (done, total) =>
         status.update(`<b>Sweep</b>\n\n${bar(done, total)}  preparing ${done}/${total}`)
     );
+    // The manual sweep has the same nonce accounting to settle as the automatic
+    // one, and now that a copy can be followed by a sweep at any moment, a
+    // wallet left with a stale counter is a mint rejected as a duplicate.
+    advanceSweepNonces(chain, toMove);
 
     const failed = result.outcomes.filter((o) => !o.accepted);
     // Failures grouped by cause the same way the mint report does it, so the
@@ -3016,6 +3109,507 @@ async function cmdCopy(ctx: Context): Promise<void> {
   );
 }
 
+// ── Scheduled mints ───────────────────────────────────────────────────────
+//
+// A drop opens at a published minute and is gone in the next one. Everything
+// else in this bot assumes somebody is holding the phone at that minute; this
+// is the part that does not.
+
+/**
+ * Read the drop from both sources at once.
+ *
+ * Both are optional and both are allowed to fail. A contract with no SeaDrop
+ * public stage is a normal, common thing — it means OpenSea's path — and an
+ * OpenSea lookup without an API key is a missing feature, not a broken drop.
+ * What must never happen is one source's failure hiding what the other knew,
+ * which is why each is caught separately and reported by name.
+ */
+async function buildDropPreview(
+  chain: ChainContext,
+  contract: string,
+  slugHint?: string
+): Promise<DropPreview> {
+  const now = Date.now();
+
+  const chainSide = (async (): Promise<ChainFacts> => {
+    try {
+      const [drop, name, supply] = await Promise.all([
+        fetchPublicDrop(chain.rpc.readUrl, contract),
+        readName(chain.rpc.readUrl, contract),
+        readSupply(chain.rpc.readUrl, contract),
+      ]);
+      const stage: StageFacts | null = drop
+        ? {
+            label: "public",
+            priceWei: drop.mintPrice,
+            startsAt: drop.startTime > 0 ? drop.startTime * 1000 : undefined,
+            endsAt: drop.endTime > 0 ? drop.endTime * 1000 : undefined,
+            perWallet:
+              drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : undefined,
+            live: drop.startTime * 1000 <= now && drop.endTime * 1000 > now,
+            source: "chain",
+          }
+        : null;
+      return { stage, name, ...supply };
+    } catch (err) {
+      // A transport failure says nothing about the collection, and saying so
+      // is the difference between "check your RPC" and a wild goose chase
+      // through a contract that was fine all along.
+      const message =
+        err instanceof DropReadError ? err.message : `could not be read (${(err as Error).message})`;
+      return { stage: null, error: message };
+    }
+  })();
+
+  const seaSide = (async (): Promise<OpenSeaFacts> => {
+    const apiKey = (process.env.OPENSEA_API_KEY ?? "").trim();
+    if (!apiKey) return { error: "no API key set, so the marketplace side is unknown" };
+    try {
+      const slug = slugHint ?? (await slugForContract(apiKey, chain.chainId, contract));
+      if (!slug) return { error: "does not recognise this contract" };
+      const drop = await fetchDrop(apiKey, slug);
+      const stages: StageFacts[] = drop.stages.map((s) => ({
+        label: describeStage(s),
+        priceWei: s.price ? BigInt(s.price) : 0n,
+        startsAt: Number.isNaN(Date.parse(s.start_time)) ? undefined : Date.parse(s.start_time),
+        endsAt: Number.isNaN(Date.parse(s.end_time)) ? undefined : Date.parse(s.end_time),
+        perWallet: Number(s.max_per_wallet) || undefined,
+        live: stageIsLive(s),
+        source: "opensea",
+      }));
+      return {
+        slug,
+        name: drop.collection_name,
+        totalSupply: drop.total_supply,
+        maxSupply: drop.max_supply,
+        openseaUrl: drop.opensea_url,
+        isMinting: drop.is_minting,
+        stage: pickStage(stages, now),
+        stageCount: stages.length,
+      };
+    } catch (err) {
+      return { error: (err as Error).message };
+    }
+  })();
+
+  const [chainFacts, openseaFacts] = await Promise.all([chainSide, seaSide]);
+  return mergePreview({
+    contract,
+    chainKey: chain.key,
+    chainName: chain.name,
+    chainId: chain.chainId,
+    chain: chainFacts,
+    opensea: openseaFacts,
+    now,
+  });
+}
+
+/**
+ * The card somebody reads before agreeing to spend money while asleep.
+ *
+ * Everything on it is a fact that changes the decision: what it is, where it
+ * lives, what one costs, how many exist, when it opens and how many wallets
+ * will fire. The total is spelled out because "0.008 ETH" and "0.008 × 120
+ * wallets" are very different agreements and only one of them is what happens.
+ */
+function renderPreviewCard(
+  preview: DropPreview,
+  quantity: number,
+  selector: string,
+  walletCount: number,
+  fireAt: number
+): string {
+  const stage = preview.stage;
+  // Price is per NFT, gas is per transaction, and one transaction mints the
+  // whole quantity — so only the price multiplies by it. Multiplying both was
+  // the easy mistake, and it inflates the estimate by the gas of every NFT
+  // after the first.
+  const unitWei = (stage?.priceWei ?? 0n) * BigInt(quantity);
+  const gasWei = gasReservation(config.gasLimit, config.maxFeePerGas);
+  const totalWei = (unitWei + gasWei) * BigInt(walletCount);
+
+  const supply =
+    preview.totalSupply !== undefined && preview.maxSupply !== undefined
+      ? `${preview.totalSupply} / ${preview.maxSupply} minted`
+      : preview.maxSupply !== undefined
+        ? `${preview.maxSupply} supply`
+        : preview.totalSupply !== undefined
+          ? `${preview.totalSupply} minted so far`
+          : undefined;
+
+  return [
+    `<b>${esc(preview.collection ?? "Unnamed collection")}</b>`,
+    `<code>${esc(preview.contract)}</code>`,
+    ``,
+    `network    <b>${esc(preview.chainName)}</b>`,
+    preview.slug ? `slug       <code>${esc(preview.slug)}</code>` : ``,
+    supply ? `supply     ${esc(supply)}` : ``,
+    stage
+      ? `price      ${eth(stage.priceWei)} ETH each${stage.priceWei === 0n ? " <i>(free)</i>" : ""}`
+      : `price      <i>unknown until the stage is configured</i>`,
+    stage?.perWallet !== undefined ? `per wallet ${stage.perWallet} max` : ``,
+    stage
+      ? `stage      ${esc(stage.label)}${stage.live ? " · <b>open now</b>" : ""}` +
+        (stage.startsAt !== undefined && !stage.live
+          ? `\nopens      ${esc(whenText(stage.startsAt))}`
+          : ``)
+      : ``,
+    ``,
+    `<b>Booking</b>`,
+    `fires      ${esc(whenText(fireAt))}  <i>(in ${untilText(fireAt - Date.now())})</i>`,
+    `quantity   ${quantity} each`,
+    `wallets    ${walletCount} matching <code>${esc(selector)}</code>`,
+    `path       ${preview.path === "public" ? "SeaDrop public — pre-signed, fires on the tick" : preview.path === "fcfs" ? "OpenSea — calldata fetched at T-0" : "<i>decided at T-0 — nothing readable yet</i>"}`,
+    ``,
+    `<b>at most ${eth(totalWei)} ETH</b> <i>(mint + gas reservation, all wallets)</i>`,
+    preview.notes.length > 0
+      ? `\n${preview.notes.map((n) => `⚠️ <i>${esc(n)}</i>`).join("\n")}`
+      : ``,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** A booking shown to the operator but not yet written down. */
+interface PendingBooking {
+  preview: DropPreview;
+  quantity: number;
+  selector: string;
+  walletCount: number;
+  fireAt: number;
+  at: number;
+}
+
+const pendingBookings = new Map<number, PendingBooking>();
+/** Long enough to read the card, short enough that yesterday's tap cannot book. */
+const BOOKING_TTL_MS = 10 * 60_000;
+
+function takePendingBooking(chatId: number): PendingBooking | undefined {
+  const booking = pendingBookings.get(chatId);
+  pendingBookings.delete(chatId);
+  if (!booking) return undefined;
+  return Date.now() - booking.at > BOOKING_TTL_MS ? undefined : booking;
+}
+
+/**
+ * Book a mint for later.
+ *
+ * Takes what /mint and /fcfs take, plus a time, and accepts an OpenSea link
+ * wherever they take a contract — pasting the link is what somebody actually
+ * has when they hear about a drop, and making them find the address first is
+ * the step at which a scheduled mint stops being worth the trouble.
+ */
+async function cmdSchedule(ctx: Context): Promise<void> {
+  const parts = args(ctx);
+  const atIndex = parts.findIndex((p) => p.toLowerCase() === "at");
+  const when = atIndex === -1 ? "" : parts.slice(atIndex + 1).join(" ");
+  // `on <chain>` is a keyword pair, not a positional. Filtering only the word
+  // "on" would leave the chain name sitting in the selector slot, which is how
+  // "/schedule 0x… 1 on base at 16:00" ends up minting from wallets tagged
+  // "base" — a set that does not exist, reported as if the wallets were wrong.
+  const head = withoutKeywordPairs(atIndex === -1 ? parts : parts.slice(0, atIndex));
+
+  const [raw, qtyArg, selectorArg] = head;
+  if (!raw || !when) {
+    await ctx.reply(
+      [
+        `<b>Schedule a mint</b>`,
+        ``,
+        `<code>/schedule &lt;link|contract&gt; [qty] [selector] at &lt;time&gt;</code>`,
+        ``,
+        `<b>Times are UTC.</b> Any of these work:`,
+        `  <code>at 15:30</code> — today, or tomorrow if it has passed`,
+        `  <code>at 2026-08-29 15:30</code>`,
+        `  <code>at in 45m</code> · <code>at in 2h30m</code>`,
+        ``,
+        `<b>Examples</b>`,
+        `<code>/schedule https://opensea.io/collection/some-drop 2 at 16:00</code>`,
+        `<code>/schedule 0xabc… 1 derived+funded at in 90m</code>`,
+        ``,
+        `<i>You see the collection, price, supply and total cost before anything`,
+        `is booked. Use /scheduled to list or cancel.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  let fireAt: number;
+  try {
+    fireAt = schedule.parseWhen(when);
+  } catch (err) {
+    if (err instanceof ScheduleError) {
+      await ctx.reply(`⚠️ ${err.message}`, { parse_mode: "HTML" });
+      return;
+    }
+    throw err;
+  }
+
+  const quantity = Number(qtyArg ?? 1);
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    await ctx.reply("Quantity must be a positive whole number.");
+    return;
+  }
+  const selector = selectorArg ?? "derived+funded";
+
+  const status = new StatusCard(bot, ctx.chat!.id);
+  await status.start(`<b>Schedule</b>\n\nlooking up ${esc(raw.slice(0, 80))}…`);
+
+  try {
+    // The link is resolved before the chain is detected, because a slug tells
+    // us nothing about an address until OpenSea has been asked.
+    const resolved = await resolveCollectionInput(
+      raw,
+      (process.env.OPENSEA_API_KEY ?? "").trim() || undefined,
+      config.chain
+    );
+    const address = getAddress(resolved.address);
+    const chainOverride = chainOverrideFrom(args(ctx));
+    const chain = chainOverride
+      ? session.chain(chainOverride)
+      : (await session.detectChain(address)).chain;
+
+    await status.update(
+      `<b>Schedule</b>\n\n<code>${esc(short(address))}</code> on ${esc(chain.name)}\n\nreading the drop…`
+    );
+
+    const preview = await buildDropPreview(chain, address, resolved.slug);
+    const matched = await select(selector, ctx, chain.key, false);
+    if (!matched) {
+      await status.finish(`<b>Schedule</b>\n\nNo wallets match <code>${esc(selector)}</code>.`);
+      return;
+    }
+
+    pendingBookings.set(ctx.chat!.id, {
+      preview,
+      quantity,
+      selector,
+      walletCount: matched.length,
+      fireAt,
+      at: Date.now(),
+    });
+
+    await status.finish(
+      renderPreviewCard(preview, quantity, selector, matched.length, fireAt),
+      scheduleConfirm()
+    );
+  } catch (err) {
+    await status.finish(`<b>Could not schedule that</b>\n\n${esc((err as Error).message)}`);
+  }
+}
+
+/** Write down the booking the operator has just agreed to. */
+async function confirmBooking(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+
+  const booking = takePendingBooking(chatId);
+  if (!booking) {
+    await ctx.reply(
+      "That booking expired before it was confirmed. Run <code>/schedule</code> again.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const { preview } = booking;
+
+  // A drop nobody can read yet is the normal state of a drop worth booking:
+  // you hear about it before the stage is configured, which is the whole reason
+  // to book it. So "unknown" becomes "auto" and the runner reads the chain
+  // again at T-0, when the answer exists. Refusing here would have made the
+  // scheduler useless for exactly the drops it is for.
+  const entry = schedule.add({
+    contract: preview.contract,
+    chainKey: preview.chainKey,
+    chainId: preview.chainId,
+    slug: preview.slug,
+    collection: preview.collection,
+    quantity: booking.quantity,
+    selector: booking.selector,
+    path: preview.path === "unknown" ? "auto" : preview.path,
+    fireAt: booking.fireAt,
+    priceWei: preview.stage?.priceWei?.toString(),
+    supply: preview.totalSupply,
+    maxSupply: preview.maxSupply,
+    stage: preview.stage?.label,
+  });
+
+  await ctx.reply(
+    [
+      `<b>📅 Booked — ${esc(entry.id)}</b>`,
+      ``,
+      `${esc(entry.collection ?? short(entry.contract))} × ${entry.quantity}`,
+      `fires ${esc(whenText(entry.fireAt))} <i>(in ${untilText(entry.fireAt - Date.now())})</i>`,
+      `from ${booking.walletCount} wallet(s) on ${esc(preview.chainName)}`,
+      ``,
+      preview.path === "public"
+        ? `<i>Transactions are signed a couple of minutes ahead and held, so the mint goes out on the tick.</i>`
+        : preview.path === "fcfs"
+          ? `<i>OpenSea will not issue calldata before the stage opens, so the request itself happens at T-0.</i>`
+          : `<i>⚠️ Nothing is readable on this contract yet. The runner reads the chain again a` +
+            ` couple of minutes before firing and takes whichever path exists then — if neither` +
+            ` does, it will tell you rather than spend anything.</i>`,
+      ``,
+      `<i>Fund those wallets before then — a booking does not reserve ETH.</i>`,
+      `<code>/scheduled</code> to list · <code>/unschedule ${esc(entry.id)}</code> to stop it`,
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  );
+}
+
+async function cmdScheduled(ctx: Context): Promise<void> {
+  const all = schedule.list();
+  const waiting = all.filter((m) => m.status === "pending" || m.status === "running");
+  const finished = all.filter((m) => m.status !== "pending" && m.status !== "running").slice(-5);
+
+  if (all.length === 0) {
+    await ctx.reply(
+      [
+        `<b>No mints booked</b>`,
+        ``,
+        `<code>/schedule &lt;link|contract&gt; [qty] at &lt;time&gt;</code>`,
+        ``,
+        `<i>Paste an OpenSea link and a UTC time. You will see the collection,`,
+        `price and total cost before anything is booked.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: mintMenu(0) }
+    );
+    return;
+  }
+
+  const line = (m: ScheduledMint): string => {
+    const name = esc(m.collection ?? short(m.contract));
+    const chainName = session.chains.get(m.chainKey)?.name ?? m.chainKey;
+    const price = m.priceWei !== undefined ? ` · ${eth(BigInt(m.priceWei))} ETH` : "";
+    return [
+      `<code>${esc(m.id)}</code>  <b>${name}</b> × ${m.quantity}`,
+      `    ${esc(whenText(m.fireAt))} · ${esc(chainName)}${price}`,
+      m.status === "pending"
+        ? `    ⏳ in ${untilText(m.fireAt - Date.now())} · <code>${esc(m.selector)}</code>`
+        : m.status === "running"
+          ? `    🔴 firing now`
+          : `    ${m.status === "done" ? "✅" : m.status === "missed" ? "🕳" : "✕"} ${esc(m.outcome ?? m.status)}`,
+    ].join("\n");
+  };
+
+  await ctx.reply(
+    [
+      `<b>📅 Booked mints</b>`,
+      ``,
+      waiting.length > 0 ? waiting.map(line).join("\n\n") : `<i>Nothing waiting.</i>`,
+      finished.length > 0 ? `\n<b>Recent</b>\n${finished.map(line).join("\n\n")}` : ``,
+      ``,
+      `<i>Times are UTC. Cancel with a button or <code>/unschedule &lt;id&gt;</code>.</i>`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    { parse_mode: "HTML", reply_markup: scheduledKeyboard(waiting.map((m) => m.id)) }
+  );
+}
+
+async function cmdUnschedule(ctx: Context): Promise<void> {
+  const [id] = args(ctx);
+  if (!id) {
+    await ctx.reply("Usage: <code>/unschedule &lt;id&gt;</code> — see <code>/scheduled</code>.", {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const entry = schedule.find(id.trim().toLowerCase());
+  if (!entry) {
+    await ctx.reply(`No booking with id <code>${esc(id)}</code>.`, { parse_mode: "HTML" });
+    return;
+  }
+  if (entry.status === "running") {
+    // Honest rather than reassuring: the transactions may already be signed and
+    // held, and saying "cancelled" when they are about to go out would be a lie
+    // the operator only discovers from their balance.
+    await ctx.reply(
+      `<code>${esc(entry.id)}</code> is already firing — it cannot be called back now.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  if (entry.status !== "pending") {
+    await ctx.reply(
+      `<code>${esc(entry.id)}</code> already finished (${esc(entry.status)}).`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  schedule.cancel(entry.id);
+  await ctx.reply(
+    `<b>Cancelled</b>  <code>${esc(entry.id)}</code>\n\n` +
+      `${esc(entry.collection ?? short(entry.contract))} will not be minted at ${esc(whenText(entry.fireAt))}.`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/**
+ * Turn the follow-the-copy sweep on or off.
+ *
+ * Separate from /copy on purpose. Firing spends money; sweeping only moves what
+ * that money already bought between two addresses the same person owns. Tying
+ * them together would mean somebody who wants their NFTs collected has to leave
+ * autonomous buying on to get it.
+ */
+async function cmdAutoSweep(ctx: Context): Promise<void> {
+  const [state] = args(ctx);
+  const on = config.autoSweep.enabled;
+
+  if (state !== "on" && state !== "off") {
+    const vaultSet = config.vault !== ZeroAddress;
+    await ctx.reply(
+      [
+        `<b>Auto-sweep is ${on ? "ON" : "OFF"}</b>`,
+        ``,
+        on
+          ? `When a copy-mint lands, the NFTs are moved into your vault by themselves.`
+          : `NFTs stay in whichever wallets minted them until you run <code>/sweep all</code>.`,
+        ``,
+        vaultSet
+          ? `Vault  <code>${esc(config.vault)}</code>`
+          : `<b>No vault set</b> — set one in Settings or nothing can be swept.`,
+        ``,
+        `<code>/autosweep on</code> · <code>/autosweep off</code>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: autoSweepMenu(on) }
+    );
+    return;
+  }
+
+  const enabled = state === "on";
+  updateUserSettings({ autoSweep: enabled });
+  config.autoSweep.enabled = enabled;
+
+  await ctx.reply(
+    enabled
+      ? [
+          `<b>Auto-sweep ON</b>`,
+          ``,
+          `Every copy-mint that lands is moved to your vault as soon as it confirms.`,
+          config.vault === ZeroAddress
+            ? `\n<b>Set an NFT vault in Settings first</b> — there is nowhere to send them yet.`
+            : `<code>${esc(config.vault)}</code>`,
+          ``,
+          `<i>Each transfer costs gas from the wallet that minted, so keep a little`,
+          `ETH in them. Saved for your account and survives a restart.</i>`,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : [
+          `<b>Auto-sweep OFF</b>`,
+          ``,
+          `Copied NFTs stay where they were minted. Collect them yourself with`,
+          `<code>/sweep all</code>.`,
+        ].join("\n"),
+    { parse_mode: "HTML" }
+  );
+}
+
 async function cmdCaps(ctx: Context): Promise<void> {
   // The cap governs autonomous spending, so that is what this reports against.
   const spent = spentSince(24, ["mint"], { autoOnly: true });
@@ -3244,9 +3838,255 @@ function renderCopyEvent(
       void feed.close();
       const r = event.result;
       notify(renderCopyResult(r, chain));
+      // Queued, never awaited: the sweep waits on receipts and the copy engine
+      // must be free to take the next signal in the meantime.
+      scheduleAutoSweep(r, chain);
       break;
     }
   }
+}
+
+// ── Auto-sweep ────────────────────────────────────────────────────────────
+//
+// What a copy-mint buys lands in whichever wallets fired, and until somebody
+// typed /sweep it stayed there. Now the sweep follows the purchase.
+
+/**
+ * One sweep per user at a time.
+ *
+ * Not politeness — correctness. Two copies inside a minute can involve the same
+ * wallets, and two sweeps signing from one address concurrently would both read
+ * the same nonce and one would be thrown away. Chaining them means the second
+ * reads a counter the first has already advanced.
+ */
+const sweepsInFlight = new Map<number, Promise<void>>();
+
+function scheduleAutoSweep(result: CopyResult, chain: ChainContext): void {
+  const runtime = currentRuntime();
+  const previous = sweepsInFlight.get(runtime.chatId) ?? Promise.resolve();
+
+  const chained = previous
+    .catch(() => undefined)
+    .then(() =>
+      // The state-path and runtime contexts are re-entered rather than
+      // inherited. This runs minutes after the update that started it, from a
+      // timer, and a sweep that wrote to the wrong user's ledger would be the
+      // worst bug in this file.
+      withStateDir(runtime.stateDir, () =>
+        runtimeContext.run(runtime, () => autoSweep(result, chain))
+      )
+    )
+    .catch((err: unknown) => {
+      // A rejection that escapes here would be an unhandled rejection, which
+      // this deployment has already learned kills the process under Node 22.
+      console.error(
+        `  chat ${runtime.chatId}: auto-sweep failed — ${(err as Error).message}`
+      );
+    });
+
+  sweepsInFlight.set(runtime.chatId, chained);
+  void chained
+    .finally(() => {
+      if (sweepsInFlight.get(runtime.chatId) === chained) {
+        sweepsInFlight.delete(runtime.chatId);
+      }
+    })
+    .catch(() => undefined);
+}
+
+/**
+ * Say nothing about a skip the owner already understands.
+ *
+ * Turning auto-sweep off, or a copy where every transaction was rejected, are
+ * both facts the chat has already been told in the message immediately above.
+ * Repeating them turns a working feature into noise. Only a missing destination
+ * is worth a line, because it is the one case where NFTs were bought and there
+ * is genuinely nowhere for them to go.
+ */
+function reportSweepSkip(skip: SkipReason | undefined): void {
+  if (skip?.kind !== "no-destination") return;
+  notify(
+    [
+      `<b>Bought, but not swept</b>`,
+      ``,
+      `Auto-sweep is on and there is no NFT vault set, so the tokens are still in`,
+      `the wallets that minted them.`,
+      ``,
+      `Set one in Settings, then <code>/sweep all</code>.`,
+    ].join("\n")
+  );
+}
+
+/**
+ * Advance the nonce counter past transactions a sweep has just sent.
+ *
+ * sweepNfts reads a starting nonce with peek() and counts upwards in its own
+ * map, which leaves the shared NonceManager believing none of those nonces were
+ * used. The next mint from the same wallet then signs over the top of a
+ * transfer that is still in flight and is rejected as a duplicate — rare enough
+ * to look like bad luck when a sweep was a deliberate, occasional act, and
+ * routine once every copy is followed by one.
+ *
+ * Advanced by transactions *prepared*, not accepted. A rejected transfer that
+ * turns out to have landed somewhere would otherwise have its nonce handed out
+ * twice, and the reconcile loop already exists to heal the opposite mistake.
+ */
+function advanceSweepNonces(chain: ChainContext, holdings: Holding[]): void {
+  const perOwner = new Map<string, number>();
+  for (const holding of holdings) {
+    perOwner.set(holding.owner, (perOwner.get(holding.owner) ?? 0) + 1);
+  }
+  for (const [address, count] of perOwner) {
+    for (let i = 0; i < count; i++) {
+      try {
+        chain.nonces.next(address);
+      } catch {
+        // Unprimed means nothing was signed from it either. Nothing to advance.
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Move a finished copy-mint into the vault.
+ *
+ * The wait is the substance of this. dispatchAll returns on acceptance, and a
+ * transfer signed before the mint is mined would be rejected by the contract —
+ * the token does not exist yet. So each accepted transaction is polled to a
+ * receipt, and the tokens are read out of the receipt logs rather than found by
+ * scanning: the receipt names the NFT contract even when the mint was routed
+ * through a separate minter, and costs one call per wallet on a provider whose
+ * rate limit is the binding constraint everywhere else here.
+ */
+async function autoSweep(result: CopyResult, chain: ChainContext): Promise<void> {
+  const decision = decideSweep({
+    enabled: config.autoSweep.enabled,
+    destination: config.vault,
+    zeroAddress: ZeroAddress,
+    hashes: result.hashes,
+  });
+  if (!decision.proceed) {
+    reportSweepSkip(decision.skip);
+    return;
+  }
+
+  const destination = getAddress(config.vault);
+  const collected = await collectMintedTokens({
+    sent: decision.sent,
+    getReceipt: (hash) =>
+      rpcCall<TxReceipt | null>(chain.rpc.readUrl, "eth_getTransactionReceipt", [hash]),
+    waitMs: config.autoSweep.waitSec * 1000,
+  });
+
+  if (collected.tokens.length === 0) {
+    // Silence here is what "the auto-sweep doesn't work" would sound like, and
+    // the three causes need three different things done about them.
+    if (collected.reverted > 0 || collected.pending > 0) {
+      notify(
+        [
+          `<b>Nothing to sweep yet</b>`,
+          ``,
+          collected.reverted > 0
+            ? `${collected.reverted} of ${decision.sent.length} mint(s) were accepted by the network and then reverted — no token was created.`
+            : ``,
+          collected.pending > 0
+            ? `${collected.pending} mint(s) had not made it into a block after ${Math.round(collected.waitedMs / 1000)}s. They may still land.`
+            : ``,
+          ``,
+          `<i>Check with <code>/nfts</code>, then <code>/sweep all</code> once they confirm.</i>`,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    }
+    return;
+  }
+
+  const ownerIds = new Set(collected.tokens.map((t) => t.ownerId));
+  const wallets = session.wallets().filter((w) => ownerIds.has(w.id));
+  await session.primeNonces(wallets, chain.key);
+
+  const names = new Map<string, string>();
+  for (const contract of new Set(collected.tokens.map((t) => t.contract))) {
+    const name = await collectionName(chain.rpc.readUrl, contract).catch(() => undefined);
+    if (name) names.set(contract.toLowerCase(), name);
+  }
+  const label = (contract: string): string =>
+    names.get(contract.toLowerCase()) ?? short(contract);
+
+  const sweep = await sweepNfts(collected.tokens, {
+    signerFor: session.signerFor,
+    vault: destination,
+    chainId: chain.chainId,
+    endpoints: chain.rpc.endpoints,
+    maxFeePerGas: config.maxFeePerGas,
+    maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+    nonceFor: (address: string) => session.nonceFor(address, chain.key),
+  });
+  advanceSweepNonces(chain, collected.tokens);
+
+  record({
+    kind: "sweep",
+    chainId: chain.chainId,
+    contract: result.contract,
+    walletIds: [...ownerIds],
+    valueWei: "0",
+    auto: true,
+    note: `auto-sweep ${sweep.accepted}/${collected.tokens.length} → ${destination}`,
+  });
+
+  const moved = new Map<string, number>();
+  const byId = new Map(collected.tokens.map((t) => [`${t.ownerId}#${t.tokenId}`, t]));
+  for (const outcome of sweep.outcomes) {
+    if (!outcome.accepted) continue;
+    const token = byId.get(outcome.id);
+    if (!token) continue;
+    const key = label(token.contract);
+    moved.set(key, (moved.get(key) ?? 0) + 1);
+  }
+
+  const byReason = new Map<string, number>();
+  for (const outcome of sweep.outcomes.filter((o) => !o.accepted)) {
+    const reason = explainRejection(outcome.errors);
+    byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+  }
+
+  notify(
+    [
+      sweep.accepted > 0
+        ? `<b>🧹 Auto-swept ${sweep.accepted} NFT(s)</b>`
+        : `<b>🧹 Auto-sweep could not move anything</b>`,
+      ``,
+      `From ${ownerIds.size} wallet(s) on ${esc(chain.name)} into your vault`,
+      `<code>${esc(destination)}</code>`,
+      ``,
+      ...[...moved.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([name, count]) => `  ${esc(name)} × ${count}`),
+      moved.size > 10 ? `  …and ${moved.size - 10} more collection(s)` : ``,
+      collected.reverted > 0
+        ? `\n<i>${collected.reverted} mint(s) reverted and minted nothing.</i>`
+        : ``,
+      collected.pending > 0
+        ? `\n<i>${collected.pending} mint(s) had not confirmed in time — run /sweep all for those.</i>`
+        : ``,
+      byReason.size > 0
+        ? `\n<b>Did not move</b>\n` +
+          [...byReason.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([reason, count]) => `  ${esc(reason)} — ${count}`)
+            .join("\n") +
+          `\n<i>Usually gas: a transfer needs its own fee on top of the mint.</i>`
+        : ``,
+      ``,
+      `<i>ETH stays in the wallets — they remain armed for the next signal.</i>`,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
 }
 
 async function showWalletImport(ctx: Context): Promise<void> {
@@ -3372,10 +4212,12 @@ async function showUserSettings(ctx: Context): Promise<void> {
         ? `<i>Created automatically with your wallet store</i>`
         : `<code>${esc(config.funder)}</code>`,
       ``,
+      `Auto-sweep after a copy-mint  <b>${config.autoSweep.enabled ? "ON" : "OFF"}</b>`,
+      ``,
       `<i>NFT sweeps go to the vault. ETH is funded from and reclaimed to your`,
       `derived funding wallet. Changing the vault never moves existing assets.</i>`,
     ].join("\n"),
-    { parse_mode: "HTML", reply_markup: settingsMenu(!isReady()) }
+    { parse_mode: "HTML", reply_markup: settingsMenu(!isReady(), config.autoSweep.enabled) }
   );
 }
 
@@ -3767,6 +4609,343 @@ function notify(html: string): void {
     });
 }
 
+// ── The scheduler's runner ────────────────────────────────────────────────
+
+/** How often to look at the book. Cheap: it reads one small file. */
+const SCHEDULE_TICK_MS = 10_000;
+/**
+ * How far ahead of a booking to start preparing.
+ *
+ * Everything that can be done before T-0 has to fit in here: resolving wallets,
+ * reading the drop, checking five hundred balances, priming nonces and signing
+ * five hundred transactions. The provider's rate limit is what sizes this, not
+ * the work — at ~20 effective calls a second a 500-wallet balance read and
+ * nonce prime is well over a minute on its own. Four minutes leaves room for
+ * that twice over and is still short enough that a wallet funded ten minutes
+ * before the drop is counted.
+ */
+const ARM_LEAD_MS = 240_000;
+/**
+ * How late a booking may still fire after the bot was down.
+ *
+ * Past this it is not a late mint, it is a different one: the price, the supply
+ * and the queue are not what was agreed to, and spending money on that is a
+ * decision nobody made. It is reported instead — which is the part that was
+ * missing when a scheduled /fcfs died with its handler and said nothing.
+ */
+const LATE_GRACE_MS = 120_000;
+
+const scheduleTimers = new Map<number, NodeJS.Timeout>();
+const firing = new Set<string>();
+
+function startScheduleRunner(): void {
+  const runtime = currentRuntime();
+  stopScheduleRunner(runtime.chatId);
+
+  // Anything left claimed by a runner that no longer exists goes back in the
+  // pool, where the ordinary rules will fire it or bury it. Without this a
+  // booking interrupted mid-arm sits in a status nothing looks at.
+  const reclaimed = schedule.reclaimRunning();
+  if (reclaimed.length > 0) {
+    console.log(
+      `  chat ${runtime.chatId}: reclaimed ${reclaimed.length} booking(s) left mid-flight.`
+    );
+  }
+
+  const timer = setInterval(() => {
+    withStateDir(runtime.stateDir, () =>
+      runtimeContext.run(runtime, () => {
+        // Never left bare: an unhandled rejection out of a timer takes the
+        // whole process down under Node 22, and this one runs every ten
+        // seconds for every user.
+        void tickSchedule().catch((err: unknown) =>
+          console.error(
+            `  chat ${runtime.chatId}: schedule tick failed — ${(err as Error).message}`
+          )
+        );
+      })
+    );
+  }, SCHEDULE_TICK_MS);
+
+  scheduleTimers.set(runtime.chatId, timer);
+}
+
+function stopScheduleRunner(chatId: number): void {
+  const timer = scheduleTimers.get(chatId);
+  if (timer) clearInterval(timer);
+  scheduleTimers.delete(chatId);
+}
+
+/**
+ * One pass over the book.
+ *
+ * Two jobs, and the order matters: bury the bookings whose moment passed while
+ * the bot was down before arming anything, or a mint that is four hours late
+ * gets armed and fired as though it were on time.
+ */
+async function tickSchedule(): Promise<void> {
+  const now = Date.now();
+
+  for (const entry of schedule.missed(now, LATE_GRACE_MS)) {
+    if (firing.has(entry.id)) continue;
+    schedule.update(entry.id, {
+      status: "missed",
+      finishedAt: now,
+      outcome: `missed by ${untilText(now - entry.fireAt)}`,
+    });
+    notify(
+      [
+        `<b>🕳 Missed a booked mint</b>`,
+        ``,
+        `<code>${esc(entry.id)}</code> ${esc(entry.collection ?? short(entry.contract))} was due at`,
+        `${esc(whenText(entry.fireAt))} — ${untilText(now - entry.fireAt)} ago.`,
+        ``,
+        `<i>The bot was not running at that moment. It was not fired late on purpose:`,
+        `the price and supply are no longer what you agreed to.</i>`,
+      ].join("\n")
+    );
+  }
+
+  for (const entry of schedule.due(now, ARM_LEAD_MS)) {
+    if (firing.has(entry.id)) continue;
+    firing.add(entry.id);
+    schedule.update(entry.id, { status: "running" });
+
+    const runtime = currentRuntime();
+    void runScheduled(entry)
+      .catch((err: unknown) => {
+        const message = (err as Error).message;
+        schedule.update(entry.id, {
+          status: "failed",
+          finishedAt: Date.now(),
+          outcome: message.slice(0, 200),
+        });
+        notify(
+          `<b>❌ Booked mint failed</b>\n\n<code>${esc(entry.id)}</code> ` +
+            `${esc(entry.collection ?? short(entry.contract))}\n\n${esc(message)}`
+        );
+      })
+      .catch((err: unknown) =>
+        console.error(
+          `  chat ${runtime.chatId}: booking ${entry.id} reporting failed — ${(err as Error).message}`
+        )
+      )
+      .finally(() => firing.delete(entry.id));
+  }
+}
+
+/**
+ * Arm and fire one booking.
+ *
+ * The path decides how T-0 is met. A SeaDrop public drop is signed here, now,
+ * minutes early, and the hold happens on already-signed bytes — so the moment
+ * itself is socket writes and nothing else. OpenSea cannot be pre-signed at
+ * all, because it refuses to issue calldata before the stage opens, so its T-0
+ * is the fetch and the burst behind it.
+ */
+async function runScheduled(entry: ScheduledMint): Promise<void> {
+  const chain = session.chain(entry.chainKey);
+  const status = new StatusCard(bot, currentRuntime().chatId);
+  await status.start(
+    [
+      `<b>⏰ Arming booked mint</b>  <code>${esc(entry.id)}</code>`,
+      ``,
+      `${esc(entry.collection ?? short(entry.contract))} × ${entry.quantity} on ${esc(chain.name)}`,
+      `fires ${esc(whenText(entry.fireAt))} · in ${untilText(entry.fireAt - Date.now())}`,
+      ``,
+      `selecting wallets…`,
+    ].join("\n")
+  );
+
+  const tagCtx = await session.tagContext(chain.key, true);
+  const matched = resolveWallets(entry.selector, session.wallets(), tagCtx);
+  if (matched.length === 0) {
+    throw new Error(
+      `No wallets match "${entry.selector}" on ${chain.name} any more. Nothing was sent.`
+    );
+  }
+
+  // "auto" is resolved now rather than at booking time, because a drop is very
+  // often not configured yet when somebody books it — which is exactly when
+  // reading the chain would have said "no public stage" and picked wrong.
+  let path = entry.path;
+  if (path === "auto") {
+    const drop = await fetchPublicDrop(chain.rpc.readUrl, entry.contract).catch(() => null);
+    path = drop ? "public" : "fcfs";
+  }
+
+  await status.update(
+    [
+      `<b>⏰ Arming booked mint</b>  <code>${esc(entry.id)}</code>`,
+      ``,
+      `${matched.length} wallet(s) · ${path === "public" ? "SeaDrop public" : "OpenSea"}`,
+      `fires ${esc(whenText(entry.fireAt))}`,
+    ].join("\n")
+  );
+
+  const label = `<b>Booked mint</b> <code>${esc(entry.id)}</code>`;
+
+  if (path === "public") {
+    const report = await executePublicMint(
+      {
+        nftContract: entry.contract,
+        quantity: entry.quantity,
+        wallets: matched,
+        // Both clocks are honoured — see MintRequest.notBefore. The stage may
+        // open later than the booking, and firing early would only revert.
+        waitForStart: true,
+        notBefore: new Date(entry.fireAt),
+        skipUnderfunded: true,
+      },
+      {
+        readUrl: chain.rpc.readUrl,
+        allRpcUrls: chain.rpc.allUrls,
+        endpoints: chain.rpc.endpoints,
+        chainId: chain.chainId,
+        gasLimit: config.gasLimit,
+        maxFeePerGas: config.maxFeePerGas,
+        maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        nonces: chain.nonces,
+        signerFor: session.signerFor,
+      },
+      (event: MintEvent) => {
+        switch (event.type) {
+          case "armed":
+            status.update(
+              `${label}\n\n🔒 ${event.total} transaction(s) signed and held\n` +
+                `<i>T-0 is now socket writes only.</i>`
+            );
+            break;
+          case "waiting":
+            status.update(
+              `${label}\n\n⏳ holding — ${Math.round(event.msRemaining / 1000)}s\n` +
+                `<i>Everything is signed. Nothing left to do but the clock.</i>`
+            );
+            break;
+          case "dispatched":
+            status.update(`${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms`);
+            break;
+          case "receipts":
+            status.update(
+              `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
+                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending`
+            );
+            break;
+        }
+      }
+    );
+
+    schedule.update(entry.id, {
+      status: "done",
+      finishedAt: Date.now(),
+      outcome: `${report.confirmed}/${report.attempted} confirmed`,
+    });
+    const first = report.rows.find((r) => r.status === "confirmed");
+    await status.finish(
+      [
+        report.confirmed > 0 ? `<b>✅ Booked mint landed</b>` : `<b>❌ Booked mint bought nothing</b>`,
+        `<code>${esc(entry.id)}</code> ${esc(entry.collection ?? short(entry.contract))}`,
+        ``,
+        `${bar(report.confirmed, report.attempted)}  ${report.confirmed}/${report.attempted} confirmed`,
+        report.reverted > 0 ? `✗ ${report.reverted} reverted` : ``,
+        report.pending > 0 ? `· ${report.pending} still pending` : ``,
+        `spent ${eth(report.totalValue)} ETH`,
+        first ? `\n${txLink(chain.chainId, first.hash, "view a transaction")}` : ``,
+        report.errorSummary.length > 0
+          ? `\n<b>Rejections</b>\n${report.errorSummary
+              .slice(0, 3)
+              .map((e) => `  ${esc(e.reason)} — ${e.count}`)
+              .join("\n")}`
+          : ``,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+    return;
+  }
+
+  // ── OpenSea ──
+  const apiKey = requireApiKey();
+  const slug = entry.slug ?? (await resolveSlug(chain, entry.contract, undefined));
+
+  const report = await executeOpenSeaMint(
+    {
+      slug,
+      nftContract: entry.contract,
+      quantity: entry.quantity,
+      wallets: matched.map((w) => ({ id: w.id, address: w.address })),
+      startAt: new Date(entry.fireAt),
+      // Holding turns a near miss into a wait. A booked time that is a second
+      // early otherwise spends the entire run on one refusal.
+      waitForOpen: true,
+      skipUnderfunded: true,
+      unitPriceHintWei: entry.priceWei !== undefined ? BigInt(entry.priceWei) : undefined,
+    },
+    {
+      readUrl: chain.rpc.readUrl,
+      allRpcUrls: chain.rpc.allUrls,
+      endpoints: chain.rpc.endpoints,
+      chainId: chain.chainId,
+      gasLimit: config.gasLimit,
+      maxFeePerGas: config.maxFeePerGas,
+      maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+      nonces: chain.nonces,
+      signerFor: session.signerFor,
+      apiKey,
+      maxUnitPriceWei: config.capMaxPriceWei,
+      pacing: {
+        concurrency: config.signed.concurrency,
+        minDelayMs: config.signed.minDelayMs,
+        maxRetries: config.signed.maxRetries,
+      },
+    },
+    (event: OpenSeaMintEvent) => {
+      switch (event.type) {
+        case "waiting":
+          status.update(
+            `${label}\n\n⏳ holding — ${Math.round(event.msRemaining / 1000)}s\n` +
+              `<i>OpenSea will not issue calldata before the stage opens,\nso the fetch starts at T-0.</i>`
+          );
+          break;
+        case "probing":
+          status.update(
+            `${label}\n\n🔄 asking — attempt ${event.attempt}\n<i>${esc(event.reason.slice(0, 120))}</i>`
+          );
+          break;
+        case "fetching":
+          status.update(`${label}\n\n${bar(event.done, event.total)}  calldata ${event.done}/${event.total}`);
+          break;
+        case "receipts":
+          status.update(
+            `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
+              `${event.confirmed} confirmed · ${event.reverted} reverted`
+          );
+          break;
+      }
+    }
+  );
+
+  schedule.update(entry.id, {
+    status: "done",
+    finishedAt: Date.now(),
+    outcome: `${report.confirmed}/${report.attempted} confirmed`,
+  });
+  const firstOk = report.rows.find((r) => r.status === "confirmed");
+  await status.finish(
+    [
+      report.confirmed > 0 ? `<b>✅ Booked mint landed</b>` : `<b>❌ Booked mint bought nothing</b>`,
+      `<code>${esc(entry.id)}</code> ${esc(slug)}`,
+      ``,
+      `${bar(report.confirmed, report.attempted)}  ${report.confirmed}/${report.attempted} confirmed`,
+      `${report.fetched}/${report.requested} wallets got calldata`,
+      `spent ${eth(report.totalValue)} ETH · fetch ${report.fetchMs.toFixed(0)}ms`,
+      firstOk ? `\n${txLink(chain.chainId, firstOk.hash, "view a transaction")}` : ``,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+}
+
 /** Nonce hygiene and the copy-mint watcher — both need a live session. */
 async function startBackground(): Promise<void> {
   session.startReconcile(30_000, (message, level) => {
@@ -3785,8 +4964,14 @@ async function startBackground(): Promise<void> {
     }
   );
 
+  // Bookings are a file, so they survive whatever happened to the process that
+  // made them. Starting the runner here is what turns that file back into a
+  // commitment — and what buries anything whose moment passed while it was down.
+  startScheduleRunner();
+
   console.log(
-    `  Copy-mint: ${targets.list().length} target(s), firing ${session.copyEnabled ? "ON" : "OFF"}.`
+    `  Copy-mint: ${targets.list().length} target(s), firing ${session.copyEnabled ? "ON" : "OFF"}. ` +
+      `${schedule.pending().length} booked mint(s).`
   );
 }
 
@@ -3807,8 +4992,8 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
   const views: Record<string, { text: string; keyboard: ReturnType<typeof mainMenu> }> = {
     main: { text: menuHeader(), keyboard: mainMenu(session.copyEnabled, watched) },
     mint: {
-      text: `<b>Mint</b>\n\n<i>Public reads the drop from chain. FCFS asks OpenSea for whatever stage you're eligible for.</i>`,
-      keyboard: mintMenu(),
+      text: `<b>Mint</b>\n\n<i>Public reads the drop from chain. FCFS asks OpenSea for whatever stage you're eligible for. Schedule books either one for a time you name and fires it without you.</i>`,
+      keyboard: mintMenu(schedule.pending().length),
     },
     wallets: {
       text:
@@ -3825,8 +5010,8 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
       keyboard: autoFireMenu(),
     },
     money: {
-      text: `<b>Money</b>\n\n<i>Funding tops wallets up to a target. Sweeping moves NFTs to the vault and leaves gas in place. Reclaiming pulls the ETH back to the funder when a campaign is done.</i>`,
-      keyboard: moneyMenu(),
+      text: `<b>Money</b>\n\n<i>Funding tops wallets up to a target. Sweeping moves NFTs to the vault and leaves gas in place — automatically after a copy-mint, if auto-sweep is on. Reclaiming pulls the ETH back to the funder when a campaign is done.</i>`,
+      keyboard: moneyMenu(config.autoSweep.enabled),
     },
     copy: {
       text:
@@ -4079,6 +5264,57 @@ async function advanceFlow(ctx: Context, flow: Flow): Promise<void> {
     }
   }
 
+  // Scheduling asks the same three questions a mint does, then one more. It
+  // ends on the details card rather than a confirmation of its own: the card
+  // is the confirmation, because what is being agreed to is the drop, not the
+  // arguments.
+  if (flow.kind === "schedule") {
+    if (flow.quantity === undefined) {
+      await ctx.reply(
+        `<b>Schedule a mint</b>\n\n<code>${esc(flow.contract ?? "")}</code>\n\nHow many per wallet?`,
+        { parse_mode: "HTML", reply_markup: quantityKeyboard() }
+      );
+      return;
+    }
+    if (!flow.selector) {
+      await ctx.reply(`<b>Schedule a mint</b>\n\nWhich wallets?`, {
+        parse_mode: "HTML",
+        reply_markup: selectorKeyboard(),
+      });
+      return;
+    }
+    if (!flow.when) {
+      flow.step = "time";
+      await ctx.reply(
+        [
+          `<b>When should it fire?</b>`,
+          ``,
+          `Pick one, or type a time. <b>Times are UTC.</b>`,
+          ``,
+          `  <code>15:30</code> — today, or tomorrow if it has passed`,
+          `  <code>2026-08-29 15:30</code>`,
+          `  <code>in 45m</code> · <code>in 2h30m</code>`,
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: scheduleTimeKeyboard() }
+      );
+      return;
+    }
+
+    clearFlow(ctx.chat!.id);
+    return runWithArgs(
+      ctx,
+      [
+        flow.contract!,
+        String(flow.quantity),
+        flow.selector,
+        ...(flow.chain ? ["on", flow.chain] : []),
+        "at",
+        ...flow.when.split(/\s+/),
+      ],
+      cmdSchedule
+    );
+  }
+
   if (flow.kind === "mint" || flow.kind === "fcfs") {
     if (flow.quantity === undefined) {
       await ctx.reply(`<b>${label}</b>\n\n<code>${esc(flow.contract ?? "")}</code>\n\nHow many per wallet?`, {
@@ -4169,6 +5405,9 @@ async function executeFlow(ctx: Context, flow: Flow, waitForOpen: boolean): Prom
         cmdWatch
       );
     case "destination":
+    // Scheduling never reaches "ready": advanceFlow ends it on the details
+    // card, which is the confirmation, and the booking is taken from there.
+    case "schedule":
       return;
   }
 }
@@ -4247,6 +5486,10 @@ async function onCallback(ctx: Context): Promise<void> {
           return cmdWalletsCsv(ctx);
         case "nfts":
           return runWithArgs(ctx, ["all"], cmdNfts);
+        case "autosweep":
+          return cmdAutoSweep(ctx);
+        case "scheduled":
+          return cmdScheduled(ctx);
         case "autofire":
           return runWithArgs(ctx, ["autofire"], cmdWallets);
         case "targets":
@@ -4283,6 +5526,32 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "c":
       return runWithArgs(ctx, [payload], cmdCopy);
+
+    case "as":
+      return runWithArgs(ctx, [payload], cmdAutoSweep);
+
+    // A booking is the one thing here that spends money with nobody watching,
+    // so confirming it is always a separate, deliberate tap.
+    case "sch": {
+      const [action, id] = rest;
+      if (action === "go") return confirmBooking(ctx);
+      if (action === "drop") {
+        pendingBookings.delete(chatId);
+        await ctx.reply("Nothing booked.");
+        return;
+      }
+      if (action === "cancel" && id) return runWithArgs(ctx, [id], cmdUnschedule);
+      return;
+    }
+
+    // A preset firing time. The flow is mid-question, so this answers it the
+    // same way typing the words would.
+    case "st": {
+      const flow = getFlow(chatId);
+      if (!flow || flow.kind !== "schedule") return;
+      flow.when = payload;
+      return advanceFlow(ctx, flow);
+    }
 
     // One-tap remedies offered by the health check. They exist because the
     // setting that silenced this bot was four taps deep and had to be changed
@@ -4469,7 +5738,7 @@ async function onCallback(ctx: Context): Promise<void> {
       }
       await ctx.reply(
         [
-          `<b>${kind === "check" ? "Probe" : kind === "fcfs" ? "FCFS mint" : "Public mint"}</b>`,
+          `<b>${kind === "check" ? "Probe" : kind === "fcfs" ? "FCFS mint" : kind === "schedule" ? "Schedule a mint" : "Public mint"}</b>`,
           ``,
           `Send the contract address, or just paste the OpenSea link.`,
           ``,
@@ -4674,6 +5943,26 @@ async function onText(ctx: Context): Promise<void> {
     return advanceFlow(ctx, flow);
   }
 
+  // A typed firing time. Parsed here rather than at the far end so a bad time
+  // is refused while the question is still on screen, with the drop lookup not
+  // yet spent on it.
+  if (flow.kind === "schedule" && flow.step === "time") {
+    try {
+      schedule.parseWhen(text);
+    } catch (err) {
+      if (err instanceof ScheduleError) {
+        await ctx.reply(`⚠️ ${err.message}`, {
+          parse_mode: "HTML",
+          reply_markup: scheduleTimeKeyboard(),
+        });
+        return;
+      }
+      throw err;
+    }
+    flow.when = text;
+    return advanceFlow(ctx, flow);
+  }
+
   if (flow.step === "contract" || flow.step === "address") {
     let resolved;
     try {
@@ -4813,6 +6102,26 @@ async function main(): Promise<void> {
     throw err;
   }
 
+  // The access list, before anything else that could serve a request.
+  //
+  // Refusing to start on a missing list is the whole point. The alternative —
+  // starting open and hoping the list arrives — is a bot that hands a wallet
+  // to whoever finds it, and the operator would have no way to notice.
+  try {
+    access = AccessList.fromEnv();
+  } catch (err) {
+    if (err instanceof AccessError) {
+      console.error(`\n  ${err.message}\n`);
+      process.exit(1);
+    }
+    throw err;
+  }
+  if (access.size === 0) {
+    console.error(describeMissingList(knownUserChatIds()));
+    process.exit(1);
+  }
+  console.log(`  Access list: ${access.size} chat(s) — ${access.ids().join(", ")}`);
+
   // Environment first so systemd can start unattended; console otherwise.
   masterPassphrase = (process.env.COPYMINT_PASSPHRASE || "").trim();
   if (!masterPassphrase) {
@@ -4826,6 +6135,10 @@ async function main(): Promise<void> {
   }
 
   bot = new Bot(bootstrapConfig.telegramToken);
+
+  // The access list is the first thing every update meets — before any state
+  // directory is created for the chat that sent it.
+  bot.use((ctx, next) => gateAccess(ctx, next));
 
   // Every private chat is a user boundary. The state-path and runtime contexts
   // wrap the entire update, including timers and background work it creates.
@@ -4874,12 +6187,16 @@ async function main(): Promise<void> {
   bot.command("fund", (ctx) => cmdFund(ctx).catch((e) => fail(ctx, e)));
   bot.command("nfts", (ctx) => cmdNfts(ctx).catch((e) => fail(ctx, e)));
   bot.command("sweep", (ctx) => cmdSweep(ctx).catch((e) => fail(ctx, e)));
+  bot.command("autosweep", (ctx) => cmdAutoSweep(ctx).catch((e) => fail(ctx, e)));
   bot.command("drain", (ctx) => cmdDrain(ctx).catch((e) => fail(ctx, e)));
   bot.command("mint", (ctx) => cmdMint(ctx).catch((e) => fail(ctx, e)));
   bot.command("check", (ctx) => cmdCheck(ctx).catch((e) => fail(ctx, e)));
   bot.command("allowlist", (ctx) => cmdAllowList(ctx).catch((e) => fail(ctx, e)));
   bot.command("probe", (ctx) => cmdProbe(ctx).catch((e: unknown) => fail(ctx, e)));
   bot.command("fcfs", (ctx) => cmdFcfs(ctx).catch((e: unknown) => fail(ctx, e)));
+  bot.command("schedule", (ctx) => cmdSchedule(ctx).catch((e: unknown) => fail(ctx, e)));
+  bot.command("scheduled", (ctx) => cmdScheduled(ctx).catch((e: unknown) => fail(ctx, e)));
+  bot.command("unschedule", (ctx) => cmdUnschedule(ctx).catch((e: unknown) => fail(ctx, e)));
   bot.command("watch", (ctx) => cmdWatch(ctx).catch((e) => fail(ctx, e)));
   bot.command("unwatch", (ctx) => cmdUnwatch(ctx).catch((e) => fail(ctx, e)));
   bot.command("targets", (ctx) => cmdTargets(ctx).catch((e) => fail(ctx, e)));
@@ -4917,6 +6234,7 @@ async function shutdown(): Promise<void> {
       const runtime = await pending;
       runtime.session?.stopCopy();
       runtime.session?.stopReconcile();
+      stopScheduleRunner(runtime.chatId);
     } catch {
       // A runtime that never opened has no background work to stop.
     }

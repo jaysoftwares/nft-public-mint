@@ -38,6 +38,16 @@ export interface MintRequest {
   wallets: ManagedWallet[];
   /** Hold until the stage opens instead of firing now. */
   waitForStart: boolean;
+  /**
+   * Do not fire before this instant, whatever the stage says.
+   *
+   * A booked mint has two clocks — the stage's own opening and the minute the
+   * operator asked for — and they are not interchangeable. A stage that is
+   * already open would otherwise fire the moment the runner armed it, minutes
+   * early, which is not what "schedule this for 15:00" means. Signing still
+   * happens before the hold, so T-0 remains nothing but socket writes.
+   */
+  notBefore?: Date;
   /** Fire anyway when some wallets can't cover the reservation. */
   skipUnderfunded: boolean;
 }
@@ -167,11 +177,19 @@ export async function executePublicMint(
   const signMs = Number(process.hrtime.bigint() - signStart) / 1e6;
   emit({ type: "armed", total: prepared.length, signMs });
 
-  // ── Hold for the stage ──
-  if (!live && req.waitForStart) {
-    const msRemaining = startsAt.getTime() - Date.now();
-    emit({ type: "waiting", msRemaining });
-    await sleepUntil(startsAt.getTime());
+  // ── Hold ──
+  //
+  // The later of the two clocks wins. Firing at the booked minute into a stage
+  // that has not opened reverts and burns gas; firing at the opening ignores
+  // what was actually asked for. Waiting for both is the only reading that is
+  // never wrong.
+  const holdUntil = Math.max(
+    !live && req.waitForStart ? startsAt.getTime() : 0,
+    req.notBefore ? req.notBefore.getTime() : 0
+  );
+  if (holdUntil > Date.now()) {
+    emit({ type: "waiting", msRemaining: holdUntil - Date.now() });
+    await sleepUntil(holdUntil);
   }
 
   // ── Fire ──
