@@ -65,6 +65,28 @@ import {
 import * as bookings from "../core/schedule";
 import { ScheduleError, parseWhen, untilText, whenText, MIN_LEAD_MS } from "../core/schedule";
 import { mergePreview, pickStage, StageFacts } from "../core/drop-preview";
+import {
+  MintStage,
+  Eligibility,
+  buildStages,
+  classifyIssuance,
+  classifyProof,
+  pickStage as pickMintStage,
+  stageState,
+  canFire,
+  isSettled,
+  summariseSelection,
+  paginate,
+} from "../core/mint-plan";
+import { mintMenu } from "../bot/menu";
+import {
+  defaultFilter,
+  initialSelection,
+  walletPickerKeyboard,
+  WALLETS_PER_PAGE,
+  CardWallet,
+  MintDraft,
+} from "../bot/mint-card";
 import { openSeaChainSlug } from "../core/opensea-api";
 import { CHAINS } from "../chains";
 import {
@@ -3799,6 +3821,409 @@ async function main(): Promise<void> {
     "…and with none open, the soonest to come",
     pickStage([{ ...later, startsAt: previewBase.now + 200_000 }, later], previewBase.now)?.startsAt ===
       previewBase.now + 200_000
+  );
+
+  // ── the mint card ─────────────────────────────────────────────────────
+  //
+  // One screen replaces three commands, and the judgements that make it safe
+  // are all here: which refusal actually condemns a wallet, which stage to arm
+  // when several are open, and what the total really is.
+  section("mint card");
+
+  const cardNow = Date.UTC(2026, 7, 29, 12, 0, 0);
+  const hour = 3_600_000;
+
+  // The load-bearing rule. OpenSea will not build a transaction for a stage
+  // that has not opened, however entitled the minter is, so a refusal
+  // collected before the open is evidence about the clock and nothing else.
+  // Reading it as ineligibility paints ❌ on exactly the wallets somebody
+  // bought an allowlist place for.
+  check(
+    "issued calldata means eligible",
+    classifyIssuance({ available: true }, true) === "eligible"
+  );
+  check(
+    "a refusal on a LIVE stage naming eligibility is authoritative",
+    classifyIssuance({ available: false, kind: "not_eligible" }, true) === "ineligible"
+  );
+  check(
+    "the same refusal before the open says nothing about the wallet",
+    classifyIssuance({ available: false, kind: "not_eligible" }, false) === "unknown"
+  );
+  check(
+    "'stage not live' is never a verdict on a wallet",
+    classifyIssuance({ available: false, kind: "not_live" }, false) === "unknown"
+  );
+  check(
+    "a rate limit is not an eligibility answer",
+    classifyIssuance({ available: false, kind: "rate_limited" }, true) === "unknown"
+  );
+  check(
+    "a server error is not an eligibility answer either",
+    classifyIssuance({ available: false, kind: "server" }, true) === "unknown"
+  );
+  // These three are about the wallet or the supply, not the clock, so they
+  // survive an unopened stage.
+  check(
+    "exhausted supply holds whether the stage is open or not",
+    classifyIssuance({ available: false, kind: "minted_out" }, false) === "minted_out"
+  );
+  check(
+    "a wallet that cannot cover the mint is marked short, not ineligible",
+    classifyIssuance({ available: false, kind: "insufficient_balance" }, false) === "underfunded"
+  );
+  check(
+    "an address OpenSea has barred is marked so, permanently",
+    classifyIssuance({ available: false, kind: "account_restricted" }, false) === "restricted"
+  );
+  check("a merkle proof is a straight yes", classifyProof(true) === "eligible");
+  check("…and its absence a straight no", classifyProof(false) === "ineligible");
+
+  check("only 'eligible' may fire", canFire("eligible") && !canFire("unknown") && !canFire(undefined));
+  check(
+    "an unknown verdict is worth asking again; a barred address is not",
+    !isSettled("unknown") && isSettled("restricted") && isSettled("minted_out")
+  );
+
+  // Stage timing. A stage with no published times at all is the shape of a
+  // bare ERC-721 whose sale is a boolean it keeps to itself — nothing to wait
+  // for and nothing to have missed, so the only useful reading is "try it".
+  const timedStage = (over: Partial<MintStage>): MintStage => ({
+    key: "t",
+    label: "Stage",
+    kind: "public",
+    source: "chain",
+    priceWei: 0n,
+    ...over,
+  });
+  check(
+    "a stage between its start and end is live",
+    stageState(timedStage({ startsAt: cardNow - hour, endsAt: cardNow + hour }), cardNow) === "live"
+  );
+  check(
+    "…before its start, upcoming",
+    stageState(timedStage({ startsAt: cardNow + hour }), cardNow) === "upcoming"
+  );
+  check(
+    "…after its end, ended",
+    stageState(timedStage({ endsAt: cardNow - 1 }), cardNow) === "ended"
+  );
+  check(
+    "a stage with no published times counts as live rather than unreachable",
+    stageState(timedStage({}), cardNow) === "live"
+  );
+  check(
+    "an open-ended stage stays live once it opens",
+    stageState(timedStage({ startsAt: cardNow - 1 }), cardNow) === "live"
+  );
+
+  // Merging the two readings. The contract is the code that will run, so it
+  // wins — and the disagreement is shown rather than silently resolved.
+  const merged = buildStages({
+    chain: [
+      {
+        kind: "public",
+        label: "Public",
+        priceWei: 8_000_000_000_000_000n,
+        startsAt: Date.UTC(2026, 7, 29, 15, 0),
+      },
+    ],
+    openSea: [
+      {
+        kind: "public",
+        label: "Public Sale",
+        priceWei: 5_000_000_000_000_000n,
+        startsAt: Date.UTC(2026, 7, 29, 14, 0),
+      },
+      { kind: "allowlist", label: "Presale", priceWei: 0n, startsAt: Date.UTC(2026, 7, 29, 13, 0) },
+    ],
+  });
+  check(
+    "the contract's public stage suppresses OpenSea's copy of it",
+    merged.stages.filter((s) => s.kind === "public").length === 1
+  );
+  check(
+    "…and the one kept is the contract's",
+    merged.stages.find((s) => s.kind === "public")?.source === "chain"
+  );
+  check(
+    "a price the marketplace disagrees with is stated, not hidden",
+    merged.notes.some((n) => /OpenSea lists .* the contract charges/.test(n))
+  );
+  check(
+    "a published opening time the contract does not share is stated too",
+    merged.notes.some((n) => /does not share/.test(n))
+  );
+  check(
+    "a gated stage is never deduplicated away — it is a different door",
+    merged.stages.some((s) => s.kind === "allowlist" && s.source === "opensea")
+  );
+  check(
+    "every stage gets a distinct key short enough for a callback",
+    new Set(merged.stages.map((s) => s.key)).size === merged.stages.length &&
+      merged.stages.every((s) => s.key.length <= 4)
+  );
+  check(
+    "with no chain stage, OpenSea's public stage is kept",
+    buildStages({
+      openSea: [{ kind: "public", label: "Public", priceWei: 0n }],
+    }).stages.length === 1
+  );
+
+  // Which stage to arm. Getting this wrong is how a wallet holding a free
+  // allowlist place is pointed at the paid public stage instead.
+  const cheapList: MintStage = {
+    key: "c1",
+    label: "Allowlist",
+    kind: "allowlist",
+    source: "chain",
+    priceWei: 0n,
+    startsAt: cardNow - hour,
+    endsAt: cardNow + hour,
+  };
+  const paidPublic: MintStage = {
+    key: "c0",
+    label: "Public",
+    kind: "public",
+    source: "chain",
+    priceWei: 8_000_000_000_000_000n,
+    startsAt: cardNow - hour,
+    endsAt: cardNow + hour,
+  };
+  const soonPresale: MintStage = {
+    key: "o0",
+    label: "Presale",
+    kind: "allowlist",
+    source: "opensea",
+    priceWei: 0n,
+    startsAt: cardNow + hour,
+  };
+  const closed: MintStage = { ...paidPublic, key: "c9", endsAt: cardNow - 1 };
+
+  const verdicts = (map: Record<string, Eligibility>) => (stage: MintStage) => map[stage.key];
+
+  check(
+    "a free allowlist place beats a paid public stage when both are open",
+    pickMintStage(
+      [paidPublic, cheapList],
+      cardNow,
+      verdicts({ c0: "eligible", c1: "eligible" })
+    )?.key === "c1"
+  );
+  check(
+    "…but not when the wallet has been definitively refused from it",
+    pickMintStage(
+      [paidPublic, cheapList],
+      cardNow,
+      verdicts({ c0: "eligible", c1: "ineligible" })
+    )?.key === "c0"
+  );
+  check(
+    "an inconclusive probe does not hand the card to the public stage",
+    pickMintStage(
+      [paidPublic, cheapList],
+      cardNow,
+      verdicts({ c1: "unknown" })
+    )?.key === "c1"
+  );
+  check(
+    "an open stage beats one that has not started",
+    pickMintStage([soonPresale, paidPublic], cardNow, verdicts({ c0: "eligible" }))?.key === "c0"
+  );
+  check(
+    "with nothing open, the soonest to come is armed",
+    pickMintStage([soonPresale], cardNow, () => undefined)?.key === "o0"
+  );
+  check(
+    "a closed stage is never armed while anything else exists",
+    pickMintStage([closed, soonPresale], cardNow, () => undefined)?.key === "o0"
+  );
+  check("no stages means nothing to arm", pickMintStage([], cardNow, () => undefined) === undefined);
+
+  // What the operator is agreeing to. "0.008 ETH" and "0.008 × 120 wallets"
+  // look identical until the money has moved.
+  const perWalletWei = 9_000_000_000_000_000n;
+  const selection = summariseSelection(
+    [
+      { id: "d:0", balanceWei: perWalletWei },
+      { id: "d:1", balanceWei: 1n },
+      { id: "d:2" },
+      { id: "d:3", balanceWei: perWalletWei * 2n },
+    ],
+    new Map<string, Eligibility | undefined>([
+      ["d:0", "eligible"],
+      ["d:1", "ineligible"],
+      ["d:2", "unknown"],
+      ["d:3", "eligible"],
+    ]),
+    perWalletWei
+  );
+  check("eligible wallets are counted", selection.eligible === 2);
+  check("a refusal is counted apart from an unanswered probe", selection.refused === 1 && selection.unknown === 1);
+  check("a wallet that can cover the mint counts as funded", selection.funded === 2);
+  check("…and one that cannot is counted short", selection.short === 1);
+  check(
+    "a balance nobody has read is neither funded nor short — it is unknown",
+    selection.funded + selection.short === 3 && selection.selected === 4
+  );
+  check(
+    "the total is the per-wallet cost times the whole set",
+    selection.totalWei === perWalletWei * 4n
+  );
+
+  // Paging a five-hundred-wallet list.
+  const pageable = Array.from({ length: 23 }, (_, i) => i);
+  check("a page starts where it is asked to", paginate(pageable, 10, 10).items[0] === 10);
+  check("…and holds a page's worth", paginate(pageable, 10, 10).items.length === 10);
+  check("the last page is short rather than padded", paginate(pageable, 20, 10).items.length === 3);
+  check(
+    "an offset past the end clamps onto the last page rather than showing nothing",
+    paginate(pageable, 900, 10).items.length === 3
+  );
+  check(
+    "an offset off a page boundary is aligned onto one",
+    paginate(pageable, 14, 10).offset === 10
+  );
+  check(
+    "the first page offers no Prev and the last no Next",
+    !paginate(pageable, 0, 10).hasPrev && paginate(pageable, 0, 10).hasNext && !paginate(pageable, 20, 10).hasNext
+  );
+  check("an empty list pages without throwing", paginate([], 5, 10).items.length === 0);
+
+  // A booking made by ticking wallets names those wallets. Re-resolving a
+  // selector at T-0 would quietly substitute a different set — which is the
+  // one substitution nobody notices until the receipts come back from the
+  // wrong addresses.
+  check("the allowlist is a schedulable path in its own right", bookings.MINT_PATHS.includes("allowlist"));
+  const picked = bookings.add({
+    contract: VECTORS[1],
+    chainKey: "base",
+    chainId: 8453,
+    quantity: 1,
+    selector: "3 picked on the card",
+    walletIds: ["d:0", "d:7", "i:0xabc"],
+    path: "allowlist",
+    fireAt: Date.now() + 2 * hour,
+  });
+  check(
+    "the exact wallets ticked survive the round trip to disk",
+    bookings.find(picked.id)?.walletIds?.join(",") === "d:0,d:7,i:0xabc"
+  );
+  check("…and so does the path they were ticked for", bookings.find(picked.id)?.path === "allowlist");
+  bookings.cancel(picked.id);
+
+  check(
+    "the mint card is reachable from the mint menu",
+    JSON.stringify(mintMenu(0).inline_keyboard).includes("mc:new")
+  );
+
+  // Where the card opens, and on what. A whitelist is granted to an address
+  // somebody already owns, so the wallet that mints a gated drop is one they
+  // import. The generated set is bulk plumbing for the copy engine — leading
+  // the picker with it buried the one wallet that mattered behind fifty pages.
+  const generated: CardWallet[] = Array.from({ length: 40 }, (_, i) => ({
+    id: `d:${i}`,
+    address: `0x${(i + 1).toString(16).padStart(40, "b")}`,
+    kind: "derived",
+    balanceWei: i < 5 ? 10_000_000_000_000_000n : 0n,
+  }));
+  const brought: CardWallet[] = [
+    {
+      id: "i:0xaaa",
+      address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      kind: "imported",
+      balanceWei: 20_000_000_000_000_000n,
+    },
+    {
+      id: "i:0xbbb",
+      address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      kind: "imported",
+      balanceWei: 0n,
+    },
+  ];
+
+  check(
+    "a card with an imported wallet opens on the imported set",
+    defaultFilter([...generated, ...brought]) === "imported"
+  );
+  check(
+    "…even when hundreds of generated wallets are present",
+    defaultFilter([...generated, ...generated, ...brought]) === "imported"
+  );
+  check(
+    "with nothing imported it opens on whatever holds money",
+    defaultFilter(generated) === "funded"
+  );
+  check(
+    "and on everything when nothing holds money either",
+    defaultFilter(generated.map((w) => ({ ...w, balanceWei: 0n }))) === "all"
+  );
+  check("no wallets at all still resolves to a filter", defaultFilter([]) === "all");
+
+  check(
+    "a handful of imported wallets is ticked for you — that is what they are for",
+    initialSelection([...generated, ...brought]).join(",") === "i:0xaaa,i:0xbbb"
+  );
+  check(
+    "generated wallets are never ticked without being asked for",
+    initialSelection(generated).length === 0
+  );
+  check(
+    "an imported set too big to see at once is left alone rather than pre-armed",
+    initialSelection(
+      Array.from({ length: WALLETS_PER_PAGE + 1 }, (_, i) => ({
+        id: `i:${i}`,
+        address: `0x${i.toString(16).padStart(40, "c")}`,
+        kind: "imported" as const,
+      }))
+    ).length === 0
+  );
+
+  const pickerDraft = (wallets: CardWallet[]): MintDraft => ({
+    chatId: 1,
+    messageId: 1,
+    contract: VECTORS[0],
+    chainKey: "base",
+    chainId: 8453,
+    chainName: "Base",
+    nativeSymbol: "ETH",
+    stages: [],
+    quantity: 1,
+    selected: initialSelection(wallets),
+    wallets,
+    verdicts: {},
+    filter: defaultFilter(wallets),
+    page: 0,
+    view: "wallets",
+    notes: [],
+    seq: 0,
+    probing: false,
+    gasReserveWei: 1_000_000_000_000_000n,
+    createdAt: Date.now(),
+  });
+
+  const withImports = JSON.stringify(
+    walletPickerKeyboard(pickerDraft([...generated, ...brought])).inline_keyboard
+  );
+  const withoutImports = JSON.stringify(
+    walletPickerKeyboard(pickerDraft(generated)).inline_keyboard
+  );
+  check("the imported filter is reachable from the picker", withImports.includes("mc:w:f:imported"));
+  check("…and so are funded, eligible and all", ["funded", "eligible", "all"].every((f) => withImports.includes(`mc:w:f:${f}`)));
+  check("importing is always one tap from the picker", withImports.includes("im:menu"));
+  check(
+    "with nothing imported, importing is the first button on the screen",
+    withoutImports.indexOf("im:menu") < withoutImports.indexOf("mc:w:f:")
+  );
+  check(
+    "the imported wallets are the ones ticked on a fresh picker",
+    withImports.includes("mc:w:t:i:0xaaa") && withImports.includes("\u2611 i:0xaaa")
+  );
+  check(
+    "every picker button stays inside Telegram's 64-byte callback limit",
+    walletPickerKeyboard(pickerDraft([...generated, ...brought]))
+      .inline_keyboard.flat()
+      .every((b) => !("callback_data" in b) || Buffer.byteLength(String(b.callback_data)) <= 64)
   );
 
   check(

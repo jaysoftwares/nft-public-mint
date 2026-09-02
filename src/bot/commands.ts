@@ -52,7 +52,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "drain", description: "Send leftover ETH back to your funding wallet" },
 
   // ── Minting by hand ──
-  { command: "mint", description: "Mint a public drop yourself" },
+  { command: "mint", description: "Mint a drop — pick the stage, the wallets and the moment" },
   { command: "fcfs", description: "Mint through OpenSea — whichever stage you qualify for" },
   { command: "probe", description: "Check a drop's stages and prices before minting" },
   { command: "check", description: "See which of your wallets are on an allowlist" },

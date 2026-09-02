@@ -80,6 +80,7 @@ import {
   checkEligibility,
   eligibilityTag,
   EligibilityReport,
+  EligibilityRow,
   ZERO_ROOT,
   AllowListError,
 } from "../core/allowlist";
@@ -120,6 +121,37 @@ import {
   recentSignals,
   summarise as summariseJournal,
 } from "../core/copy-journal";
+import {
+  MintStage,
+  Eligibility,
+  buildStages,
+  classifyIssuance,
+  classifyProof,
+  pickStage as pickMintStage,
+  stageState,
+  isLive as stageIsOpen,
+  canFire,
+  isSettled,
+  paginate,
+} from "../core/mint-plan";
+import {
+  MintDraft,
+  CardWallet,
+  WalletFilter,
+  WALLET_FILTERS,
+  WALLETS_PER_PAGE,
+  renderMintCard,
+  mintCardKeyboard,
+  mintPromptKeyboard,
+  activeStage,
+  selectedWallets,
+  filteredWallets,
+  verdictFor,
+  setVerdict,
+  requiredPerWallet as cardRequiredPerWallet,
+  defaultFilter,
+  initialSelection,
+} from "./mint-card";
 import { StatusCard, esc, eth, bar, short, clamp, toCsv, txLink } from "./ui";
 import { renderHealth, healthMenu, renderSignals, signalsMenu } from "./health";
 import {
@@ -522,7 +554,13 @@ const HELP = `<b>Copymint</b>
 /drain [selector] — send ETH back to the funder, leave nothing
 
 <b>Minting</b>
-/mint &lt;contract&gt; &lt;qty&gt; [selector] [wait] — public SeaDrop mint
+/mint — the mint card. Paste a link or a contract and it reads every stage
+  the contract and OpenSea can see, marks which of your wallets can mint each
+  one, and gives you two buttons: fire now, or book it for a time.
+  The picker opens on your imported wallets — the ones an allowlist was
+  granted to — with 🔑 Import right there if the one you need isn't in yet.
+  Tap wallets to tick them; filters and paging are for the generated set.
+/mint &lt;contract&gt; &lt;qty&gt; [selector] [wait] — the typed form, unchanged
 /check &lt;contract&gt; [listUrl] — who's on the allowlist
 /allowlist &lt;contract&gt; &lt;qty&gt; [selector] [wait] — FCFS allowlist mint
 
@@ -2076,7 +2114,9 @@ async function loadEligibility(
   chain: ChainContext,
   contract: string,
   explicitUri: string | undefined,
-  wallets: ManagedWallet[]
+  // Only the id and the address are proved against; asking for a whole
+  // ManagedWallet would stop the mint card passing the trimmed rows it holds.
+  wallets: { id: string; address: string }[]
 ): Promise<{ report: EligibilityReport; uri: string }> {
   const root = await fetchAllowListRoot(chain.rpc.readUrl, contract);
   if (BigInt(root) === BigInt(ZERO_ROOT)) {
@@ -2754,6 +2794,1161 @@ async function cmdFcfs(ctx: Context): Promise<void> {
       caption: `${latest.rows.length} wallet results`,
     });
   }
+}
+
+// ── The mint card ─────────────────────────────────────────────────────────
+//
+// One screen for minting, replacing three commands whose arguments had to be
+// remembered in order while a stage was opening. The card holds the drop, every
+// stage the chain or OpenSea can see, a tick-box list of wallets with a verdict
+// against the armed stage, and the two buttons that spend money — now, or at a
+// time you name.
+//
+// The draft is per chat and lives in memory. Losing one to a restart costs a
+// re-paste, which is the right trade against persisting a half-made decision
+// that spends money when the bot comes back.
+
+const mintDrafts = new Map<number, MintDraft>();
+
+/** Long enough to watch a countdown, short enough that yesterday's tap cannot fire. */
+const MINT_DRAFT_TTL_MS = 45 * 60_000;
+
+/**
+ * Wallets probed against OpenSea in one automatic pass.
+ *
+ * Sized for an imported set — the wallets somebody was actually whitelisted on,
+ * which is a handful and not a hundred — so opening the card answers for all of
+ * them without anybody tapping anything. The generated set is checked a page at
+ * a time on request instead; five hundred probes would be a rate-limit incident
+ * rather than a feature.
+ */
+const PROBE_BATCH = 15;
+
+/** Concurrent OpenSea probes. Two is fast enough to feel live and stays inside the limit. */
+const PROBE_CONCURRENCY = 2;
+
+/**
+ * The longest "Mint now" will hold for a stage that has not opened.
+ *
+ * Beyond this the hold is a promise in memory that a deploy would cancel in
+ * silence, and the durable booking is the right answer instead.
+ */
+const MAX_INLINE_HOLD_MS = 30 * 60_000;
+
+function liveDraft(chatId: number): MintDraft | undefined {
+  const draft = mintDrafts.get(chatId);
+  if (!draft) return undefined;
+  if (Date.now() - draft.createdAt > MINT_DRAFT_TTL_MS) {
+    mintDrafts.delete(chatId);
+    return undefined;
+  }
+  return draft;
+}
+
+/** Telegram tolerates roughly one edit per second per chat before 429s. */
+const CARD_EDIT_INTERVAL_MS = 1100;
+
+interface CardPainter {
+  timer?: NodeJS.Timeout;
+  lastAt: number;
+  /** Text *and* keyboard: a ticked box changes only the second one. */
+  lastSent: string;
+}
+
+const cardPainters = new Map<number, CardPainter>();
+
+function painterFor(chatId: number): CardPainter {
+  const existing = cardPainters.get(chatId);
+  if (existing) return existing;
+  const painter: CardPainter = { lastAt: 0, lastSent: "" };
+  cardPainters.set(chatId, painter);
+  return painter;
+}
+
+function forgetCard(chatId: number): void {
+  const painter = cardPainters.get(chatId);
+  if (painter?.timer) clearTimeout(painter.timer);
+  cardPainters.delete(chatId);
+  // Bumping the sequence stops any probe still in flight from writing a verdict
+  // and repainting over the closing line this card is about to be replaced by.
+  const draft = mintDrafts.get(chatId);
+  if (draft) draft.seq++;
+  mintDrafts.delete(chatId);
+}
+
+async function paintCard(draft: MintDraft): Promise<void> {
+  const painter = painterFor(draft.chatId);
+  const text = clamp(renderMintCard(draft));
+  const keyboard = mintCardKeyboard(draft);
+  // Compared against both halves. Comparing only the text meant a ticked box on
+  // a page where the summary line had not moved was computed, skipped, and
+  // never drawn — the operator tapped a wallet and nothing happened.
+  const signature = `${text} ${JSON.stringify(keyboard.inline_keyboard)}`;
+  if (signature === painter.lastSent) return;
+  painter.lastSent = signature;
+  painter.lastAt = Date.now();
+  try {
+    await bot.api.editMessageText(draft.chatId, draft.messageId, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard,
+    });
+  } catch {
+    // A dropped frame is not worth failing a mint over; the next action redraws.
+  }
+}
+
+/**
+ * Redraw the card in place, no faster than Telegram will take it.
+ *
+ * Ten eligibility answers landing over two seconds is ten edits, which earns a
+ * 429 and loses the ones that matter. Bursts collapse onto a trailing timer
+ * that renders the draft as it stands when it fires, so the last state always
+ * arrives even though the intermediate ones do not.
+ */
+async function refreshCard(draft: MintDraft): Promise<void> {
+  const painter = painterFor(draft.chatId);
+  const since = Date.now() - painter.lastAt;
+  if (since >= CARD_EDIT_INTERVAL_MS) {
+    if (painter.timer) {
+      clearTimeout(painter.timer);
+      painter.timer = undefined;
+    }
+    return paintCard(draft);
+  }
+  if (painter.timer) return;
+  painter.timer = setTimeout(() => {
+    painter.timer = undefined;
+    void paintCard(draft).catch(() => undefined);
+  }, CARD_EDIT_INTERVAL_MS - since);
+  painter.timer.unref?.();
+}
+
+/** The wallets a mint may spend from — never the funder or the vault. */
+async function cardWallets(chain: ChainContext, force = false): Promise<CardWallet[]> {
+  const tagCtx = await session.tagContext(chain.key, force).catch(() => undefined);
+  const pool = tagCtx ? withoutProtected(session.wallets(), tagCtx) : session.wallets();
+  const balances = await session.balances(chain.key, force).catch(() => new Map<string, bigint>());
+  return pool.map((wallet) => ({
+    id: wallet.id,
+    address: wallet.address,
+    kind: wallet.kind,
+    label: wallet.label,
+    balanceWei: balances.get(wallet.address),
+  }));
+}
+
+/**
+ * Re-read the wallet set into an open card.
+ *
+ * Importing a wallet leaves the card. This is what brings it back: the picker
+ * has a 🔑 Import button precisely so a wallet can be added mid-decision, and a
+ * picker that then goes on listing the old set makes that button a dead end.
+ * Selections and verdicts survive by id; anything removed from the store
+ * quietly stops being selected, because it can no longer sign.
+ *
+ * Returns true when the set actually changed, which is the caller's signal that
+ * the allowlist proofs — built for the old set — are now incomplete.
+ */
+async function refreshWallets(draft: MintDraft, force = false): Promise<boolean> {
+  const before = draft.wallets.map((w) => w.id).join(",");
+  draft.wallets = await cardWallets(session.chain(draft.chainKey), force);
+  const present = new Set(draft.wallets.map((w) => w.id));
+  draft.selected = draft.selected.filter((id) => present.has(id));
+  return draft.wallets.map((w) => w.id).join(",") !== before;
+}
+
+/**
+ * Fold a changed wallet set back into an open card.
+ *
+ * A merkle allowlist was proved against the wallets that existed when the card
+ * was drawn, so anything added since carries no proof and would sit at "not
+ * checked" for ever. Re-reading the drop rebuilds the tree over the new set,
+ * which is the whole point of importing a wallet mid-decision: to find out
+ * whether *that* address is on the list.
+ */
+async function absorbWalletChange(draft: MintDraft): Promise<void> {
+  if (draft.stages.some((s) => s.source === "chain" && s.kind === "allowlist")) {
+    return loadCardStages(draft);
+  }
+  applyKnownVerdicts(draft);
+  await refreshCard(draft);
+  await checkWallets(draft, walletsToCheck(draft));
+}
+
+/** OpenSea's own words for a stage, reduced to the three kinds that matter here. */
+function openSeaStageKind(stageType: string, label?: string): "public" | "allowlist" | "signed" {
+  const text = `${stageType} ${label ?? ""}`;
+  if (/public/i.test(text)) return "public";
+  if (/signed/i.test(text)) return "signed";
+  return "allowlist";
+}
+
+interface StageReading {
+  stages: MintStage[];
+  notes: string[];
+  collection?: string;
+  slug?: string;
+  totalSupply?: string;
+  maxSupply?: string;
+  /** Per-wallet merkle verdicts, when a SeaDrop allowlist was published. */
+  proofs?: Record<string, EligibilityRow>;
+}
+
+/**
+ * Everything both sources will say about this contract.
+ *
+ * Read together and merged rather than one-then-the-other, because the useful
+ * screen is the one that shows a presale you can prove and a public stage you
+ * cannot yet, side by side. Either side failing is a note on the card, not an
+ * error: a collection OpenSea has never indexed still mints perfectly well from
+ * the chain, and a contract with no SeaDrop config is exactly the case OpenSea
+ * exists to cover.
+ */
+async function readStages(
+  chain: ChainContext,
+  contract: string,
+  wallets: CardWallet[],
+  slugHint?: string
+): Promise<StageReading> {
+  type ChainFacts = NonNullable<Parameters<typeof buildStages>[0]["chain"]>[number];
+
+  const notes: string[] = [];
+  let publicFacts: ChainFacts | undefined;
+  let listFacts: ChainFacts | undefined;
+  let proofs: Record<string, EligibilityRow> | undefined;
+  let collection: string | undefined;
+  let totalSupply: string | undefined;
+  let maxSupply: string | undefined;
+
+  const chainSide = (async (): Promise<void> => {
+    const [drop, name, supply] = await Promise.all([
+      fetchPublicDrop(chain.rpc.readUrl, contract).catch((err: unknown) => {
+        notes.push(
+          err instanceof DropReadError
+            ? err.message
+            : `The contract's SeaDrop config could not be read (${(err as Error).message}).`
+        );
+        return null;
+      }),
+      readName(chain.rpc.readUrl, contract),
+      readSupply(chain.rpc.readUrl, contract),
+    ]);
+    // Assigned only when present. These three read concurrently with the
+    // OpenSea side, which fills the same fields with `??=` — so an unguarded
+    // assignment here would blank a name OpenSea had already supplied purely
+    // because the contract has no name() and this half happened to finish last.
+    if (name) collection = name;
+    if (supply.totalSupply) totalSupply = supply.totalSupply;
+    if (supply.maxSupply) maxSupply = supply.maxSupply;
+    if (drop) {
+      publicFacts = {
+        kind: "public",
+        label: "Public",
+        priceWei: drop.mintPrice,
+        startsAt: drop.startTime > 0 ? drop.startTime * 1000 : undefined,
+        endsAt: drop.endTime > 0 ? drop.endTime * 1000 : undefined,
+        perWallet: drop.maxTotalMintableByWallet > 0 ? drop.maxTotalMintableByWallet : undefined,
+      };
+    }
+  })();
+
+  // The allowlist is worth the round trip because it is the one gated stage this
+  // bot can answer definitively for all five hundred wallets at once, offline,
+  // before the stage opens — which is exactly what the OpenSea path cannot do.
+  const listSide = (async (): Promise<void> => {
+    try {
+      const { report } = await loadEligibility(
+        chain,
+        contract,
+        undefined,
+        wallets.map((w) => ({ id: w.id, address: w.address }))
+      );
+      const params = report.eligible[0]?.mintParams ?? report.rows.find((r) => r.mintParams)?.mintParams;
+      listFacts = {
+        kind: "allowlist",
+        label: "Allowlist",
+        priceWei: params?.mintPrice ?? 0n,
+        startsAt: params && params.startTime > 0n ? Number(params.startTime) * 1000 : undefined,
+        endsAt: params && params.endTime > 0n ? Number(params.endTime) * 1000 : undefined,
+        perWallet:
+          params && params.maxTotalMintableByWallet > 0n
+            ? Number(params.maxTotalMintableByWallet)
+            : undefined,
+      };
+      proofs = Object.fromEntries(report.rows.map((row) => [row.id, row]));
+      if (!report.rootMatched) {
+        notes.push(
+          "The published allowlist does not rebuild the root this contract holds, so no proof " +
+            "can be trusted. Proofs are withheld rather than guessed."
+        );
+        // A mismatched tree yields proofs that look fine and revert on every
+        // wallet, so nobody is marked eligible off it.
+        proofs = Object.fromEntries(
+          report.rows.map((row) => [row.id, { ...row, eligible: false, proof: undefined }])
+        );
+      }
+    } catch {
+      // No allowlist root, no published URI, or an unreachable list. All three
+      // are ordinary and none of them is a reason to fail the card.
+    }
+  })();
+
+  const openSeaFacts: Parameters<typeof buildStages>[0]["openSea"] = [];
+  let slug = slugHint;
+  const seaSide = (async (): Promise<void> => {
+    const apiKey = (process.env.OPENSEA_API_KEY ?? "").trim();
+    if (!apiKey) {
+      notes.push(
+        "No OPENSEA_API_KEY is set, so any stage OpenSea gates is invisible here — only what " +
+          "the contract publishes is shown."
+      );
+      return;
+    }
+    try {
+      slug ??= await slugForContract(apiKey, chain.chainId, contract);
+      if (!slug) return;
+      const drop = await fetchDrop(apiKey, slug);
+      collection ??= drop.collection_name;
+      totalSupply ??= drop.total_supply;
+      maxSupply ??= drop.max_supply;
+      for (const stage of drop.stages) {
+        const startsAt = Date.parse(stage.start_time);
+        const endsAt = Date.parse(stage.end_time);
+        openSeaFacts.push({
+          label: stage.label?.trim() || stage.stage_type,
+          kind: openSeaStageKind(stage.stage_type, stage.label),
+          priceWei: stage.price ? BigInt(stage.price) : 0n,
+          startsAt: Number.isFinite(startsAt) ? startsAt : undefined,
+          endsAt: Number.isFinite(endsAt) ? endsAt : undefined,
+          perWallet: Number(stage.max_per_wallet) || undefined,
+        });
+      }
+    } catch (err) {
+      notes.push(`OpenSea: ${(err as Error).message}`);
+    }
+  })();
+
+  await Promise.all([chainSide, listSide, seaSide]);
+
+  // Assembled after both halves have settled, in a fixed order, so a stage's
+  // key does not depend on which read happened to return first. The keys ride
+  // in callback data, and a button that means the allowlist on one load and the
+  // public stage on the next is a mint fired at the wrong price.
+  const chainFacts = [publicFacts, listFacts].filter((f): f is ChainFacts => f !== undefined);
+
+  const built = buildStages({ chain: chainFacts, openSea: openSeaFacts });
+  return {
+    stages: built.stages,
+    notes: [...built.notes, ...notes],
+    collection,
+    slug,
+    totalSupply,
+    maxSupply,
+    proofs,
+  };
+}
+
+/**
+ * Open the card on a contract.
+ *
+ * The message goes out before the stages are read, because a tap that shows
+ * nothing for four seconds reads as a bot that has stopped — and reading a drop
+ * touches the chain, an allowlist file and OpenSea.
+ */
+async function openMintCard(ctx: Context, raw: string): Promise<void> {
+  const chatId = ctx.chat!.id;
+
+  let resolved;
+  try {
+    resolved = await resolveCollectionInput(
+      raw,
+      (process.env.OPENSEA_API_KEY ?? "").trim() || undefined,
+      config.chain
+    );
+  } catch (err) {
+    await ctx.reply(
+      [
+        `⚠️ ${esc((err as Error).message)}`,
+        ``,
+        `<i>Any of these work:</i>`,
+        `· the contract address, <code>0x</code> plus 40 hex characters`,
+        `· the OpenSea link, <code>opensea.io/collection/…</code>`,
+        `· the collection slug on its own`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: mintPromptKeyboard() }
+    );
+    return;
+  }
+
+  const contract = getAddress(resolved.address);
+  const found = await session.detectChain(contract);
+  const chain = found.chain;
+
+  const sent = await ctx.reply(
+    [
+      `🎨 <b>${esc(resolved.name ?? resolved.slug ?? short(contract))}</b>`,
+      `<code>${esc(contract)}</code>`,
+      `network <b>${esc(chain.name)}</b>`,
+      ``,
+      `reading stages, allowlist and OpenSea…`,
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  );
+
+  const wallets = await cardWallets(chain);
+
+  const draft: MintDraft = {
+    chatId,
+    messageId: sent.message_id,
+    contract,
+    chainKey: chain.key,
+    chainId: chain.chainId,
+    chainName: chain.name,
+    nativeSymbol: chain.profile.nativeSymbol,
+    slug: resolved.slug,
+    collection: resolved.name,
+    stages: [],
+    quantity: 1,
+    // A handful of imported wallets is already the answer to "which wallets?" —
+    // they were imported to mint with. Ticking them saves a step that has no
+    // other sensible outcome, and the ⚡ button still needs its own deliberate
+    // press with the cost on screen above it.
+    selected: initialSelection(wallets),
+    wallets,
+    verdicts: {},
+    // Opens on the imported set. A whitelist is granted to an address somebody
+    // already owns, so that is the wallet a gated drop is minted from; the
+    // generated set is bulk plumbing for the copy engine, and leading with it
+    // buried the one wallet that mattered behind fifty pages.
+    filter: defaultFilter(wallets),
+    page: 0,
+    view: "main",
+    notes: [],
+    seq: 0,
+    probing: false,
+    gasReserveWei: gasReservation(config.gasLimit, config.maxFeePerGas),
+    createdAt: Date.now(),
+  };
+  forgetCard(chatId);
+  mintDrafts.set(chatId, draft);
+
+  if (found.ambiguous) {
+    draft.notes.push(
+      `This address has code on more than one chain. The card is pointed at ${chain.name}; ` +
+        `re-open it with "on <chain>" if that is not the one.`
+    );
+  }
+
+  await refreshCard(draft);
+  await loadCardStages(draft);
+}
+
+/** Read the drop and repaint. Shared by opening the card and re-checking it. */
+async function loadCardStages(draft: MintDraft): Promise<void> {
+  const chain = session.chain(draft.chainKey);
+  const seq = ++draft.seq;
+  draft.probing = true;
+  try {
+    const reading = await readStages(chain, draft.contract, draft.wallets, draft.slug);
+    if (draft.seq !== seq) return;
+    draft.stages = reading.stages;
+    draft.notes = reading.notes;
+    draft.proofs = reading.proofs;
+    draft.slug = reading.slug ?? draft.slug;
+    draft.collection = draft.collection ?? reading.collection;
+    draft.totalSupply = reading.totalSupply;
+    draft.maxSupply = reading.maxSupply;
+    // Verdicts first, then the choice. The other order arms whichever stage is
+    // cheapest among those nobody has been refused from — which, before the
+    // merkle tree has spoken, is every stage — and lands on public while the
+    // wallets are sitting on an allowlist place that costs less.
+    applyKnownVerdicts(draft);
+    draft.stageKey = pickMintStage(draft.stages, Date.now(), (stage) =>
+      firstVerdict(draft, stage.key)
+    )?.key;
+    if (activeStage(draft)?.kind === "signed") {
+      draft.notes.push(
+        "This is a signed stage: OpenSea answers an eligibility check by issuing a real " +
+          "signature for that wallet, so the card will not spend them unasked. Open 👛 Wallets " +
+          "and tap 🔍 Check this page when you want the verdicts."
+      );
+    }
+  } finally {
+    if (draft.seq === seq) draft.probing = false;
+  }
+  await refreshCard(draft);
+  await checkWallets(draft, walletsToCheck(draft));
+}
+
+/** The strongest verdict any wallet holds for a stage — used to choose one. */
+function firstVerdict(draft: MintDraft, stageKey: string): Eligibility | undefined {
+  let best: Eligibility | undefined;
+  for (const wallet of draft.wallets) {
+    const verdict = draft.verdicts[wallet.id]?.[stageKey];
+    if (canFire(verdict)) return verdict;
+    if (verdict !== undefined && best === undefined) best = verdict;
+  }
+  return best;
+}
+
+/**
+ * Fill in every verdict that needs no network.
+ *
+ * A public stage is open to anyone who can pay, and a merkle allowlist has
+ * already answered for all five hundred wallets by the time the list has been
+ * fetched once. Only OpenSea's gated stages cost a request per wallet, which is
+ * why they are the only ones rationed.
+ */
+function applyKnownVerdicts(draft: MintDraft): void {
+  for (const stage of draft.stages) {
+    if (stage.kind === "public") {
+      for (const wallet of draft.wallets) setVerdict(draft, wallet.id, stage.key, "eligible");
+      continue;
+    }
+    if (stage.source === "chain" && stage.kind === "allowlist" && draft.proofs) {
+      for (const wallet of draft.wallets) {
+        const row = draft.proofs[wallet.id];
+        if (row) setVerdict(draft, wallet.id, stage.key, classifyProof(row.eligible));
+      }
+    }
+  }
+}
+
+/** Which wallets the next probe should spend its budget on. */
+function walletsToCheck(draft: MintDraft): CardWallet[] {
+  const stage = activeStage(draft);
+  if (!stage) return [];
+  const picked = selectedWallets(draft);
+  const pool =
+    picked.length > 0
+      ? picked
+      : paginate(filteredWallets(draft), draft.page, WALLETS_PER_PAGE).items;
+  return pool
+    .filter((wallet) => !isSettled(verdictFor(draft, wallet.id, stage.key)))
+    .slice(0, PROBE_BATCH);
+}
+
+/**
+ * Ask OpenSea what each of these wallets may mint.
+ *
+ * Only ever the stage that is armed, and only when it is actually open: the
+ * endpoint will not build a transaction for an upcoming phase however entitled
+ * the minter is, so probing one before it opens spends rate limit to learn the
+ * time. Anything the card already knows for certain is skipped, which keeps the
+ * budget on the wallets whose answer can still move.
+ *
+ * `explicit` marks the operator having asked. It matters for one case: a signed
+ * stage answers a probe by issuing a real server signature bound to that
+ * minter, and whether those are one-shot is OpenSea's business and not
+ * documented. Fetching ten of them unasked, to draw ten ticks, is a risk taken
+ * on somebody else's behalf — so signed stages are only ever checked on request.
+ */
+async function checkWallets(
+  draft: MintDraft,
+  wallets: CardWallet[],
+  explicit = false
+): Promise<void> {
+  const stage = activeStage(draft);
+  if (!stage || wallets.length === 0) return;
+  if (stage.kind === "public") return;
+  if (stage.source === "chain") return; // answered by the merkle tree already.
+
+  const apiKey = (process.env.OPENSEA_API_KEY ?? "").trim();
+  const slug = draft.slug;
+  if (!apiKey || !slug) return;
+
+  if (stage.kind === "signed" && !explicit) {
+    for (const wallet of wallets) {
+      if (verdictFor(draft, wallet.id, stage.key) === undefined) {
+        setVerdict(draft, wallet.id, stage.key, "unknown");
+      }
+    }
+    await refreshCard(draft);
+    return;
+  }
+
+  const open = stageIsOpen(stage, Date.now());
+  if (!open) {
+    // Honest rather than blank: an unopened gated stage is genuinely unknowable
+    // from here, and saying so beats a row of ❌ that means "not yet".
+    for (const wallet of wallets) setVerdict(draft, wallet.id, stage.key, "unknown");
+    await refreshCard(draft);
+    return;
+  }
+
+  const seq = draft.seq;
+  for (const wallet of wallets) setVerdict(draft, wallet.id, stage.key, "checking");
+  draft.probing = true;
+  await refreshCard(draft);
+
+  const queue = [...wallets];
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const wallet = queue.shift();
+      if (!wallet) return;
+      if (draft.seq !== seq) return;
+      const probe = await probeIssuance(apiKey, slug, wallet.address, draft.quantity).catch(() => ({
+        available: false,
+        detail: "",
+      }));
+      if (draft.seq !== seq) return;
+      setVerdict(draft, wallet.id, stage.key, classifyIssuance(probe, true));
+      await refreshCard(draft);
+    }
+  };
+
+  try {
+    await Promise.all(
+      Array.from({ length: Math.min(PROBE_CONCURRENCY, queue.length) }, () => worker())
+    );
+  } finally {
+    if (draft.seq === seq) draft.probing = false;
+  }
+  await refreshCard(draft);
+}
+
+// ── Card actions ──────────────────────────────────────────────────────────
+
+/**
+ * Which executor can buy the armed stage.
+ *
+ * The stage's source decides it, and the difference is not cosmetic: a SeaDrop
+ * stage is readable ahead of the open and therefore fully pre-signed, while
+ * OpenSea will not issue calldata until the stage is live and has to be raced.
+ */
+function pathFor(stage: MintStage | undefined): "public" | "allowlist" | "fcfs" | "unknown" {
+  if (!stage) return "unknown";
+  if (stage.source === "opensea") return "fcfs";
+  return stage.kind === "allowlist" ? "allowlist" : "public";
+}
+
+/** The wallets a fire will actually use, and why the rest were dropped. */
+function firingSet(draft: MintDraft): { wallets: CardWallet[]; dropped: number } {
+  const stage = activeStage(draft);
+  const picked = selectedWallets(draft);
+  if (!stage) return { wallets: picked, dropped: 0 };
+  // A verdict of "unknown" is not a refusal — it is what an unopened stage can
+  // honestly say — so those wallets still fire. Only a definite no is dropped.
+  const usable = picked.filter((w) => {
+    const verdict = verdictFor(draft, w.id, stage.key);
+    return verdict === undefined || verdict === "eligible" || verdict === "unknown" || verdict === "checking";
+  });
+  return { wallets: usable, dropped: picked.length - usable.length };
+}
+
+/**
+ * Refuse a quantity the stage will not serve.
+ *
+ * SeaDrop and OpenSea both cap what one wallet may take, and asking for more
+ * does not mint fewer — it reverts. On a set of five hundred that is five
+ * hundred gas fees for nothing, so it is stopped here rather than warned about.
+ */
+async function overStageCap(ctx: Context, draft: MintDraft): Promise<boolean> {
+  const stage = activeStage(draft);
+  if (!stage?.perWallet || stage.perWallet <= 0) return false;
+  if (draft.quantity <= stage.perWallet) return false;
+  await ctx.reply(
+    `<b>${esc(stage.label)}</b> allows ${stage.perWallet} per wallet and the amount is ` +
+      `${draft.quantity}. Tap 🎫 Amount and lower it — as it stands every wallet would ` +
+      `revert and pay gas for the privilege.`,
+    { parse_mode: "HTML" }
+  );
+  return true;
+}
+
+async function fireCard(ctx: Context): Promise<void> {
+  const chatId = ctx.chat!.id;
+  const draft = liveDraft(chatId);
+  if (!draft) {
+    await ctx.reply("That mint card expired. Run <code>/mint</code> again.", { parse_mode: "HTML" });
+    return;
+  }
+  const stage = activeStage(draft);
+  if (!stage) {
+    await ctx.reply(
+      "Nothing readable to mint on this contract yet — book it instead and the runner reads again at T-0.",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  if (draft.selected.length === 0) {
+    await ctx.reply("Pick at least one wallet first — tap 👛 Wallets.", { parse_mode: "HTML" });
+    return;
+  }
+  if (stageState(stage, Date.now()) === "ended") {
+    await ctx.reply(`<b>${esc(stage.label)}</b> has already closed.`, { parse_mode: "HTML" });
+    return;
+  }
+  if (await overStageCap(ctx, draft)) return;
+
+  // Firing an unopened stage holds inside this handler until it opens, which is
+  // exactly right for the last few minutes and quietly wrong for the next six
+  // hours: a hold is a promise in memory, and a restart, a deploy or a dropped
+  // connection cancels it without saying so. Past the threshold the booking is
+  // the honest answer, because that one is a file.
+  const opensAt = stage.startsAt;
+  if (opensAt !== undefined && opensAt - Date.now() > MAX_INLINE_HOLD_MS) {
+    await ctx.reply(
+      [
+        `<b>${esc(stage.label)}</b> does not open for ${untilText(opensAt - Date.now())}.`,
+        ``,
+        `<i>Holding that long only lasts as long as this process does — a restart`,
+        `would cancel it silently. Tap ⏰ Schedule it instead: a booking survives`,
+        `restarts and arms itself a couple of minutes before the open.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const { wallets, dropped } = firingSet(draft);
+  if (wallets.length === 0) {
+    await ctx.reply(
+      `None of the ${draft.selected.length} picked wallets can mint <b>${esc(stage.label)}</b>. ` +
+        `Open 👛 Wallets and pick from the ✅ marked ones, or tap 🔄 to re-check.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const ids = new Set(wallets.map((w) => w.id));
+  const managed = session.wallets().filter((w) => ids.has(w.id));
+  const path = pathFor(stage);
+
+  // The card has done its job; the run gets its own message so the report and
+  // the configuration do not overwrite one another.
+  forgetCard(chatId);
+  await refreshCardClosed(draft, `⚡ Firing ${wallets.length} wallet(s) — see below.`);
+
+  if (dropped > 0) {
+    await ctx.reply(
+      `<i>${dropped} picked wallet(s) were left out — they are refused at this stage.</i>`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  // Always held. A stage that is already open falls through the hold in the
+  // same millisecond, and one that opens in ten minutes is the whole reason
+  // somebody is sitting on this screen — firing into a closed stage would
+  // revert on every wallet and pay gas for it.
+  const argv = [draft.contract, String(draft.quantity), addressSelector(managed), "wait"];
+  argv.push("on", draft.chainKey);
+
+  switch (path) {
+    case "public":
+      return runWithArgs(ctx, argv, cmdMint);
+    case "allowlist":
+      return runWithArgs(ctx, argv, cmdAllowList);
+    default:
+      return runWithArgs(ctx, argv, cmdFcfs);
+  }
+}
+
+/**
+ * A selector naming exactly these wallets.
+ *
+ * The executors take a selector rather than a list, and comma is the grammar's
+ * OR, so the card's tick-boxes come out the other side as the same set that was
+ * ticked. Addresses rather than ids because an address is unambiguous whatever
+ * happens to the store's ordering between here and the fire.
+ */
+function addressSelector(wallets: ManagedWallet[]): string {
+  return wallets.map((w) => w.address.toLowerCase()).join(",");
+}
+
+/** Leave the card message behind as a closing line rather than a stale screen. */
+async function refreshCardClosed(draft: MintDraft, line: string): Promise<void> {
+  await bot.api
+    .editMessageText(
+      draft.chatId,
+      draft.messageId,
+      [
+        `🎨 <b>${esc(draft.collection ?? short(draft.contract))}</b>`,
+        `<code>${esc(draft.contract)}</code> · ${esc(draft.chainName)}`,
+        ``,
+        line,
+      ].join("\n"),
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+    )
+    .catch(() => undefined);
+}
+
+/** Book the card's exact selection for a time. */
+async function bookCard(ctx: Context, fireAt: number): Promise<void> {
+  const chatId = ctx.chat!.id;
+  const draft = liveDraft(chatId);
+  if (!draft) {
+    await ctx.reply("That mint card expired. Run <code>/mint</code> again.", { parse_mode: "HTML" });
+    return;
+  }
+  if (draft.selected.length === 0) {
+    await ctx.reply("Pick at least one wallet first — tap 👛 Wallets.", { parse_mode: "HTML" });
+    return;
+  }
+  if (await overStageCap(ctx, draft)) return;
+
+  const stage = activeStage(draft);
+  const { wallets } = firingSet(draft);
+  const useWallets = wallets.length > 0 ? wallets : selectedWallets(draft);
+  const path = pathFor(stage);
+  const perWallet = cardRequiredPerWallet(draft);
+
+  const entry = schedule.add({
+    contract: draft.contract,
+    chainKey: draft.chainKey,
+    chainId: draft.chainId,
+    slug: draft.slug,
+    collection: draft.collection,
+    quantity: draft.quantity,
+    // Kept for the listing and for anything that still reads a selector; the
+    // ids below are what actually fires.
+    selector: `${useWallets.length} picked on the card`,
+    walletIds: useWallets.map((w) => w.id),
+    path: path === "unknown" ? "auto" : path,
+    fireAt,
+    priceWei: stage?.priceWei?.toString(),
+    supply: draft.totalSupply,
+    maxSupply: draft.maxSupply,
+    stage: stage?.label,
+  });
+
+  forgetCard(chatId);
+  await refreshCardClosed(draft, `⏰ Booked as <code>${esc(entry.id)}</code> — see below.`);
+
+  await ctx.reply(
+    [
+      `<b>📅 Booked — ${esc(entry.id)}</b>`,
+      ``,
+      `${esc(entry.collection ?? short(entry.contract))} × ${entry.quantity}`,
+      `stage ${esc(stage?.label ?? "decided at T-0")}`,
+      `fires ${esc(whenText(entry.fireAt))} <i>(in ${untilText(entry.fireAt - Date.now())})</i>`,
+      `from ${useWallets.length} wallet(s) on ${esc(draft.chainName)}`,
+      ``,
+      `<b>at most ${eth(perWallet * BigInt(useWallets.length))} ${esc(draft.nativeSymbol)}</b>` +
+        ` <i>(mint + gas, all wallets)</i>`,
+      ``,
+      path === "fcfs"
+        ? `<i>OpenSea will not issue calldata before the stage opens, so the request itself happens at T-0.</i>`
+        : path === "unknown"
+          ? `<i>⚠️ Nothing is readable on this contract yet. The runner reads the chain again a couple` +
+            ` of minutes before firing and takes whichever path exists then.</i>`
+          : `<i>Transactions are signed a couple of minutes ahead and held, so the mint goes out on the tick.</i>`,
+      ``,
+      `<i>Fund those wallets before then — a booking does not reserve ETH.</i>`,
+      `<code>/scheduled</code> to list · <code>/unschedule ${esc(entry.id)}</code> to stop it`,
+    ].join("\n"),
+    { parse_mode: "HTML" }
+  );
+}
+
+// ── Card callbacks ────────────────────────────────────────────────────────
+
+/**
+ * Every button on the card.
+ *
+ * One entry point rather than a handler each, because they all end the same
+ * way: mutate the draft, bump the sequence if an in-flight probe is now about
+ * the wrong thing, redraw.
+ */
+async function onMintCard(ctx: Context, parts: string[]): Promise<void> {
+  const chatId = ctx.chat!.id;
+  const [action, ...rest] = parts;
+
+  if (action === "new") {
+    const flow = startFlow(chatId, "mintCard", "contract");
+    flow.step = "contract";
+    await ctx.reply(
+      [
+        `<b>Mint a drop</b>`,
+        ``,
+        `Send the contract address, or paste the OpenSea link.`,
+        ``,
+        `<i>e.g. https://opensea.io/collection/omrevo</i>`,
+        `<i>You will see the stages, which of your wallets can mint each one,`,
+        `and what it costs — before anything is sent.</i>`,
+      ].join("\n"),
+      { parse_mode: "HTML", reply_markup: mintPromptKeyboard() }
+    );
+    return;
+  }
+
+  const draft = liveDraft(chatId);
+  if (!draft) {
+    await ctx.reply("That mint card expired. Run <code>/mint</code> again.", {
+      parse_mode: "HTML",
+      reply_markup: mintMenu(schedule.pending().length),
+    });
+    return;
+  }
+
+  // Any button on the card supersedes whatever the card last asked for in
+  // words. Without this, tapping a preset while a "send a number" prompt is
+  // outstanding leaves the flow armed, and the operator's next unrelated
+  // message is read as the answer to a question they had already moved past.
+  clearFlow(chatId);
+
+  switch (action) {
+    case "noop":
+      return;
+
+    case "close":
+      forgetCard(chatId);
+      await refreshCardClosed(draft, `✕ Closed. Nothing was sent.`);
+      return;
+
+    case "back":
+      draft.view = "main";
+      return refreshCard(draft);
+
+    case "recheck": {
+      draft.view = "main";
+      await refreshCard(draft);
+      // Re-read the drop *and* the wallets. A stage that has opened since the
+      // card was drawn is the commonest reason to press this; a wallet funded
+      // in another window is the second.
+      await refreshWallets(draft, true);
+      await loadCardStages(draft);
+      return;
+    }
+
+    case "qty": {
+      const value = rest[0];
+      if (value === undefined) {
+        draft.view = "quantity";
+        return refreshCard(draft);
+      }
+      if (value === "custom") {
+        // The overlay closes now rather than when the number lands: leaving the
+        // preset buttons up while waiting for typed text offers two answers to
+        // the same question, and taking the button one strands the prompt.
+        draft.view = "main";
+        await refreshCard(draft);
+        const flow = startFlow(chatId, "mintCard", "amount");
+        flow.contract = draft.contract;
+        const cap = activeStage(draft)?.perWallet;
+        await ctx.reply(
+          `<b>How many per wallet?</b>\n\nSend a whole number` +
+            (cap !== undefined && cap > 0 ? ` — this stage allows up to ${cap}.` : `.`),
+          { parse_mode: "HTML", reply_markup: backTo("mc:back", "✕ Cancel") }
+        );
+        return;
+      }
+      const quantity = Number(value);
+      if (!Number.isInteger(quantity) || quantity < 1) return;
+      draft.quantity = quantity;
+      draft.view = "main";
+      // Price per wallet has changed, so who counts as funded has too.
+      draft.seq++;
+      return refreshCard(draft);
+    }
+
+    case "stage": {
+      const key = rest[0];
+      if (key === undefined) {
+        draft.view = "stages";
+        return refreshCard(draft);
+      }
+      if (!draft.stages.some((s) => s.key === key)) return;
+      draft.stageKey = key;
+      draft.view = "main";
+      draft.seq++;
+      applyKnownVerdicts(draft);
+      await refreshCard(draft);
+      return checkWallets(draft, walletsToCheck(draft));
+    }
+
+    case "w":
+      return onWalletPicker(ctx, draft, rest);
+
+    case "fire":
+      return fireCard(ctx);
+
+    case "sched": {
+      const [kind, ...tail] = rest;
+      if (kind === undefined) {
+        draft.view = "schedule";
+        return refreshCard(draft);
+      }
+      if (kind === "custom") {
+        draft.view = "main";
+        await refreshCard(draft);
+        const flow = startFlow(chatId, "mintCard", "time");
+        flow.contract = draft.contract;
+        await ctx.reply(
+          [
+            `<b>When should it fire?</b>`,
+            ``,
+            `<b>Times are UTC.</b> Any of these work:`,
+            `  <code>15:30</code> — today, or tomorrow if it has passed`,
+            `  <code>2026-08-29 15:30</code>`,
+            `  <code>in 45m</code> · <code>in 2h30m</code>`,
+          ].join("\n"),
+          { parse_mode: "HTML", reply_markup: backTo("mc:back", "✕ Cancel") }
+        );
+        return;
+      }
+      if (kind === "stage") {
+        const stage = draft.stages.find((s) => s.key === tail.join(":"));
+        if (!stage?.startsAt) {
+          await ctx.reply("That stage has no published opening time — pick a preset or type one.");
+          return;
+        }
+        // Pin the card to the stage being booked, so the executor chosen at T-0
+        // is the one the operator was looking at when they tapped.
+        draft.stageKey = stage.key;
+        return bookCardAt(ctx, stage.startsAt);
+      }
+      // A relative preset, as typed: "in 5m".
+      return bookCardWhen(ctx, [kind, ...tail].join(":"));
+    }
+  }
+}
+
+/** Book at an instant, refusing what the schedule refuses and saying why. */
+async function bookCardAt(ctx: Context, at: number): Promise<void> {
+  if (at - Date.now() < schedule.MIN_LEAD_MS) {
+    await ctx.reply(
+      `That is less than ${schedule.MIN_LEAD_MS / 1000}s away — there is arming to do. ` +
+        `Tap ⚡ Mint now instead; it holds until the stage opens.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  // A published stage start is still a time, and a drop announced for six weeks
+  // out is a note to self rather than a booking — the same bound the typed path
+  // enforces applies to the one-tap button.
+  if (at - Date.now() > schedule.MAX_LEAD_MS) {
+    await ctx.reply(
+      `That stage opens more than a month from now — closer to a reminder than a mint. ` +
+        `Come back nearer the time.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+  return bookCard(ctx, at);
+}
+
+/** Book from words: "in 5m", "15:30", "2026-08-29 15:30". */
+async function bookCardWhen(ctx: Context, when: string): Promise<void> {
+  try {
+    return await bookCard(ctx, schedule.parseWhen(when));
+  } catch (err) {
+    if (err instanceof ScheduleError) {
+      await ctx.reply(`⚠️ ${err.message}`, { parse_mode: "HTML" });
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * The wallet picker's buttons.
+ *
+ * Ticking is the whole point, so it costs nothing: no probe, no balance read,
+ * no redraw of anything but the keyboard. Checking is explicit — a page at a
+ * time — because with five hundred wallets an eligibility check that ran on
+ * every tap would be a rate limit incident, not a feature.
+ */
+async function onWalletPicker(ctx: Context, draft: MintDraft, parts: string[]): Promise<void> {
+  const [action, ...rest] = parts;
+
+  if (action === undefined) {
+    draft.view = "wallets";
+    // Balances move and wallets get imported while a card is open, and both are
+    // exactly what the operator is about to decide on.
+    const changed = await refreshWallets(draft);
+    await refreshCard(draft);
+    if (changed) return absorbWalletChange(draft);
+    return;
+  }
+
+  switch (action) {
+    case "t": {
+      const id = rest.join(":");
+      if (!draft.wallets.some((w) => w.id === id)) return;
+      const at = draft.selected.indexOf(id);
+      if (at >= 0) draft.selected.splice(at, 1);
+      else draft.selected.push(id);
+      return refreshCard(draft);
+    }
+
+    case "p":
+      draft.page = Number(rest[0]) || 0;
+      await refreshCard(draft);
+      return;
+
+    case "f": {
+      const filter = rest[0] as WalletFilter;
+      if (!WALLET_FILTERS.includes(filter)) return;
+      draft.filter = filter;
+      draft.page = 0;
+      return refreshCard(draft);
+    }
+
+    case "none":
+      draft.selected = [];
+      return refreshCard(draft);
+
+    case "all": {
+      const which = rest[0];
+      const stageKey = activeStage(draft)?.key;
+      const required = cardRequiredPerWallet(draft);
+      let picked: CardWallet[];
+      if (which === "page") {
+        picked = paginate(filteredWallets(draft), draft.page, WALLETS_PER_PAGE).items;
+      } else if (which === "funded") {
+        picked = draft.wallets.filter(
+          (w) => w.balanceWei !== undefined && w.balanceWei >= required
+        );
+      } else {
+        picked = draft.wallets.filter((w) => canFire(verdictFor(draft, w.id, stageKey)));
+      }
+      if (picked.length === 0) {
+        // A reply rather than a callback alert: onCallback answers the query
+        // before dispatch, so a second answer here is refused and the operator
+        // sees nothing at all.
+        await ctx.reply(
+          which === "funded"
+            ? `No wallet holds the ${eth(required)} ${esc(draft.nativeSymbol)} this mint needs. ` +
+              `Fund them from 💸 Money first.`
+            : `No wallet is confirmed eligible for this stage yet — tap 🔍 Check this page.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      const seen = new Set(draft.selected);
+      for (const wallet of picked) {
+        if (!seen.has(wallet.id)) {
+          draft.selected.push(wallet.id);
+          seen.add(wallet.id);
+        }
+      }
+      return refreshCard(draft);
+    }
+
+    case "check": {
+      const page = paginate(filteredWallets(draft), draft.page, WALLETS_PER_PAGE).items;
+      return checkWallets(draft, page, true);
+    }
+  }
+}
+
+/**
+ * What `/mint` does now.
+ *
+ * A link or a contract on its own opens the card, which is the interface this
+ * command should always have had. The old positional form is kept intact and
+ * recognised by its second argument being a number: somebody typing
+ * `/mint 0x… 1 derived+funded wait` has already made every decision the card
+ * would ask about, and turning that into a screen full of buttons would be a
+ * regression for the person who knows exactly what they want.
+ */
+async function cmdMintEntry(ctx: Context): Promise<void> {
+  const parts = args(ctx);
+  if (parts.length === 0) return onMintCard(ctx, ["new"]);
+  if (parts.length >= 2 && /^\d+$/.test(parts[1])) return cmdMint(ctx);
+  return openMintCard(ctx, parts.join(" "));
 }
 
 /** One phrase for the payer rule, used everywhere it is shown. */
@@ -4090,6 +5285,8 @@ async function autoSweep(result: CopyResult, chain: ChainContext): Promise<void>
 }
 
 async function showWalletImport(ctx: Context): Promise<void> {
+  // Straight back to the picker when a mint card is what sent them here.
+  const back = liveDraft(ctx.chat!.id) ? "mc:w" : "m:wallets";
   await ctx.reply(
     [
       `<b>Import an existing wallet</b>`,
@@ -4100,7 +5297,7 @@ async function showWalletImport(ctx: Context): Promise<void> {
       `cloud chats are not end-to-end encrypted, and the VPS operator can access`,
       `wallets while the service is running. Imported wallets start manual-only.</i>`,
     ].join("\n"),
-    { parse_mode: "HTML", reply_markup: walletImportMenu() }
+    { parse_mode: "HTML", reply_markup: walletImportMenu(back) }
   );
 }
 
@@ -4122,7 +5319,10 @@ async function beginWalletSecretImport(
       `<b>Do not send this secret to anyone else.</b> This bot deletes the`,
       `message after reading it, but Telegram will still have transported it.`,
     ].join("\n"),
-    { parse_mode: "HTML", reply_markup: backTo("x", "✕ Cancel") }
+    {
+      parse_mode: "HTML",
+      reply_markup: backTo(liveDraft(ctx.chat!.id) ? "mc:w" : "x", "✕ Cancel"),
+    }
   );
 }
 
@@ -4138,6 +5338,25 @@ async function importWalletSecret(ctx: Context, flow: Flow, secret: string): Pro
     const result = session.store.importKeys(entries);
     clearFlow(ctx.chat!.id);
 
+    // An import started from a mint card was started to mint with. Fold the new
+    // wallet straight into that card, ticked, rather than returning the operator
+    // to a wallet menu and leaving them to find their way back and hunt for it
+    // in a list of five hundred.
+    const draft = liveDraft(ctx.chat!.id);
+    const intoCard = draft !== undefined && result.added.length > 0;
+    if (draft && intoCard) {
+      await refreshWallets(draft, true);
+      const added = new Set(result.added.map((address) => address.toLowerCase()));
+      for (const wallet of draft.wallets) {
+        if (added.has(wallet.address.toLowerCase()) && !draft.selected.includes(wallet.id)) {
+          draft.selected.push(wallet.id);
+        }
+      }
+      draft.filter = "imported";
+      draft.page = 0;
+      draft.view = "wallets";
+    }
+
     await ctx.reply(
       [
         `<b>Wallet import complete</b>`,
@@ -4146,13 +5365,22 @@ async function importWalletSecret(ctx: Context, flow: Flow, secret: string): Pro
         ...result.added.slice(0, 10).map((address) => `<code>${esc(address)}</code>`),
         result.added.length > 10 ? `…and ${result.added.length - 10} more` : ``,
         ``,
-        `<i>Imported wallets are manual-only. Use Wallets → Auto-fire only if`,
-        `you deliberately want them to spend on copy signals.</i>`,
+        intoCard
+          ? `<i>Added to the mint card above and ticked. Its eligibility for the`
+          : `<i>Imported wallets are manual-only. Use Wallets → Auto-fire only if`,
+        intoCard
+          ? `armed stage is being checked now.</i>`
+          : `you deliberately want them to spend on copy signals.</i>`,
       ]
         .filter(Boolean)
         .join("\n"),
-      { parse_mode: "HTML", reply_markup: walletsMenu() }
+      {
+        parse_mode: "HTML",
+        reply_markup: intoCard ? backTo("mc:w", "‹ Back to the mint") : walletsMenu(),
+      }
     );
+
+    if (draft && intoCard) await absorbWalletChange(draft);
   } catch (err) {
     await ctx.reply(
       `⚠️ ${esc((err as Error).message)}\n\nThe secret message was deleted. Send it again, or tap Cancel.`,
@@ -4758,11 +5986,36 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
   );
 
   const tagCtx = await session.tagContext(chain.key, true);
-  const matched = resolveWallets(entry.selector, session.wallets(), tagCtx);
-  if (matched.length === 0) {
-    throw new Error(
-      `No wallets match "${entry.selector}" on ${chain.name} any more. Nothing was sent.`
-    );
+
+  // Ids beat the selector when the booking carries them. A booking made by
+  // ticking eleven wallets off the mint card names those eleven because they
+  // are the ones on the allowlist; re-resolving a rule at T-0 would quietly
+  // substitute a different set, which is the one substitution nobody would
+  // notice until the receipts came back from the wrong addresses.
+  let matched: ManagedWallet[];
+  if (entry.walletIds && entry.walletIds.length > 0) {
+    const wanted = new Set(entry.walletIds);
+    matched = session.wallets().filter((w) => wanted.has(w.id));
+    if (matched.length === 0) {
+      throw new Error(
+        `None of the ${entry.walletIds.length} wallet(s) booked for this mint are in the store ` +
+          `any more. Nothing was sent.`
+      );
+    }
+    const missing = entry.walletIds.length - matched.length;
+    if (missing > 0) {
+      notify(
+        `<b>⚠️ Booked mint ${esc(entry.id)}</b>\n\n${missing} of the ${entry.walletIds.length} ` +
+          `booked wallet(s) are gone from the store; the remaining ${matched.length} will fire.`
+      );
+    }
+  } else {
+    matched = resolveWallets(entry.selector, session.wallets(), tagCtx);
+    if (matched.length === 0) {
+      throw new Error(
+        `No wallets match "${entry.selector}" on ${chain.name} any more. Nothing was sent.`
+      );
+    }
   }
 
   // "auto" is resolved now rather than at booking time, because a drop is very
@@ -4774,16 +6027,107 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
     path = drop ? "public" : "fcfs";
   }
 
+  const pathName =
+    path === "public" ? "SeaDrop public" : path === "allowlist" ? "SeaDrop allowlist" : "OpenSea";
+
   await status.update(
     [
       `<b>⏰ Arming booked mint</b>  <code>${esc(entry.id)}</code>`,
       ``,
-      `${matched.length} wallet(s) · ${path === "public" ? "SeaDrop public" : "OpenSea"}`,
+      `${matched.length} wallet(s) · ${esc(pathName)}`,
       `fires ${esc(whenText(entry.fireAt))}`,
     ].join("\n")
   );
 
   const label = `<b>Booked mint</b> <code>${esc(entry.id)}</code>`;
+
+  // ── SeaDrop allowlist ──
+  //
+  // Proofs are public data, so this pre-signs exactly like the public path —
+  // but the list is re-fetched here rather than trusted from booking time. A
+  // list republished between the booking and the open would otherwise produce
+  // five hundred transactions carrying proofs the contract no longer accepts.
+  if (path === "allowlist") {
+    const { report } = await loadEligibility(chain, entry.contract, undefined, matched);
+    if (report.eligible.length === 0) {
+      throw new Error(
+        report.rootMatched
+          ? `None of the ${matched.length} booked wallet(s) are on this allowlist any more.`
+          : `The published allowlist no longer rebuilds the root this contract holds, so no ` +
+            `proof can be trusted. Nothing was sent.`
+      );
+    }
+
+    const listReport = await executeAllowListMint(
+      {
+        nftContract: entry.contract,
+        quantity: entry.quantity,
+        eligible: report.eligible,
+        waitForStart: true,
+        skipUnderfunded: true,
+      },
+      {
+        readUrl: chain.rpc.readUrl,
+        allRpcUrls: chain.rpc.allUrls,
+        endpoints: chain.rpc.endpoints,
+        chainId: chain.chainId,
+        gasLimit: config.gasLimit,
+        maxFeePerGas: config.maxFeePerGas,
+        maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        nonces: chain.nonces,
+        signerFor: session.signerFor,
+      },
+      (event: AllowListEvent) => {
+        switch (event.type) {
+          case "armed":
+            status.update(
+              `${label}\n\n🔒 ${event.total} transaction(s) signed and held\n` +
+                `<i>Proofs are public data, so T-0 is socket writes only.</i>`
+            );
+            break;
+          case "waiting":
+            status.update(
+              `${label}\n\n⏳ holding — ${Math.round(event.msRemaining / 1000)}s`
+            );
+            break;
+          case "dispatched":
+            status.update(
+              `${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms`
+            );
+            break;
+          case "receipts":
+            status.update(
+              `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
+                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending`
+            );
+            break;
+        }
+      }
+    );
+
+    schedule.update(entry.id, {
+      status: "done",
+      finishedAt: Date.now(),
+      outcome: `${listReport.confirmed}/${listReport.attempted} confirmed`,
+    });
+    const firstListOk = listReport.rows.find((r) => r.status === "confirmed");
+    await status.finish(
+      [
+        listReport.confirmed > 0
+          ? `<b>✅ Booked mint landed</b>`
+          : `<b>❌ Booked mint bought nothing</b>`,
+        `<code>${esc(entry.id)}</code> ${esc(entry.collection ?? short(entry.contract))} · allowlist`,
+        ``,
+        `${bar(listReport.confirmed, listReport.attempted)}  ${listReport.confirmed}/${listReport.attempted} confirmed`,
+        listReport.reverted > 0 ? `✗ ${listReport.reverted} reverted` : ``,
+        `spent ${eth(listReport.totalValue)} ETH`,
+        firstListOk ? `\n${txLink(chain.chainId, firstListOk.hash, "view a transaction")}` : ``,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+    return;
+  }
 
   if (path === "public") {
     const report = await executePublicMint(
@@ -4992,7 +6336,14 @@ async function showMenu(ctx: Context, which: string): Promise<void> {
   const views: Record<string, { text: string; keyboard: ReturnType<typeof mainMenu> }> = {
     main: { text: menuHeader(), keyboard: mainMenu(session.copyEnabled, watched) },
     mint: {
-      text: `<b>Mint</b>\n\n<i>Public reads the drop from chain. FCFS asks OpenSea for whatever stage you're eligible for. Schedule books either one for a time you name and fires it without you.</i>`,
+      text:
+        `<b>Mint</b>\n\n` +
+        `<i>Paste a link or a contract. The card reads every stage — the ` +
+        `contract's own and whatever OpenSea gates — then says which of your ` +
+        `wallets can mint each one.</i>` +
+        `\n\n<i>Whitelisted on a wallet you keep elsewhere? Import it right ` +
+        `there in the wallet picker and mint from it. Fire now, or book it for ` +
+        `a time and walk away.</i>`,
       keyboard: mintMenu(schedule.pending().length),
     },
     wallets: {
@@ -5463,6 +6814,10 @@ async function onCallback(ctx: Context): Promise<void> {
   }
 
   switch (prefix) {
+    // The mint card. Every button on it, including the ones that spend.
+    case "mc":
+      return onMintCard(ctx, rest);
+
     case "m":
       return showMenu(ctx, payload);
 
@@ -5898,6 +7253,45 @@ async function onText(ctx: Context): Promise<void> {
     return;
   }
 
+  // The mint card asks for at most one thing at a time and owns everything
+  // else, so it is answered here rather than through advanceFlow — which would
+  // otherwise resolve the contract a second time and start a parallel flow.
+  if (flow.kind === "mintCard") {
+    clearFlow(chatId);
+    if (flow.step === "contract") return openMintCard(ctx, text);
+
+    const draft = liveDraft(chatId);
+    if (!draft) {
+      await ctx.reply("That mint card expired. Run <code>/mint</code> again.", {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (flow.step === "time") return bookCardWhen(ctx, text);
+    if (flow.step === "amount") {
+      const quantity = Number(text);
+      if (!Number.isInteger(quantity) || quantity < 1) {
+        await ctx.reply("Quantity must be a whole number, 1 or more.");
+        return;
+      }
+      const stage = activeStage(draft);
+      if (stage?.perWallet !== undefined && stage.perWallet > 0 && quantity > stage.perWallet) {
+        await ctx.reply(
+          `<b>${esc(stage.label)}</b> allows at most ${stage.perWallet} per wallet. ` +
+            `Anything above that reverts and pays gas for the privilege.`,
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
+      draft.quantity = quantity;
+      draft.view = "main";
+      // The price per wallet has moved, so who counts as funded has too.
+      draft.seq++;
+      return refreshCard(draft);
+    }
+    return;
+  }
+
   if (flow.kind === "destination" && flow.step === "address") {
     if (!isAddress(text)) {
       await ctx.reply("That doesn't look like an address. Send a 0x… address, or tap Cancel.");
@@ -6189,7 +7583,7 @@ async function main(): Promise<void> {
   bot.command("sweep", (ctx) => cmdSweep(ctx).catch((e) => fail(ctx, e)));
   bot.command("autosweep", (ctx) => cmdAutoSweep(ctx).catch((e) => fail(ctx, e)));
   bot.command("drain", (ctx) => cmdDrain(ctx).catch((e) => fail(ctx, e)));
-  bot.command("mint", (ctx) => cmdMint(ctx).catch((e) => fail(ctx, e)));
+  bot.command("mint", (ctx) => cmdMintEntry(ctx).catch((e) => fail(ctx, e)));
   bot.command("check", (ctx) => cmdCheck(ctx).catch((e) => fail(ctx, e)));
   bot.command("allowlist", (ctx) => cmdAllowList(ctx).catch((e) => fail(ctx, e)));
   bot.command("probe", (ctx) => cmdProbe(ctx).catch((e: unknown) => fail(ctx, e)));

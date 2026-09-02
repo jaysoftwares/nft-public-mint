@@ -19,6 +19,12 @@ export type FlowKind =
   | "mint"
   | "fcfs"
   | "schedule"
+  /**
+   * The one short answer the mint card cannot collect with a button: a
+   * contract to point at, a quantity outside the presets, or a firing time.
+   * The card owns the rest of the state; this flow only carries the question.
+   */
+  | "mintCard"
   | "fund"
   | "watch"
   | "sweep"
@@ -142,17 +148,23 @@ export function destinationConfirm(address: string, duringSetup = false): Inline
     .text("✕ Cancel", duringSetup ? "cfg:menu" : "m:main");
 }
 
+/**
+ * One way in, not three.
+ *
+ * This used to offer "Public mint", "FCFS via OpenSea" and "Schedule a mint" as
+ * separate paths, which asked the operator to know — before pasting a link —
+ * which machinery the drop needed and whether any of their wallets was on its
+ * list. The card answers all three from the contract itself: it reads every
+ * stage, marks the wallets that can mint each one, and carries both the fire
+ * button and the booking. The old paths still work as typed commands.
+ */
 export function mintMenu(scheduled = 0): InlineKeyboard {
   return new InlineKeyboard()
-    .text("🎯 Public mint", "i:mint")
+    .text("💎 Mint a drop", "mc:new")
     .row()
-    .text("🔥 FCFS via OpenSea", "i:fcfs")
-    .row()
-    // First among the things you do ahead of time, and labelled with the count
-    // because a booking made yesterday is invisible otherwise — which is how a
-    // scheduled mint gets forgotten and fires as a surprise.
-    .text("⏰ Schedule a mint", "i:schedule")
-    .row()
+    // Labelled with the count because a booking made yesterday is invisible
+    // otherwise — which is how a scheduled mint gets forgotten and fires as a
+    // surprise.
     .text(scheduled > 0 ? `📅 Booked (${scheduled})` : "📅 Booked mints", "a:scheduled")
     .row()
     .text("🔎 Probe a drop", "i:check")
@@ -216,7 +228,15 @@ export function walletsMenu(): InlineKeyboard {
     .text("‹ Back", "m:main");
 }
 
-export function walletImportMenu(): InlineKeyboard {
+/**
+ * `back` is where the operator came from.
+ *
+ * Importing is reached from two places that mean different things: the wallets
+ * screen, where it is housekeeping, and the mint card's picker, where it is the
+ * middle of a decision about a drop that is opening. Sending the second one
+ * back to a wallet menu loses the drop.
+ */
+export function walletImportMenu(back = "m:wallets"): InlineKeyboard {
   return new InlineKeyboard()
     .text("🔑 Private key", "im:key")
     .row()
@@ -224,7 +244,7 @@ export function walletImportMenu(): InlineKeyboard {
     .row()
     .text("🌱 Seed phrase · first 10", "im:seed:10")
     .row()
-    .text("‹ Back", "m:wallets");
+    .text("‹ Back", back);
 }
 
 /**

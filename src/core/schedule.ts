@@ -25,16 +25,18 @@ import { stateDir, ensureStateDir } from "./paths";
  *
  * `public` reads the SeaDrop public drop straight off the chain, so everything
  * — plan, balances, signatures — is done before the stage opens and T-0 is
- * nothing but socket writes. `fcfs` goes through OpenSea, which refuses to
- * issue calldata before a stage opens and therefore cannot be pre-signed; its
- * T-0 is a fetch. `auto` picks the first that is actually available, which is
- * what somebody who pasted a link and a time meant.
+ * nothing but socket writes. `allowlist` is the same shape with a merkle proof
+ * in front of it: the list is public data, so it too is fully pre-signed.
+ * `fcfs` goes through OpenSea, which refuses to issue calldata before a stage
+ * opens and therefore cannot be pre-signed; its T-0 is a fetch. `auto` picks
+ * the first that is actually available, which is what somebody who pasted a
+ * link and a time meant.
  */
-export type MintPath = "auto" | "public" | "fcfs";
+export type MintPath = "auto" | "public" | "allowlist" | "fcfs";
 
 export type ScheduleStatus = "pending" | "running" | "done" | "failed" | "cancelled" | "missed";
 
-export const MINT_PATHS: MintPath[] = ["auto", "public", "fcfs"];
+export const MINT_PATHS: MintPath[] = ["auto", "public", "allowlist", "fcfs"];
 
 export interface ScheduledMint {
   id: string;
@@ -46,6 +48,17 @@ export interface ScheduledMint {
   collection?: string;
   quantity: number;
   selector: string;
+  /**
+   * The exact wallets chosen, when the booking came from the mint card.
+   *
+   * A selector is a rule and re-runs at T-0, which is right for `/schedule
+   * derived+funded` — the set that is funded in six hours is the set that
+   * should fire. It is wrong for a booking made by ticking eleven wallets off a
+   * list because they are the ones on the allowlist: re-resolving would quietly
+   * substitute a different set. Ids win where they are present, and any that
+   * have since vanished are reported rather than skipped.
+   */
+  walletIds?: string[];
   path: MintPath;
   /** Epoch ms, UTC. */
   fireAt: number;
