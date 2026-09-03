@@ -180,12 +180,31 @@ code changes needed.
 
 ---
 
-## Allowlist / FCFS mints
+## GTD / allowlist / FCFS mints
 
-Not supported here, and it isn't an oversight. An allowlist stage uses SeaDrop's
-`mintSigned()`, which needs a signature that OpenSea generates per wallet — that
-genuinely requires an authenticated OpenSea session. There's no way to build it
-from on-chain data, which is the whole premise of this tool.
+The Telegram bot supports all of these paths:
+
+- Public SeaDrop mints are read from chain, signed ahead of time and broadcast
+  in parallel at the opening instant.
+- GTD or Merkle allowlists are checked per wallet against the on-chain root.
+  Eligible transactions are also signed ahead of time.
+- OpenSea-gated GTD, FCFS and signed stages use OpenSea's wallet-specific mint
+  calldata and require `OPENSEA_API_KEY`. OpenSea selects the stage each wallet
+  qualifies for.
+
+The mint card shows each wallet's eligibility and funding state. A mint can be
+fired immediately or stored as a durable booking; scheduled public and Merkle
+transactions are armed before the target time so T-0 only performs network
+writes. OpenSea-gated calldata cannot be fetched before a stage opens, so that
+request begins at T-0 and the resulting transactions are signed and dispatched
+as soon as it returns.
+
+Chat notifications identify the collection, contract and wallet addresses when
+transactions are dispatched, then mark each wallet as confirmed, failed or
+still pending. Every run also produces a CSV with the complete per-wallet result.
+
+The standalone CLI described above remains the on-chain public-mint path; run
+the Telegram interface for GTD/FCFS and durable scheduling.
 
 ## License
 

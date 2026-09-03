@@ -110,12 +110,87 @@ function targetsFor(index: number, sequencers: Endpoint[], providers: Endpoint[]
   return targets.length > 0 ? targets : providers.slice(0, 1);
 }
 
+/**
+ * Where the nth transaction of a burst should go.
+ *
+ * Exported because a pipelined mint no longer has the whole burst in hand when
+ * it sends the first one — it fires each wallet the moment that wallet is ready
+ * — but the sharding rule must stay identical either way, or one provider ends
+ * up carrying every transaction.
+ */
+export function endpointTargets(index: number, endpoints: Endpoint[]): Endpoint[] {
+  return targetsFor(
+    index,
+    endpoints.filter((e) => e.kind === "sequencer"),
+    endpoints.filter((e) => e.kind === "provider")
+  );
+}
+
 export interface DispatchOptions {
   timeoutMs?: number;
   /** Called once all bytes are on the wire, before any response is read. */
   onDispatched?: (count: number, ms: number) => void;
   /** Called as each transaction's responses settle. */
   onSettled?: (outcome: DispatchOutcome, done: number, total: number) => void;
+}
+
+/**
+ * One transaction, to its shard of the endpoints.
+ *
+ * Every POST is created before the first await, so calling this in a loop still
+ * puts the whole burst on the wire before any response is read — the property
+ * dispatchAll was written for, now available to callers that build their burst
+ * incrementally.
+ */
+export function dispatchOne(
+  tx: PreparedTx,
+  targets: Endpoint[],
+  timeoutMs = 15_000
+): Promise<DispatchOutcome> {
+  const posts = targets.map((ep) =>
+    post(ep.url, tx.body, timeoutMs).then(
+      (res) => ({ ep, res, err: null as Error | null }),
+      (err: Error) => ({ ep, res: null, err })
+    )
+  );
+
+  return Promise.all(posts).then((settled) => {
+    const acceptedBy: string[] = [];
+    const errors: string[] = [];
+
+    for (const { ep, res, err } of settled) {
+      if (err || !res) {
+        errors.push(`${ep.label}: ${err?.message ?? "no response"}`);
+        continue;
+      }
+      try {
+        const json = JSON.parse(res.text) as {
+          result?: string;
+          error?: { message?: string };
+        };
+        if (json.result) {
+          acceptedBy.push(ep.label);
+        } else if (json.error) {
+          const message = json.error.message ?? "unknown error";
+          if (isBenign(message)) acceptedBy.push(`${ep.label} (already known)`);
+          else errors.push(`${ep.label}: ${message}`);
+        } else {
+          errors.push(`${ep.label}: empty response`);
+        }
+      } catch {
+        errors.push(`${ep.label}: HTTP ${res.status} (non-JSON)`);
+      }
+    }
+
+    return {
+      id: tx.id,
+      address: tx.address,
+      hash: tx.hash,
+      accepted: acceptedBy.length > 0,
+      acceptedBy,
+      errors,
+    };
+  });
 }
 
 export async function dispatchAll(
@@ -131,59 +206,17 @@ export async function dispatchAll(
 
   // Every request is initiated before anything is awaited — this loop is the
   // critical path and must not block on a response.
-  const inFlight = txs.map((tx, i) => {
-    const targets = targetsFor(i, sequencers, providers);
-    const posts = targets.map((ep) =>
-      post(ep.url, tx.body, timeoutMs).then(
-        (res) => ({ ep, res, err: null as Error | null }),
-        (err: Error) => ({ ep, res: null, err })
-      )
-    );
-    return { tx, posts };
-  });
+  const inFlight = txs.map((tx, i) =>
+    dispatchOne(tx, targetsFor(i, sequencers, providers), timeoutMs)
+  );
 
   const dispatchMs = Number(process.hrtime.bigint() - started) / 1e6;
   opts.onDispatched?.(txs.length, dispatchMs);
 
   let done = 0;
   const outcomes = await Promise.all(
-    inFlight.map(async ({ tx, posts }) => {
-      const settled = await Promise.all(posts);
-      const acceptedBy: string[] = [];
-      const errors: string[] = [];
-
-      for (const { ep, res, err } of settled) {
-        if (err || !res) {
-          errors.push(`${ep.label}: ${err?.message ?? "no response"}`);
-          continue;
-        }
-        try {
-          const json = JSON.parse(res.text) as {
-            result?: string;
-            error?: { message?: string };
-          };
-          if (json.result) {
-            acceptedBy.push(ep.label);
-          } else if (json.error) {
-            const message = json.error.message ?? "unknown error";
-            if (isBenign(message)) acceptedBy.push(`${ep.label} (already known)`);
-            else errors.push(`${ep.label}: ${message}`);
-          } else {
-            errors.push(`${ep.label}: empty response`);
-          }
-        } catch {
-          errors.push(`${ep.label}: HTTP ${res.status} (non-JSON)`);
-        }
-      }
-
-      const outcome: DispatchOutcome = {
-        id: tx.id,
-        address: tx.address,
-        hash: tx.hash,
-        accepted: acceptedBy.length > 0,
-        acceptedBy,
-        errors,
-      };
+    inFlight.map(async (pending) => {
+      const outcome = await pending;
       done += 1;
       opts.onSettled?.(outcome, done, txs.length);
       return outcome;

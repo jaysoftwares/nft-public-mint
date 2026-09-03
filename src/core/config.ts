@@ -9,8 +9,18 @@ import { FILES, ensureStateDir } from "./paths";
 
 export interface GasConfig {
   limit: number;
+  /** Hard ceiling on maxFeePerGas. With autoPrice on, the bot bids up to this. */
   maxFeeGwei: string;
+  /** Floor on the tip. With autoPrice on, the bot never bids below this. */
   priorityGwei: string;
+  /**
+   * Price gas from the chain instead of from this file.
+   *
+   * On means the two numbers above become bounds rather than the bid, and what
+   * goes on the wire is sampled from recent blocks between them. Off restores
+   * the old fixed-price behaviour exactly.
+   */
+  autoPrice: boolean;
 }
 
 export interface CapsConfig {
@@ -91,6 +101,29 @@ export interface SignedConfig {
   concurrency: number;
   minDelayMs: number;
   maxRetries: number;
+  /**
+   * Wallets allowed to skip the pacing delay entirely at the start of a burst.
+   *
+   * Pacing exists for OpenSea's rate limit, which is a per-minute budget — and
+   * spending it evenly is exactly wrong for a drop that is decided in the first
+   * two seconds. The opening wallets go out together; the tail is paced as
+   * before, when the race is already over.
+   */
+  burstFirst: number;
+}
+
+/**
+ * What the drawn mint card is signed with.
+ *
+ * Configurable rather than hard-coded because the wordmark and the links are
+ * an identity, and putting somebody else's on a card this bot sends out is not
+ * a default anyone should inherit. Empty links are omitted from the card
+ * entirely rather than drawn blank.
+ */
+export interface BrandConfig {
+  name: string;
+  x: string;
+  telegram: string;
 }
 
 export interface BotConfig {
@@ -110,6 +143,8 @@ export interface BotConfig {
    */
   reconcileBatch: number;
   gas: GasConfig;
+  /** Wordmark and links drawn on the mint card. */
+  brand: BrandConfig;
   caps: CapsConfig;
   copy: CopyConfig;
   autoSweep: AutoSweepConfig;
@@ -180,7 +215,8 @@ export const DEFAULT_CONFIG: BotConfig = {
   funder: ZeroAddress,
   hotSetSize: 50,
   reconcileBatch: 100,
-  gas: { limit: 250_000, maxFeeGwei: "2", priorityGwei: "0.05" },
+  gas: { limit: 250_000, maxFeeGwei: "2", priorityGwei: "0.05", autoPrice: true },
+  brand: { name: "copymint", x: "", telegram: "" },
   caps: { perEventEth: "0.10", maxPriceEth: "0.005", dailyEth: "0.50" },
   copy: {
     // Off by default. Turning on autonomous spending should be a decision,
@@ -213,11 +249,14 @@ export const DEFAULT_CONFIG: BotConfig = {
       uri: "https://opensea.io",
       statement: "Sign in to OpenSea",
     },
-    // Conservative on purpose: 500 wallets arriving at once gets the IP
-    // throttled or flagged. Raise only after watching real responses.
-    concurrency: 3,
-    minDelayMs: 400,
+    // Conservative for the tail, deliberately not for the opening. A drop that
+    // sells out in two seconds cannot be reached at one request every 400ms:
+    // the seventh wallet's request would not even have started. The first
+    // burstFirst wallets go at once, the rest are paced.
+    concurrency: 6,
+    minDelayMs: 120,
     maxRetries: 3,
+    burstFirst: 6,
   },
   rpc: { read: [], send: [] },
 };
@@ -315,6 +354,21 @@ export interface UserSettingsUpdate {
    * only decides whether the vault they already confirmed is used automatically.
    */
   autoSweep?: boolean;
+  /**
+   * The tip this bot bids, as a decimal gwei string.
+   *
+   * Chat-settable for the same reason the caps are. This is the number that
+   * decides where a transaction is ordered inside a contested block, which is
+   * to say it decides whether a drop is won — and leaving it at whatever
+   * shipped as the default, reachable only over SSH, is how it stops being a
+   * decision anybody made.
+   *
+   * It is a floor, not the bid: with gas.autoPrice on, the bot samples recent
+   * blocks and bids the higher of this and what the chain is actually paying.
+   */
+  gasTipGwei?: string;
+  /** Whether gas is sampled from the chain at all. */
+  autoPrice?: boolean;
 }
 
 /**
@@ -363,6 +417,8 @@ export function updateUserSettings(update: UserSettingsUpdate): {
   caps?: BotConfig["caps"];
   copyWalletSelector?: string;
   autoSweep?: boolean;
+  gasTipGwei?: string;
+  autoPrice?: boolean;
 } {
   const path = FILES.config();
   if (!existsSync(path)) {
@@ -383,7 +439,38 @@ export function updateUserSettings(update: UserSettingsUpdate): {
     caps?: BotConfig["caps"];
     copyWalletSelector?: string;
     autoSweep?: boolean;
+    gasTipGwei?: string;
+    autoPrice?: boolean;
   } = {};
+
+  if (update.gasTipGwei !== undefined) {
+    const gas = { ...DEFAULT_CONFIG.gas, ...(raw.gas ?? {}) };
+    let tip: bigint;
+    try {
+      tip = parseUnits(update.gasTipGwei.trim(), "gwei");
+    } catch {
+      throw new ConfigError(`"${update.gasTipGwei}" is not a valid gwei amount.`);
+    }
+    if (tip <= 0n) throw new ConfigError("The gas tip has to be greater than zero.");
+    // A tip above the ceiling is invalid under EIP-1559 and every node rejects
+    // it outright, so it is refused here rather than at the drop.
+    const ceiling = parseUnits(gas.maxFeeGwei, "gwei");
+    if (tip > ceiling) {
+      throw new ConfigError(
+        `A ${update.gasTipGwei} gwei tip is above the ${gas.maxFeeGwei} gwei ceiling in ` +
+          "gas.maxFeeGwei. Raise the ceiling over SSH first — every node rejects a tip " +
+          "larger than the maximum fee."
+      );
+    }
+    gas.priorityGwei = update.gasTipGwei.trim();
+    raw.gas = gas;
+    result.gasTipGwei = gas.priorityGwei;
+  }
+
+  if (update.autoPrice !== undefined) {
+    raw.gas = { ...DEFAULT_CONFIG.gas, ...(raw.gas ?? {}), autoPrice: update.autoPrice };
+    result.autoPrice = update.autoPrice;
+  }
 
   if (update.destination !== undefined) {
     try {
@@ -507,6 +594,7 @@ export function loadConfig(): ResolvedConfig {
     ...DEFAULT_CONFIG,
     ...raw,
     gas: { ...DEFAULT_CONFIG.gas, ...(raw.gas ?? {}) },
+    brand: { ...DEFAULT_CONFIG.brand, ...(raw.brand ?? {}) },
     caps: { ...DEFAULT_CONFIG.caps, ...(raw.caps ?? {}) },
     copy: {
       ...DEFAULT_CONFIG.copy,

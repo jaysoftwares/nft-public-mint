@@ -23,7 +23,16 @@
 import { Interface, getAddress, formatEther, Wallet, HDNodeWallet } from "ethers";
 import { SEADROP_ADDRESS } from "../seadrop-public";
 import { NonceManager } from "./nonce-manager";
-import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
+import {
+  Endpoint,
+  DispatchOutcome,
+  dispatchOne,
+  endpointTargets,
+  prepareTx,
+  PreparedTx,
+  summariseErrors,
+} from "./dispatcher";
+import { FeeQuote, sampleFees } from "./fee-oracle";
 import { fetchBalances, requiredPerWallet, shortfalls, Shortfall } from "./balances";
 import { collectReceipts, sleepUntil, ReceiptRow } from "./mint-runtime";
 import { simulate } from "./calldata";
@@ -38,6 +47,14 @@ import {
 } from "./opensea-api";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
+
+/**
+ * How far ahead of a booked fire to re-price gas and re-open the sockets.
+ *
+ * Long enough for both round trips to finish comfortably, short enough that the
+ * base fee sampled is still the one the transaction will pay.
+ */
+const PREFIRE_LEAD_MS = 1_500;
 
 // Every SeaDrop mint entry point shares its first four parameters, so one
 // decoder covers public, allowlist and signed stages alike.
@@ -144,7 +161,12 @@ export interface OpenSeaMintDeps {
   apiKey: string;
   /** Sanity ceiling on unit price — a guard against an unexpected response. */
   maxUnitPriceWei: bigint;
-  pacing: { concurrency: number; minDelayMs: number; maxRetries: number };
+  pacing: { concurrency: number; minDelayMs: number; maxRetries: number; burstFirst: number };
+  /**
+   * Price gas from the chain rather than from config. Defaults to on; pass
+   * false to sign with the configured numbers exactly, as this used to.
+   */
+  autoPrice?: boolean;
 }
 
 export interface OpenSeaMintRequest {
@@ -302,14 +324,16 @@ export type OpenSeaMintEvent =
   | { type: "waiting"; msRemaining: number }
   | { type: "probing"; attempt: number; msPastOpen: number; reason: string }
   | { type: "open"; attempts: number; waitedMs: number; hadCalldata: boolean }
+  | { type: "priced"; maxFeeWei: bigint; tipWei: bigint; source: string; ceilingTooLow: boolean }
   | { type: "fetching"; done: number; total: number; failures: number }
+  | { type: "firing"; sent: number; accepted: number; total: number; msSinceOpen: number }
   | { type: "fetched"; ok: number; failed: number; ms: number; unitPriceWei: bigint }
   | { type: "inspected"; ok: number; rejected: { address: string; reason: string }[] }
   | { type: "simulated"; gasLimit: number }
   | { type: "funding"; eligible: number; underfunded: Shortfall[]; requiredPerWallet: bigint }
   | { type: "signing"; done: number; total: number }
-  | { type: "dispatched"; count: number; ms: number }
-  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number }
+  | { type: "dispatched"; count: number; ms: number; wallets: PreparedTx[] }
+  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number; rows: ReceiptRow[] }
   | { type: "done"; report: OpenSeaMintReport };
 
 export interface OpenSeaMintReport {
@@ -532,24 +556,98 @@ export async function executeOpenSeaMint(
   // Two modes. Scheduled-only sleeps to the instant and fires once, which is
   // right when the time is known to be right. Holding keeps asking until the
   // endpoint actually answers, which is right when it might not be.
+  //
+  // Either way the last stretch before the fire belongs to two jobs that must
+  // not happen at T-0: pricing gas from the chain, and re-opening the sockets.
+  // The agent's keep-alive is fifteen seconds, so a hold of any real length
+  // leaves every connection closed and would otherwise spend the opening
+  // moment of the drop on TLS handshakes.
+  let fees: FeeQuote = {
+    maxFeePerGas: deps.maxFeePerGas,
+    maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+    baseFeeWei: 0n,
+    source: "config",
+    ceilingTooLow: false,
+  };
+
+  const reprice = async (): Promise<void> => {
+    if (deps.autoPrice !== false) {
+      fees = await sampleFees(deps.readUrl, {
+        ceilingWei: deps.maxFeePerGas,
+        priorityFloorWei: deps.maxPriorityFeePerGas,
+      });
+    }
+    emit({
+      type: "priced",
+      maxFeeWei: fees.maxFeePerGas,
+      tipWei: fees.maxPriorityFeePerGas,
+      source: fees.source,
+      ceilingTooLow: fees.ceilingTooLow,
+    });
+    await warmSockets(deps.allRpcUrls);
+  };
+
+  await reprice();
+
   let seeded: Fetched | undefined;
   if (req.waitForOpen) {
     seeded = await holdUntilOpen(req, deps, affordable[0], emit);
   } else if (req.startAt && req.startAt.getTime() > Date.now()) {
-    emit({ type: "waiting", msRemaining: req.startAt.getTime() - Date.now() });
-    await sleepUntil(req.startAt.getTime());
+    const fireAt = req.startAt.getTime();
+    emit({ type: "waiting", msRemaining: fireAt - Date.now() });
+    // Re-price and re-warm on the near side of the fire, then sleep the rest.
+    if (fireAt - Date.now() > PREFIRE_LEAD_MS) {
+      await sleepUntil(fireAt - PREFIRE_LEAD_MS);
+      await reprice();
+    }
+    await sleepUntil(fireAt);
   }
 
-  // ── Fetch calldata, paced ──
+  // ── Fetch, sign and fire, one wallet at a time, all at once ──
+  //
+  // This used to be four phases with a barrier between each: fetch every
+  // wallet's calldata, inspect every response, simulate one, then sign and
+  // dispatch the lot. Every wallet therefore waited for the slowest, and on
+  // 2026-09-02 that cost a drop outright — the collection sold out two seconds
+  // after opening while the seventh wallet's calldata request had not yet been
+  // allowed to start, and the run ended having sent nothing at all.
+  //
+  // So there is no barrier now. A wallet that has its calldata is inspected,
+  // simulated, signed and put on the wire immediately, while its neighbours are
+  // still waiting on OpenSea. The first transaction leaves at roughly the
+  // latency of a single API call rather than at the sum of all of them.
   const fetchStart = process.hrtime.bigint();
+  const firedFrom = Date.now();
   const fetched: Fetched[] = [];
   const fetchFailures: { address: string; reason: string }[] = [];
+  const rejected: { address: string; reason: string }[] = [];
+  const prepared: PreparedTx[] = [];
+  const outcomes: DispatchOutcome[] = [];
 
-  // The probe that opened the door already holds valid calldata for its wallet.
-  // Throwing it away would cost a second request for no gain, at the one moment
-  // requests are worth most.
-  const queue = seeded ? affordable.filter((w) => w.id !== seeded!.id) : affordable;
-  if (seeded) fetched.push(seeded);
+  // Settled by whichever wallet simulates first; the rest reuse it rather than
+  // each paying a round trip to learn the same number.
+  let gasLimit = deps.gasLimit;
+  let gasLimitSettled = false;
+
+  // The price ceiling is the one failure that must stop every wallet, not just
+  // its own — it exists to catch a drop that is not what was booked.
+  let priceAbort: string | undefined;
+  let unitPrice = req.unitPriceHintWei ?? 0n;
+
+  // Endpoint sharding is by send order, so it is claimed at the send rather
+  // than fixed up front: the burst no longer exists as an array beforehand.
+  let shard = 0;
+  let dispatchStarted = 0n;
+  let dispatchEnded = 0n;
+
+  const jobs: { id: string; address: string; tx?: MintCalldata }[] = affordable.map((w) =>
+    seeded && w.id === seeded.id
+      ? { id: w.id, address: w.address, tx: seeded.tx }
+      : { id: w.id, address: w.address }
+  );
+  // A wallet whose calldata the probe already fetched goes first — it can be on
+  // the wire before anyone else has finished asking.
+  jobs.sort((a, b) => (b.tx ? 1 : 0) - (a.tx ? 1 : 0));
 
   let cursor = 0;
   let lastStart = 0;
@@ -557,61 +655,162 @@ export async function executeOpenSeaMint(
 
   const worker = async (): Promise<void> => {
     for (;;) {
+      if (priceAbort) return;
       const index = cursor++;
-      if (index >= queue.length) return;
-      const wallet = queue[index];
+      if (index >= jobs.length) return;
+      const job = jobs[index];
 
-      // Slot claimed synchronously so concurrent workers cannot collide on it.
-      const slot = Math.max(Date.now(), lastStart + deps.pacing.minDelayMs);
-      lastStart = slot;
-      const wait = slot - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      // ── Calldata ──
+      let tx = job.tx;
+      if (!tx) {
+        // Pacing protects a per-minute rate budget, and spending that budget
+        // evenly is precisely wrong for a race decided in the first seconds.
+        // The opening wallets go together; the tail is paced as it always was.
+        if (index >= deps.pacing.burstFirst) {
+          const slot = Math.max(Date.now(), lastStart + deps.pacing.minDelayMs);
+          lastStart = slot;
+          const wait = slot - Date.now();
+          if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        }
 
-      let attempt = 0;
-      for (;;) {
-        try {
-          const tx = await fetchMintCalldata(deps.apiKey, req.slug, wallet.address, req.quantity);
-          fetched.push({ id: wallet.id, address: wallet.address, tx });
-          break;
-        } catch (err) {
-          const apiError = err instanceof OpenSeaApiError ? err : undefined;
-          attempt += 1;
-          if (!apiError?.retryable || attempt > deps.pacing.maxRetries) {
-            fetchFailures.push({
-              address: wallet.address,
-              reason: apiError?.message ?? (err as Error).message,
-            });
+        let attempt = 0;
+        for (;;) {
+          try {
+            tx = await fetchMintCalldata(deps.apiKey, req.slug, job.address, req.quantity);
             break;
+          } catch (err) {
+            const apiError = err instanceof OpenSeaApiError ? err : undefined;
+            attempt += 1;
+            if (!apiError?.retryable || attempt > deps.pacing.maxRetries) {
+              fetchFailures.push({
+                address: job.address,
+                reason: apiError?.message ?? (err as Error).message,
+              });
+              break;
+            }
+            const base = apiError.kind === "rate_limited" ? 1500 : 400;
+            await new Promise((r) => setTimeout(r, Math.min(20_000, base * 2 ** (attempt - 1))));
           }
-          const base = apiError.kind === "rate_limited" ? 1500 : 400;
-          await new Promise((r) => setTimeout(r, Math.min(20_000, base * 2 ** (attempt - 1))));
+        }
+        if (!tx) {
+          done += 1;
+          continue;
         }
       }
 
-      done += 1;
-      if (done % 5 === 0 || done === queue.length) {
-        emit({ type: "fetching", done, total: queue.length, failures: fetchFailures.length });
+      fetched.push({ id: job.id, address: job.address, tx });
+
+      // ── Price ──
+      //
+      // OpenSea prices the stage; take it from the response rather than
+      // guessing. Over the ceiling stops the whole run, because a price that is
+      // not the booked one means this is not the drop that was agreed to.
+      const unit = tx.value / BigInt(req.quantity || 1);
+      unitPrice = unit;
+      if (unit > deps.maxUnitPriceWei) {
+        priceAbort =
+          `Unit price ${formatEther(unit)} ETH exceeds the ` +
+          `${formatEther(deps.maxUnitPriceWei)} ETH ceiling in caps.maxPriceEth. ` +
+          "Nothing further was sent — raise the cap if this is expected.";
+        return;
       }
+
+      // ── Inspect ──
+      const check = inspectCalldata(tx, req.nftContract, job.address);
+      if (!check.ok) {
+        rejected.push({ address: job.address, reason: check.reason ?? "failed inspection" });
+        done += 1;
+        continue;
+      }
+
+      // ── Simulate ──
+      //
+      // Per wallet, and fatal only to that wallet. A single shared probe used
+      // to gate the entire batch: when it reverted — sold out, or that one
+      // address not eligible — every other wallet was abandoned unsent, however
+      // healthy. One revert is now one wallet.
+      const sim = await simulate(deps.readUrl, {
+        from: job.address,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value,
+      });
+      if (!sim.ok) {
+        rejected.push({
+          address: job.address,
+          reason: `simulation reverted — ${sim.reason ?? "no reason given"}`,
+        });
+        done += 1;
+        continue;
+      }
+      if (!gasLimitSettled && sim.gasEstimate) {
+        gasLimit = Math.max(Number((sim.gasEstimate * 13n) / 10n), deps.gasLimit);
+        gasLimitSettled = true;
+        emit({ type: "simulated", gasLimit });
+      }
+
+      // ── Sign and fire ──
+      //
+      // No balance re-read here on purpose. Pre-flight already screened every
+      // wallet against the configured gas limit and the stage price, and a
+      // second batched read at this point would put a round trip between the
+      // calldata and the wire for no outcome the node will not tell us anyway.
+      const raw = await deps.signerFor(job.id).signTransaction({
+        to: tx.to,
+        data: tx.data,
+        value: tx.value,
+        nonce: deps.nonces.next(job.address),
+        gasLimit,
+        maxFeePerGas: fees.maxFeePerGas,
+        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+        type: 2,
+        chainId: deps.chainId,
+      });
+      const ptx = prepareTx(job.id, job.address, raw);
+      prepared.push(ptx);
+
+      if (dispatchStarted === 0n) dispatchStarted = process.hrtime.bigint();
+      const outcome = await dispatchOne(ptx, endpointTargets(shard++, deps.endpoints));
+      dispatchEnded = process.hrtime.bigint();
+      outcomes.push(outcome);
+      if (!outcome.accepted) deps.nonces.rollback(job.address);
+
+      done += 1;
+      emit({
+        type: "firing",
+        sent: outcomes.length,
+        accepted: outcomes.filter((o) => o.accepted).length,
+        total: jobs.length,
+        msSinceOpen: Date.now() - firedFrom,
+      });
+      emit({ type: "fetching", done, total: jobs.length, failures: fetchFailures.length });
     }
   };
 
   await Promise.all(
     Array.from(
-      { length: Math.max(1, Math.min(deps.pacing.concurrency, Math.max(1, queue.length))) },
+      { length: Math.max(1, Math.min(deps.pacing.concurrency, Math.max(1, jobs.length))) },
       () => worker()
     )
   );
 
   const fetchMs = Number(process.hrtime.bigint() - fetchStart) / 1e6;
+
+  if (priceAbort && outcomes.length === 0) throw new OpenSeaMintError(priceAbort);
   if (fetched.length === 0) {
     throw new OpenSeaMintError(
       `No calldata obtained for any of ${req.wallets.length} wallet(s).\n` +
         (fetchFailures[0]?.reason ?? "")
     );
   }
+  if (prepared.length === 0) {
+    throw new OpenSeaMintError(
+      `Nothing could be sent. ${
+        rejected[0]?.reason ?? fetchFailures[0]?.reason ?? "every wallet was refused"
+      }`
+    );
+  }
 
-  // OpenSea prices the stage; take it from the response rather than guessing.
-  const unitPrice = fetched[0].tx.value / BigInt(req.quantity || 1);
   emit({
     type: "fetched",
     ok: fetched.length,
@@ -619,97 +818,18 @@ export async function executeOpenSeaMint(
     ms: fetchMs,
     unitPriceWei: unitPrice,
   });
+  emit({ type: "inspected", ok: prepared.length, rejected });
 
-  if (unitPrice > deps.maxUnitPriceWei) {
-    throw new OpenSeaMintError(
-      `Unit price ${formatEther(unitPrice)} ETH exceeds the ${formatEther(deps.maxUnitPriceWei)} ETH ceiling ` +
-        "in caps.maxPriceEth. Nothing was sent — raise the cap if this is expected."
-    );
-  }
+  const accepted = outcomes.filter((o) => o.accepted).length;
+  const report = {
+    outcomes,
+    accepted,
+    rejected: outcomes.length - accepted,
+    dispatchMs: dispatchStarted === 0n ? 0 : Number(dispatchEnded - dispatchStarted) / 1e6,
+  };
+  emit({ type: "dispatched", count: prepared.length, ms: report.dispatchMs, wallets: prepared });
 
-  // ── Inspect every response ──
-  const rejected: { address: string; reason: string }[] = [];
-  const clean: Fetched[] = [];
-  for (const item of fetched) {
-    const check = inspectCalldata(item.tx, req.nftContract, item.address);
-    if (check.ok) clean.push(item);
-    else rejected.push({ address: item.address, reason: check.reason ?? "failed inspection" });
-  }
-  emit({ type: "inspected", ok: clean.length, rejected });
-
-  if (clean.length === 0) {
-    throw new OpenSeaMintError(
-      `Every response failed inspection. First reason: ${rejected[0]?.reason ?? "unknown"}`
-    );
-  }
-
-  // ── Simulate one, and take its gas estimate ──
-  const probe = clean[0];
-  const sim = await simulate(deps.readUrl, {
-    from: probe.address,
-    to: probe.tx.to,
-    data: probe.tx.data,
-    value: probe.tx.value,
-  });
-  if (!sim.ok) {
-    throw new OpenSeaMintError(
-      `Simulation reverted — nothing sent. ${sim.reason ?? "no reason given"}`
-    );
-  }
-  const gasLimit = Math.max(
-    sim.gasEstimate ? Number((sim.gasEstimate * 13n) / 10n) : deps.gasLimit,
-    deps.gasLimit
-  );
-  emit({ type: "simulated", gasLimit });
-
-  // Funding was screened before the burst; re-check only against the real gas
-  // limit, which simulation has now priced properly.
-  const required = requiredPerWallet(gasLimit, deps.maxFeePerGas, probe.tx.value);
-  const balances = await fetchBalances(
-    deps.readUrl,
-    clean.map((c) => ({ id: c.id, address: c.address }))
-  );
-  const underfunded = shortfalls(
-    clean.map((c) => ({ id: c.id, address: c.address })),
-    balances,
-    required
-  );
-  const funded = clean.filter((c) => !underfunded.some((u) => u.id === c.id));
-  if (funded.length === 0) {
-    throw new OpenSeaMintError(
-      `Every wallet fell short of the ${formatEther(required)} ETH reservation once gas was priced.`
-    );
-  }
-
-  // ── Sign and fire ──
-  const prepared = [];
-  for (let i = 0; i < funded.length; i++) {
-    const item = funded[i];
-    const raw = await deps.signerFor(item.id).signTransaction({
-      to: item.tx.to,
-      data: item.tx.data,
-      value: item.tx.value,
-      nonce: deps.nonces.next(item.address),
-      gasLimit,
-      maxFeePerGas: deps.maxFeePerGas,
-      maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
-      type: 2,
-      chainId: deps.chainId,
-    });
-    prepared.push(prepareTx(item.id, item.address, raw));
-    if ((i + 1) % 25 === 0 || i + 1 === funded.length) {
-      emit({ type: "signing", done: i + 1, total: funded.length });
-    }
-  }
-
-  const report = await dispatchAll(prepared, deps.endpoints, {
-    onDispatched: (count, ms) => emit({ type: "dispatched", count, ms }),
-  });
-  for (const outcome of report.outcomes) {
-    if (!outcome.accepted) deps.nonces.rollback(outcome.address);
-  }
-
-  const totalValue = probe.tx.value * BigInt(report.accepted);
+  const totalValue = unitPrice * BigInt(req.quantity) * BigInt(report.accepted);
   if (report.accepted > 0) {
     record({
       kind: "mint",
@@ -726,8 +846,8 @@ export async function executeOpenSeaMint(
   const rows = await collectReceipts(
     deps.readUrl,
     report.outcomes.filter((o) => o.accepted),
-    (confirmed, reverted, pending, total) =>
-      emit({ type: "receipts", confirmed, reverted, pending, total })
+    (confirmed, reverted, pending, total, rows) =>
+      emit({ type: "receipts", confirmed, reverted, pending, total, rows })
   );
   for (const outcome of report.outcomes) {
     if (outcome.accepted) continue;

@@ -49,14 +49,15 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "nfts", description: "Which of your wallets are holding NFTs right now" },
   { command: "sweep", description: "Collect your NFTs into one wallet" },
   { command: "autosweep", description: "Collect copied NFTs automatically, as they land" },
+  { command: "gas", description: "Set the tip you bid — what decides your place in a block" },
   { command: "drain", description: "Send leftover ETH back to your funding wallet" },
 
   // ── Minting by hand ──
   { command: "mint", description: "Mint a drop — pick the stage, the wallets and the moment" },
-  { command: "fcfs", description: "Mint through OpenSea — whichever stage you qualify for" },
+  { command: "fcfs", description: "Mint GTD or FCFS through OpenSea — whichever stage you qualify for" },
   { command: "probe", description: "Check a drop's stages and prices before minting" },
   { command: "check", description: "See which of your wallets are on an allowlist" },
-  { command: "allowlist", description: "Mint an allowlist drop" },
+  { command: "allowlist", description: "Mint a GTD or Merkle allowlist drop" },
   { command: "schedule", description: "Book a mint for a time — it fires without you" },
   { command: "scheduled", description: "Booked mints, and cancel any of them" },
   { command: "unschedule", description: "Cancel a booked mint by its id" },

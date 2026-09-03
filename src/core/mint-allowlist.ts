@@ -20,9 +20,10 @@ import {
   AllowListError,
 } from "./allowlist";
 import { NonceManager } from "./nonce-manager";
-import { Endpoint, dispatchAll, prepareTx, summariseErrors } from "./dispatcher";
+import { Endpoint, dispatchAll, prepareTx, PreparedTx, summariseErrors } from "./dispatcher";
 import { fetchBalances, requiredPerWallet, shortfalls, Shortfall } from "./balances";
 import { rpcCall, warmSockets } from "./rpc";
+import { FeeQuote, sampleFees } from "./fee-oracle";
 import { collectReceipts, sleepUntil } from "./mint-runtime";
 import { record } from "./ledger";
 import { ReceiptRow } from "./mint-runtime";
@@ -34,6 +35,8 @@ export interface AllowListMintDeps {
   chainId: number;
   gasLimit: number;
   maxFeePerGas: bigint;
+  /** Price gas from the chain rather than from config. Defaults to on. */
+  autoPrice?: boolean;
   maxPriorityFeePerGas: bigint;
   nonces: NonceManager;
   signerFor(id: string): Wallet | HDNodeWallet;
@@ -54,8 +57,8 @@ export type AllowListEvent =
   | { type: "signing"; done: number; total: number }
   | { type: "armed"; total: number; signMs: number }
   | { type: "waiting"; msRemaining: number }
-  | { type: "dispatched"; count: number; ms: number }
-  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number }
+  | { type: "dispatched"; count: number; ms: number; wallets: PreparedTx[] }
+  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number; rows: ReceiptRow[] }
   | { type: "done"; report: AllowListMintReport };
 
 export interface AllowListMintReport {
@@ -124,7 +127,26 @@ export async function executeAllowListMint(
   // ── Funding ──
   const value = params.mintPrice * BigInt(req.quantity);
   const targets = req.eligible.map((r) => ({ id: r.id, address: r.address }));
-  const required = requiredPerWallet(deps.gasLimit, deps.maxFeePerGas, value);
+  // ── Price the gas from the chain ──
+  //
+  // The configured pair are bounds now — a ceiling and a floor — with the real
+  // bid sampled from recent blocks between them. Done before the reservation
+  // below, which is computed from the fee.
+  let fees: FeeQuote = {
+    maxFeePerGas: deps.maxFeePerGas,
+    maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+    baseFeeWei: 0n,
+    source: "config",
+    ceilingTooLow: false,
+  };
+  if (deps.autoPrice !== false) {
+    fees = await sampleFees(deps.readUrl, {
+      ceilingWei: deps.maxFeePerGas,
+      priorityFloorWei: deps.maxPriorityFeePerGas,
+    });
+  }
+
+  const required = requiredPerWallet(deps.gasLimit, fees.maxFeePerGas, value);
   const balances = await fetchBalances(deps.readUrl, targets);
   const underfunded = shortfalls(targets, balances, required);
 
@@ -146,7 +168,7 @@ export async function executeAllowListMint(
   await deps.nonces.prime(funded.map((r) => ({ id: r.id, address: r.address })));
 
   const signStart = process.hrtime.bigint();
-  const prepared = [];
+  const prepared: PreparedTx[] = [];
   for (let i = 0; i < funded.length; i++) {
     const row = funded[i];
     if (!row.proof || !row.mintParams) continue;
@@ -164,8 +186,8 @@ export async function executeAllowListMint(
       value,
       nonce: deps.nonces.next(row.address),
       gasLimit: deps.gasLimit,
-      maxFeePerGas: deps.maxFeePerGas,
-      maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+      maxFeePerGas: fees.maxFeePerGas,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
       type: 2,
       chainId: deps.chainId,
     });
@@ -181,11 +203,19 @@ export async function executeAllowListMint(
   // ── Hold, then fire ──
   if (!live && req.waitForStart) {
     emit({ type: "waiting", msRemaining: startsAt.getTime() - Date.now() });
-    await sleepUntil(startsAt.getTime());
+    // Re-open the sockets on the near side of the fire: the pool drops idle
+    // connections after fifteen seconds, and a held mint would otherwise pay
+    // for TLS handshakes at the exact moment it should be sending.
+    const fireAt = startsAt.getTime();
+    if (fireAt - Date.now() > 1_500) {
+      await sleepUntil(fireAt - 1_500);
+      await warmSockets(deps.allRpcUrls);
+    }
+    await sleepUntil(fireAt);
   }
 
   const report = await dispatchAll(prepared, deps.endpoints, {
-    onDispatched: (count, ms) => emit({ type: "dispatched", count, ms }),
+    onDispatched: (count, ms) => emit({ type: "dispatched", count, ms, wallets: prepared }),
   });
 
   for (const outcome of report.outcomes) {
@@ -209,8 +239,8 @@ export async function executeAllowListMint(
   const rows = await collectReceipts(
     deps.readUrl,
     report.outcomes.filter((o) => o.accepted),
-    (confirmed, reverted, pending, total) =>
-      emit({ type: "receipts", confirmed, reverted, pending, total })
+    (confirmed, reverted, pending, total, rows) =>
+      emit({ type: "receipts", confirmed, reverted, pending, total, rows })
   );
   for (const outcome of report.outcomes) {
     if (outcome.accepted) continue;
@@ -243,4 +273,3 @@ async function currentBlock(readUrl: string): Promise<number | undefined> {
     return undefined;
   }
 }
-

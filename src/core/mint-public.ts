@@ -13,9 +13,10 @@ import { formatEther } from "ethers";
 import { buildLocalMintPlan, LocalMintPlan } from "../seadrop-public";
 import { ManagedWallet } from "./wallet-store";
 import { NonceManager } from "./nonce-manager";
-import { Endpoint, dispatchAll, prepareTx, DispatchOutcome, summariseErrors } from "./dispatcher";
+import { Endpoint, dispatchAll, prepareTx, DispatchOutcome, PreparedTx, summariseErrors } from "./dispatcher";
 import { fetchBalances, requiredPerWallet, shortfalls, Shortfall } from "./balances";
 import { rpcCall, warmSockets } from "./rpc";
+import { FeeQuote, sampleFees } from "./fee-oracle";
 import { collectReceipts, sleepUntil, ReceiptRow } from "./mint-runtime";
 import { record } from "./ledger";
 import { Wallet, HDNodeWallet } from "ethers";
@@ -30,6 +31,11 @@ export interface MintDeps {
   maxPriorityFeePerGas: bigint;
   nonces: NonceManager;
   signerFor(id: string): Wallet | HDNodeWallet;
+  /**
+   * Price gas from the chain rather than from config. Defaults to on; pass
+   * false to sign with the configured numbers exactly, as this used to.
+   */
+  autoPrice?: boolean;
 }
 
 export interface MintRequest {
@@ -54,13 +60,14 @@ export interface MintRequest {
 
 export type MintEvent =
   | { type: "plan"; plan: LocalMintPlan; startsAt: Date; endsAt: Date; live: boolean }
+  | { type: "priced"; maxFeeWei: bigint; tipWei: bigint; source: string; ceilingTooLow: boolean }
   | { type: "funding"; eligible: number; underfunded: Shortfall[]; requiredPerWallet: bigint }
   | { type: "signing"; done: number; total: number }
   | { type: "armed"; total: number; signMs: number }
   | { type: "waiting"; msRemaining: number }
-  | { type: "dispatched"; count: number; ms: number }
+  | { type: "dispatched"; count: number; ms: number; wallets: PreparedTx[] }
   | { type: "settled"; accepted: number; rejected: number }
-  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number }
+  | { type: "receipts"; confirmed: number; reverted: number; pending: number; total: number; rows: ReceiptRow[] }
   | { type: "done"; report: MintReport };
 
 export type { ReceiptRow };
@@ -80,6 +87,9 @@ export interface MintReport {
   rows: ReceiptRow[];
   errorSummary: { reason: string; count: number }[];
 }
+
+/** How far ahead of the fire to re-open the sockets. See the hold below. */
+const PREFIRE_LEAD_MS = 1_500;
 
 export class MintError extends Error {
   constructor(message: string) {
@@ -127,9 +137,38 @@ export async function executePublicMint(
     );
   }
 
+  // ── Price the gas before anything is measured against it ──
+  //
+  // The configured pair used to go straight onto every transaction. They are
+  // bounds now: a ceiling and a floor, with the real bid sampled from recent
+  // blocks between them. It happens here rather than later because the funding
+  // reservation below is computed from the fee, and screening wallets against
+  // a number the transaction will not carry is how a funded wallet gets called
+  // underfunded.
+  let fees: FeeQuote = {
+    maxFeePerGas: deps.maxFeePerGas,
+    maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+    baseFeeWei: 0n,
+    source: "config",
+    ceilingTooLow: false,
+  };
+  if (deps.autoPrice !== false) {
+    fees = await sampleFees(deps.readUrl, {
+      ceilingWei: deps.maxFeePerGas,
+      priorityFloorWei: deps.maxPriorityFeePerGas,
+    });
+  }
+  emit({
+    type: "priced",
+    maxFeeWei: fees.maxFeePerGas,
+    tipWei: fees.maxPriorityFeePerGas,
+    source: fees.source,
+    ceilingTooLow: fees.ceilingTooLow,
+  });
+
   // ── Can these wallets actually pay? ──
   const targets = req.wallets.map((w) => ({ id: w.id, address: w.address }));
-  const required = requiredPerWallet(deps.gasLimit, deps.maxFeePerGas, plan.value);
+  const required = requiredPerWallet(deps.gasLimit, fees.maxFeePerGas, plan.value);
   const balances = await fetchBalances(deps.readUrl, targets);
   const underfunded = shortfalls(targets, balances, required);
 
@@ -154,7 +193,7 @@ export async function executePublicMint(
 
   // ── Sign everything now ──
   const signStart = process.hrtime.bigint();
-  const prepared = [];
+  const prepared: PreparedTx[] = [];
   for (let i = 0; i < eligible.length; i++) {
     const wallet = eligible[i];
     const signer = deps.signerFor(wallet.id);
@@ -163,8 +202,8 @@ export async function executePublicMint(
       data: plan.data,
       value: plan.value,
       nonce: deps.nonces.next(wallet.address),
-      maxFeePerGas: deps.maxFeePerGas,
-      maxPriorityFeePerGas: deps.maxPriorityFeePerGas,
+      maxFeePerGas: fees.maxFeePerGas,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
       gasLimit: deps.gasLimit,
       type: 2,
       chainId: deps.chainId,
@@ -189,12 +228,21 @@ export async function executePublicMint(
   );
   if (holdUntil > Date.now()) {
     emit({ type: "waiting", msRemaining: holdUntil - Date.now() });
+    // The socket pool keeps connections for fifteen seconds, so a hold of any
+    // real length leaves every one of them closed and would spend the opening
+    // moment of the drop on TLS handshakes instead of on sending. Re-open them
+    // on the near side of the fire; the transactions are already signed, so
+    // this costs the hold rather than the mint.
+    if (holdUntil - Date.now() > PREFIRE_LEAD_MS) {
+      await sleepUntil(holdUntil - PREFIRE_LEAD_MS);
+      await warmSockets(deps.allRpcUrls);
+    }
     await sleepUntil(holdUntil);
   }
 
   // ── Fire ──
   const report = await dispatchAll(prepared, deps.endpoints, {
-    onDispatched: (count, ms) => emit({ type: "dispatched", count, ms }),
+    onDispatched: (count, ms) => emit({ type: "dispatched", count, ms, wallets: prepared }),
   });
   emit({ type: "settled", accepted: report.accepted, rejected: report.rejected });
 
@@ -221,8 +269,8 @@ export async function executePublicMint(
   const rows = await collectReceipts(
     deps.readUrl,
     report.outcomes.filter((o) => o.accepted),
-    (confirmed, reverted, pending, total) =>
-      emit({ type: "receipts", confirmed, reverted, pending, total })
+    (confirmed, reverted, pending, total, rows) =>
+      emit({ type: "receipts", confirmed, reverted, pending, total, rows })
   );
 
   for (const outcome of report.outcomes) {
@@ -258,4 +306,3 @@ async function currentBlock(readUrl: string): Promise<number | undefined> {
     return undefined;
   }
 }
-

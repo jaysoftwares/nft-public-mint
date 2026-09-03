@@ -73,6 +73,12 @@ import * as targets from "../core/targets";
 import { CopyEvent, CopyResult } from "../core/copy-mint";
 import { renderCopyResult } from "./copy-report";
 import {
+  MintCardBrand,
+  MintCardInput,
+  buildMintCardSvg,
+  renderMintCardPng,
+} from "./mint-card-image";
+import {
   fetchAllowListRoot,
   findAllowListUri,
   toHttpUrl,
@@ -153,6 +159,7 @@ import {
   initialSelection,
 } from "./mint-card";
 import { StatusCard, esc, eth, bar, short, clamp, toCsv, txLink } from "./ui";
+import { explorerTx } from "../chains";
 import { renderHealth, healthMenu, renderSignals, signalsMenu } from "./health";
 import {
   NetworkStep,
@@ -214,6 +221,7 @@ import {
   phraseWritten,
   afterSetupMenu,
   settingsMenu,
+  gasMenu,
   destinationConfirm,
 } from "./menu";
 
@@ -296,6 +304,7 @@ function initialUserConfig(): BotConfig {
     hotSetSize: bootstrapConfig.hotSetSize,
     reconcileBatch: bootstrapConfig.reconcileBatch,
     gas: { ...bootstrapConfig.gas },
+    brand: { ...bootstrapConfig.brand },
     caps: { ...bootstrapConfig.caps },
     copy: {
       ...bootstrapConfig.copy,
@@ -533,6 +542,92 @@ async function chainFor(ctx: Context, contract?: string): Promise<ChainContext> 
 
 // ── Commands ──────────────────────────────────────────────────────────────
 
+// Mint notifications deliberately carry wallet addresses, not just totals.
+// A total such as "8 confirmed" cannot answer the operational question after
+// a contested mint: which eight addresses actually bought one? Telegram has a
+// hard message limit, so the live card shows a useful first page and every run
+// also emits a CSV containing the complete set.
+const INLINE_MINT_WALLETS = 12;
+
+interface MintWalletView {
+  id: string;
+  address: string;
+  hash?: string;
+  status?: "confirmed" | "reverted" | "pending";
+  block?: number;
+  gasUsed?: number;
+}
+
+function mintingWalletBlock(rows: MintWalletView[], chainId: number): string {
+  const shown = rows.slice(0, INLINE_MINT_WALLETS);
+  const lines = shown.map(
+    (row) =>
+      `🚀 <code>${esc(row.id)}</code> · <code>${esc(row.address)}</code>` +
+      (row.hash ? ` · ${txLink(chainId, row.hash, "tx")}` : "")
+  );
+  if (rows.length > shown.length) {
+    lines.push(`…and ${rows.length - shown.length} more (all addresses follow in the results CSV)`);
+  }
+  return [`<b>Wallets minting now</b>`, ...lines].join("\n");
+}
+
+function mintResultBlock(rows: MintWalletView[], chainId: number): string {
+  const shown = rows.slice(0, INLINE_MINT_WALLETS);
+  const lines = shown.map((row) => {
+    const result =
+      row.status === "confirmed"
+        ? "✅ minted successfully"
+        : row.status === "reverted"
+          ? "❌ failed"
+          : "⏳ still pending";
+    return (
+      `${result} · <code>${esc(row.id)}</code> · <code>${esc(row.address)}</code>` +
+      (row.hash ? ` · ${txLink(chainId, row.hash, "tx")}` : "")
+    );
+  });
+  if (rows.length > shown.length) {
+    lines.push(`…and ${rows.length - shown.length} more (all addresses and outcomes are in the results CSV)`);
+  }
+  return [`<b>Wallet results</b>`, ...lines].join("\n");
+}
+
+function notifyWalletsMinting(
+  name: string,
+  contract: string,
+  rows: MintWalletView[],
+  chainId: number
+): void {
+  // notify() never waits for Telegram. This is called only after dispatchAll
+  // has put every raw transaction on the wire, so chat I/O cannot slow T-0.
+  notify(
+    [
+      `<b>⚡ Minting now — ${esc(name)}</b>`,
+      `<code>${esc(contract)}</code>`,
+      ``,
+      mintingWalletBlock(rows, chainId),
+    ].join("\n")
+  );
+}
+
+async function sendMintResultsCsv(
+  chatId: number,
+  rows: MintWalletView[],
+  filename: string
+): Promise<void> {
+  if (rows.length === 0) return;
+  const csv = toCsv(rows, [
+    { header: "wallet", value: (row) => row.id },
+    { header: "address", value: (row) => row.address },
+    { header: "tx_hash", value: (row) => row.hash ?? "" },
+    { header: "status", value: (row) => row.status ?? "pending" },
+    { header: "block", value: (row) => row.block ?? "" },
+    { header: "gas_used", value: (row) => row.gasUsed ?? "" },
+  ]);
+  await bot.api.sendDocument(chatId, new InputFile(csv, filename), {
+    caption: `${rows.length} per-wallet mint result(s): address, transaction and final status`,
+  });
+}
+
 const HELP = `<b>Copymint</b>
 
 <b>Wallets</b>
@@ -562,7 +657,7 @@ const HELP = `<b>Copymint</b>
   Tap wallets to tick them; filters and paging are for the generated set.
 /mint &lt;contract&gt; &lt;qty&gt; [selector] [wait] — the typed form, unchanged
 /check &lt;contract&gt; [listUrl] — who's on the allowlist
-/allowlist &lt;contract&gt; &lt;qty&gt; [selector] [wait] — FCFS allowlist mint
+/allowlist &lt;contract&gt; &lt;qty&gt; [selector] [wait] — GTD / Merkle allowlist mint
 
 <b>Scheduled mints</b>
 /schedule &lt;link|contract&gt; [qty] [selector] at &lt;time&gt; — book it and walk away.
@@ -572,9 +667,9 @@ const HELP = `<b>Copymint</b>
 /scheduled — what is booked, with a cancel button on each
 /unschedule &lt;id&gt; — call one off
 
-<b>FCFS via OpenSea</b> <i>(needs OPENSEA_API_KEY)</i>
+<b>GTD / FCFS via OpenSea</b> <i>(needs OPENSEA_API_KEY)</i>
 /probe &lt;contract&gt; — stages, and what OpenSea will issue now
-/fcfs &lt;contract&gt; &lt;qty&gt; [selector] [at HH:MM] — allowlist/signed/public,
+/fcfs &lt;contract&gt; &lt;qty&gt; [selector] [at HH:MM] — GTD/FCFS/allowlist/signed/public,
 whichever you're eligible for. Times are UTC.
 
 <b>Copy-mint</b>
@@ -1971,6 +2066,17 @@ async function cmdMint(ctx: Context): Promise<void> {
           ].join("\n")
         );
         break;
+      case "priced":
+        status.update(
+          `<b>Public mint</b>  <code>${esc(short(contract))}</code>
+
+` +
+            feeLine(event.maxFeeWei, event.tipWei, event.source, event.ceilingTooLow) +
+            `
+
+checking funding…`
+        );
+        break;
       case "funding":
         status.update(
           [
@@ -2007,10 +2113,12 @@ async function cmdMint(ctx: Context): Promise<void> {
         );
         break;
       case "dispatched":
+        notifyWalletsMinting("Public mint", getAddress(contract), event.wallets, chain.chainId);
         status.update(
           `<b>Public mint</b>  <code>${esc(short(contract))}</code>\n\n🚀 ${
             event.count
-          } tx dispatched in ${event.ms.toFixed(0)}ms\nawaiting acceptance…`
+          } tx dispatched in ${event.ms.toFixed(0)}ms\nawaiting acceptance…\n\n` +
+            mintingWalletBlock(event.wallets, chain.chainId)
         );
         break;
       case "receipts":
@@ -2024,6 +2132,8 @@ async function cmdMint(ctx: Context): Promise<void> {
             `✓ confirmed ${event.confirmed}`,
             event.reverted > 0 ? `✗ reverted ${event.reverted}` : ``,
             `· pending ${event.pending}`,
+            ``,
+            mintResultBlock(event.rows, chain.chainId),
           ]
             .filter(Boolean)
             .join("\n")
@@ -2052,6 +2162,7 @@ async function cmdMint(ctx: Context): Promise<void> {
         gasLimit: config.gasLimit,
         maxFeePerGas: config.maxFeePerGas,
         maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        autoPrice: config.gas.autoPrice,
         nonces: chain.nonces,
         signerFor: session.signerFor,
       },
@@ -2059,7 +2170,6 @@ async function cmdMint(ctx: Context): Promise<void> {
     );
     latest = report;
 
-    const first = report.rows.find((r) => r.status === "confirmed");
     await status.finish(
       [
         `<b>Mint complete</b>  <code>${esc(short(contract))}</code>`,
@@ -2069,7 +2179,8 @@ async function cmdMint(ctx: Context): Promise<void> {
         report.pending > 0 ? `· still pending ${report.pending}` : ``,
         ``,
         `spent ${eth(report.totalValue)} ETH · dispatch ${report.dispatchMs.toFixed(0)}ms`,
-        first ? `\n${txLink(chain.chainId, first.hash, "view a transaction")}` : ``,
+        ``,
+        mintResultBlock(report.rows, chain.chainId),
         report.errorSummary.length > 0
           ? `\n<b>Failures</b>\n` +
             report.errorSummary
@@ -2081,6 +2192,17 @@ async function cmdMint(ctx: Context): Promise<void> {
         .filter(Boolean)
         .join("\n")
     );
+
+    await announceMint({
+      tool: "Public Mint",
+      contract,
+      chain,
+      wallets: report.attempted,
+      priceWei: report.valuePerWallet,
+      minted: report.confirmed * quantity,
+      caption: `Public mint · ${report.confirmed}/${report.attempted} confirmed`,
+      txHash: report.rows.find((r) => r.status === "confirmed")?.hash,
+    });
   } catch (err) {
     await status.finish(`<b>Mint failed</b>\n\n${esc((err as Error).message)}`);
   }
@@ -2309,8 +2431,10 @@ async function cmdAllowList(ctx: Context): Promise<void> {
           );
           break;
         case "dispatched":
+          notifyWalletsMinting("GTD / allowlist mint", address, event.wallets, chain.chainId);
           status.update(
-            `<b>Allowlist mint</b>  <code>${esc(short(address))}</code>\n\n🚀 ${event.count} tx dispatched in ${event.ms.toFixed(0)}ms`
+            `<b>Allowlist mint</b>  <code>${esc(short(address))}</code>\n\n🚀 ${event.count} tx dispatched in ${event.ms.toFixed(0)}ms\n\n` +
+              mintingWalletBlock(event.wallets, chain.chainId)
           );
           break;
         case "receipts":
@@ -2322,6 +2446,8 @@ async function cmdAllowList(ctx: Context): Promise<void> {
               `✓ confirmed ${event.confirmed}`,
               event.reverted > 0 ? `✗ reverted ${event.reverted}` : ``,
               `· pending ${event.pending}`,
+              ``,
+              mintResultBlock(event.rows, chain.chainId),
             ]
               .filter(Boolean)
               .join("\n")
@@ -2349,6 +2475,7 @@ async function cmdAllowList(ctx: Context): Promise<void> {
         gasLimit: config.gasLimit,
         maxFeePerGas: config.maxFeePerGas,
         maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        autoPrice: config.gas.autoPrice,
         nonces: chain.nonces,
         signerFor: session.signerFor,
       },
@@ -2356,7 +2483,6 @@ async function cmdAllowList(ctx: Context): Promise<void> {
     );
     latest = final;
 
-    const firstOk = final.rows.find((r) => r.status === "confirmed");
     await status.finish(
       [
         `<b>Allowlist mint complete</b>  <code>${esc(short(address))}</code>`,
@@ -2366,7 +2492,8 @@ async function cmdAllowList(ctx: Context): Promise<void> {
         final.pending > 0 ? `· pending ${final.pending}` : ``,
         ``,
         `spent ${eth(final.totalValue)} ETH · dispatch ${final.dispatchMs.toFixed(0)}ms`,
-        firstOk ? `\n${txLink(chain.chainId, firstOk.hash, "view a transaction")}` : ``,
+        ``,
+        mintResultBlock(final.rows, chain.chainId),
         final.errorSummary.length > 0
           ? `\n<b>Failures</b>\n` +
             final.errorSummary
@@ -2378,6 +2505,17 @@ async function cmdAllowList(ctx: Context): Promise<void> {
         .filter(Boolean)
         .join("\n")
     );
+
+    await announceMint({
+      tool: "Allowlist",
+      contract: address,
+      chain,
+      wallets: final.attempted,
+      priceWei: final.valuePerWallet,
+      minted: final.confirmed * quantity,
+      caption: `Allowlist mint · ${final.confirmed}/${final.attempted} confirmed`,
+      txHash: final.rows.find((r) => r.status === "confirmed")?.hash,
+    });
   } catch (err) {
     await status.finish(`<b>Allowlist mint failed</b>\n\n${esc((err as Error).message)}`);
   }
@@ -2694,8 +2832,10 @@ async function cmdFcfs(ctx: Context): Promise<void> {
           );
           break;
         case "dispatched":
+          notifyWalletsMinting("GTD / FCFS mint", address, event.wallets, chain.chainId);
           status.update(
-            `<b>FCFS mint</b>  <code>${esc(slug)}</code>\n\n🚀 ${event.count} tx dispatched in ${event.ms.toFixed(0)}ms`
+            `<b>FCFS mint</b>  <code>${esc(slug)}</code>\n\n🚀 ${event.count} tx dispatched in ${event.ms.toFixed(0)}ms\n\n` +
+              mintingWalletBlock(event.wallets, chain.chainId)
           );
           break;
         case "receipts":
@@ -2706,6 +2846,8 @@ async function cmdFcfs(ctx: Context): Promise<void> {
               `${bar(event.confirmed + event.reverted, event.total)}  ${event.confirmed + event.reverted}/${event.total}`,
               `✓ confirmed ${event.confirmed}`,
               event.reverted > 0 ? `✗ reverted ${event.reverted}` : ``,
+              ``,
+              mintResultBlock(event.rows, chain.chainId),
             ]
               .filter(Boolean)
               .join("\n")
@@ -2744,13 +2886,14 @@ async function cmdFcfs(ctx: Context): Promise<void> {
           concurrency: config.signed.concurrency,
           minDelayMs: config.signed.minDelayMs,
           maxRetries: config.signed.maxRetries,
+          burstFirst: config.signed.burstFirst,
         },
+        autoPrice: config.gas.autoPrice,
       },
       render
     );
     latest = final;
 
-    const firstOk = final.rows.find((r) => r.status === "confirmed");
     await status.finish(
       [
         `<b>FCFS mint complete</b>  <code>${esc(slug)}</code>`,
@@ -2761,7 +2904,8 @@ async function cmdFcfs(ctx: Context): Promise<void> {
         ``,
         `${final.fetched}/${final.requested} wallets got calldata`,
         `spent ${eth(final.totalValue)} ETH · fetch ${final.fetchMs.toFixed(0)}ms · dispatch ${final.dispatchMs.toFixed(0)}ms`,
-        firstOk ? `\n${txLink(chain.chainId, firstOk.hash, "view a transaction")}` : ``,
+        ``,
+        mintResultBlock(final.rows, chain.chainId),
         final.fetchFailures.length > 0
           ? `\n<b>Refused</b>\n` +
             final.fetchFailures
@@ -2773,6 +2917,18 @@ async function cmdFcfs(ctx: Context): Promise<void> {
         .filter(Boolean)
         .join("\n")
     );
+
+    await announceMint({
+      tool: "FCFS",
+      contract: address,
+      chain,
+      wallets: final.attempted,
+      priceWei: final.unitPriceWei,
+      minted: final.confirmed * quantity,
+      caption: `FCFS mint · ${final.confirmed}/${final.attempted} confirmed`,
+      slug,
+      txHash: final.rows.find((r) => r.status === "confirmed")?.hash,
+    });
   } catch (err) {
     const detail =
       err instanceof OpenSeaApiError
@@ -4751,6 +4907,57 @@ async function cmdUnschedule(ctx: Context): Promise<void> {
  * them together would mean somebody who wants their NFTs collected has to leave
  * autonomous buying on to get it.
  */
+/**
+ * The gas screen.
+ *
+ * The tip is the number that decides where a transaction is ordered inside a
+ * contested block, and it used to live only in config.json — reachable over SSH
+ * by somebody who, on a hosted bot, usually has no shell. So it is a choice
+ * here, made from presets rather than typed, because the realistic way it goes
+ * wrong is a decimal point in the wrong place at the worst possible moment.
+ */
+async function cmdGas(ctx: Context): Promise<void> {
+  const [action, value] = args(ctx);
+
+  if (action === "auto") {
+    const on = value === "on";
+    updateUserSettings({ autoPrice: on });
+    config.gas.autoPrice = on;
+  } else if (action === "set" && value) {
+    try {
+      const saved = updateUserSettings({ gasTipGwei: value });
+      if (saved.gasTipGwei) config.gas.priorityGwei = saved.gasTipGwei;
+    } catch (err) {
+      await ctx.reply(esc((err as Error).message), { parse_mode: "HTML" });
+      return;
+    }
+  }
+
+  const tip = config.gas.priorityGwei;
+  const auto = config.gas.autoPrice;
+  await ctx.reply(
+    [
+      `<b>Mint gas</b>`,
+      ``,
+      `Tip floor  <b>${esc(tip)} gwei</b>`,
+      `Ceiling  <b>${esc(config.gas.maxFeeGwei)} gwei</b>  <i>(SSH only)</i>`,
+      `Auto-price  <b>${auto ? "ON" : "OFF"}</b>`,
+      ``,
+      auto
+        ? `<i>Before each mint the bot reads what recent blocks actually paid and`
+        : `<i>The tip above is bid exactly as set, whatever the chain is doing.`,
+      auto
+        ? `bids the higher of that and your floor, never above the ceiling.</i>`
+        : `Turn auto-price on to let it bid up when a drop is contested.</i>`,
+      ``,
+      `<i>The tip is what decides your place in a contested block. At a 250,000`,
+      `gas limit, 0.5 gwei costs about 0.000125 ETH per wallet — a drop is won`,
+      `or lost on this number, not on the price of the NFT.</i>`,
+    ].join("\n"),
+    { parse_mode: "HTML", reply_markup: gasMenu(tip, auto) }
+  );
+}
+
 async function cmdAutoSweep(ctx: Context): Promise<void> {
   const [state] = args(ctx);
   const on = config.autoSweep.enabled;
@@ -5032,7 +5239,20 @@ function renderCopyEvent(
       feed.countFired(event.result.accepted);
       void feed.close();
       const r = event.result;
-      notify(renderCopyResult(r, chain));
+      // The card is the announcement now; the report is its caption. Voided
+      // rather than awaited so the engine is free for the next signal — and
+      // caught, because an unhandled rejection here takes the process with it.
+      void announceMint({
+        tool: "Copy Mint",
+        contract: r.contract,
+        chain,
+        wallets: r.walletCount,
+        priceWei: r.unitPriceWei,
+        minted: r.accepted * r.quantity,
+        caption: renderCopyResult(r, chain),
+        txHash: r.hashes.find((h) => h.accepted)?.hash,
+        mirrored: r.target,
+      }).catch(() => undefined);
       // Queued, never awaited: the sweep waits on receipts and the copy engine
       // must be free to take the next signal in the meantime.
       scheduleAutoSweep(r, chain);
@@ -5824,6 +6044,118 @@ function ensureFundingWallet(): ManagedWallet {
  *     pipeline, but a silent one is indistinguishable from a bot that never
  *     fired, which is exactly how the mystery lasted. It goes to the log.
  */
+/** The brand block every card is drawn with. Empty links are left off entirely. */
+function cardBrand(): MintCardBrand {
+  return {
+    name: config.brand.name,
+    x: config.brand.x || undefined,
+    telegram: config.brand.telegram || undefined,
+  };
+}
+
+/**
+ * The card that goes out after a mint, whichever machinery fired it.
+ *
+ * Photo first, the text report as the fallback: rendering is one native
+ * dependency away from failing, and a plain report that arrives beats a
+ * designed one that does not. The caption carries whatever has to be legible
+ * without opening the image, and everything tappable lives in the keyboard,
+ * because a picture cannot be tapped.
+ */
+async function sendMintCard(
+  card: MintCardInput,
+  caption: string,
+  links: { chainId: number; txHash?: string; slug?: string }
+): Promise<void> {
+  const chat = currentRuntime().chatId;
+  const keyboard = new InlineKeyboard();
+  let placed = 0;
+  if (links.txHash) {
+    keyboard.url("🔗 Transaction", explorerTx(links.chainId, links.txHash));
+    placed += 1;
+  }
+  if (links.slug) {
+    keyboard.url("🌊 OpenSea", `https://opensea.io/collection/${links.slug}`);
+    placed += 1;
+  }
+  if (placed > 0) keyboard.row();
+  keyboard.text("📊 Dashboard", "a:dash");
+
+  try {
+    const png = await renderMintCardPng(buildMintCardSvg(card));
+    await bot.api.sendPhoto(chat, new InputFile(png, "mint.png"), {
+      caption: clamp(caption),
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  } catch {
+    // The picture is the presentation; the report is the message. Losing the
+    // first must never lose the second.
+    notify(caption);
+  }
+}
+
+/**
+ * Draw and send the card for a finished mint.
+ *
+ * Called after the text report has closed, so the picture is the last thing in
+ * the chat with the detail still above it. The collection name is resolved here
+ * rather than passed in: it is a read, and a read after the mint costs nothing
+ * that matters.
+ */
+async function announceMint(opts: {
+  tool: string;
+  contract: string;
+  chain: ChainContext;
+  wallets: number;
+  priceWei: bigint;
+  minted: number;
+  caption: string;
+  slug?: string;
+  txHash?: string;
+  mirrored?: string;
+}): Promise<void> {
+  const name = await collectionName(opts.chain.rpc.readUrl, opts.contract).catch(() => undefined);
+  await sendMintCard(
+    {
+      collection: name || short(opts.contract),
+      contract: opts.contract,
+      chain: opts.chain.name,
+      wallets: opts.wallets,
+      priceWei: opts.priceWei,
+      minted: opts.minted,
+      tool: opts.tool,
+      brand: cardBrand(),
+      mirrored: opts.mirrored,
+      // A run that bought nothing says so on the card rather than showing a
+      // price for something it did not get.
+      status: opts.minted === 0 ? "MISSED" : undefined,
+    },
+    opts.caption,
+    { chainId: opts.chain.chainId, txHash: opts.txHash, slug: opts.slug }
+  );
+}
+
+/**
+ * A sampled gas price, in the terms the operator set it in.
+ *
+ * The ceiling warning is the point of this line: a bid capped below the base
+ * fee cannot be mined at all, and config.json is the only place that can be
+ * fixed from.
+ */
+function feeLine(maxFeeWei: bigint, tipWei: bigint, source: string, ceilingTooLow: boolean): string {
+  const gwei = (wei: bigint): string => {
+    const whole = wei / 1_000_000_000n;
+    const frac = (wei % 1_000_000_000n).toString().padStart(9, "0").slice(0, 3).replace(/0+$/, "");
+    return frac ? `${whole}.${frac}` : `${whole}`;
+  };
+  const line = `gas ${gwei(tipWei)} tip / ${gwei(maxFeeWei)} cap gwei · ${esc(source)}`;
+  return ceilingTooLow
+    ? `${line}
+⚠️ gas.maxFeeGwei is below the current base fee — raise it or nothing can mine`
+    : line;
+}
+
 function notify(html: string): void {
   const chat = currentRuntime().chatId;
   const text = clamp(html);
@@ -6074,6 +6406,7 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
         gasLimit: config.gasLimit,
         maxFeePerGas: config.maxFeePerGas,
         maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        autoPrice: config.gas.autoPrice,
         nonces: chain.nonces,
         signerFor: session.signerFor,
       },
@@ -6091,14 +6424,22 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
             );
             break;
           case "dispatched":
+            notifyWalletsMinting(
+              entry.collection ?? "Booked GTD / allowlist mint",
+              entry.contract,
+              event.wallets,
+              chain.chainId
+            );
             status.update(
-              `${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms`
+              `${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms\n\n` +
+                mintingWalletBlock(event.wallets, chain.chainId)
             );
             break;
           case "receipts":
             status.update(
               `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
-                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending`
+                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending\n\n` +
+                mintResultBlock(event.rows, chain.chainId)
             );
             break;
         }
@@ -6110,7 +6451,6 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
       finishedAt: Date.now(),
       outcome: `${listReport.confirmed}/${listReport.attempted} confirmed`,
     });
-    const firstListOk = listReport.rows.find((r) => r.status === "confirmed");
     await status.finish(
       [
         listReport.confirmed > 0
@@ -6121,10 +6461,29 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
         `${bar(listReport.confirmed, listReport.attempted)}  ${listReport.confirmed}/${listReport.attempted} confirmed`,
         listReport.reverted > 0 ? `✗ ${listReport.reverted} reverted` : ``,
         `spent ${eth(listReport.totalValue)} ETH`,
-        firstListOk ? `\n${txLink(chain.chainId, firstListOk.hash, "view a transaction")}` : ``,
+        ``,
+        mintResultBlock(listReport.rows, chain.chainId),
       ]
         .filter(Boolean)
         .join("\n")
+    );
+    await announceMint({
+      tool: "Allowlist",
+      contract: entry.contract,
+      chain,
+      wallets: listReport.attempted,
+      priceWei: listReport.valuePerWallet,
+      minted: listReport.confirmed * entry.quantity,
+      caption:
+        `Booked allowlist mint <code>${esc(entry.id)}</code> · ` +
+        `${listReport.confirmed}/${listReport.attempted} confirmed`,
+      slug: entry.slug,
+      txHash: listReport.rows.find((r) => r.status === "confirmed")?.hash,
+    });
+    await sendMintResultsCsv(
+      currentRuntime().chatId,
+      listReport.rows,
+      `scheduled-${entry.id}-allowlist.csv`
     );
     return;
   }
@@ -6149,6 +6508,7 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
         gasLimit: config.gasLimit,
         maxFeePerGas: config.maxFeePerGas,
         maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+        autoPrice: config.gas.autoPrice,
         nonces: chain.nonces,
         signerFor: session.signerFor,
       },
@@ -6167,12 +6527,22 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
             );
             break;
           case "dispatched":
-            status.update(`${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms`);
+            notifyWalletsMinting(
+              entry.collection ?? "Booked public mint",
+              entry.contract,
+              event.wallets,
+              chain.chainId
+            );
+            status.update(
+              `${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms\n\n` +
+                mintingWalletBlock(event.wallets, chain.chainId)
+            );
             break;
           case "receipts":
             status.update(
               `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
-                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending`
+                `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending\n\n` +
+                mintResultBlock(event.rows, chain.chainId)
             );
             break;
         }
@@ -6184,7 +6554,6 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
       finishedAt: Date.now(),
       outcome: `${report.confirmed}/${report.attempted} confirmed`,
     });
-    const first = report.rows.find((r) => r.status === "confirmed");
     await status.finish(
       [
         report.confirmed > 0 ? `<b>✅ Booked mint landed</b>` : `<b>❌ Booked mint bought nothing</b>`,
@@ -6194,7 +6563,8 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
         report.reverted > 0 ? `✗ ${report.reverted} reverted` : ``,
         report.pending > 0 ? `· ${report.pending} still pending` : ``,
         `spent ${eth(report.totalValue)} ETH`,
-        first ? `\n${txLink(chain.chainId, first.hash, "view a transaction")}` : ``,
+        ``,
+        mintResultBlock(report.rows, chain.chainId),
         report.errorSummary.length > 0
           ? `\n<b>Rejections</b>\n${report.errorSummary
               .slice(0, 3)
@@ -6204,6 +6574,24 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
       ]
         .filter(Boolean)
         .join("\n")
+    );
+    await announceMint({
+      tool: "Public Mint",
+      contract: entry.contract,
+      chain,
+      wallets: report.attempted,
+      priceWei: report.valuePerWallet,
+      minted: report.confirmed * entry.quantity,
+      caption:
+        `Booked public mint <code>${esc(entry.id)}</code> · ` +
+        `${report.confirmed}/${report.attempted} confirmed`,
+      slug: entry.slug,
+      txHash: report.rows.find((r) => r.status === "confirmed")?.hash,
+    });
+    await sendMintResultsCsv(
+      currentRuntime().chatId,
+      report.rows,
+      `scheduled-${entry.id}-public.csv`
     );
     return;
   }
@@ -6241,7 +6629,9 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
         concurrency: config.signed.concurrency,
         minDelayMs: config.signed.minDelayMs,
         maxRetries: config.signed.maxRetries,
+        burstFirst: config.signed.burstFirst,
       },
+      autoPrice: config.gas.autoPrice,
     },
     (event: OpenSeaMintEvent) => {
       switch (event.type) {
@@ -6256,14 +6646,27 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
             `${label}\n\n🔄 asking — attempt ${event.attempt}\n<i>${esc(event.reason.slice(0, 120))}</i>`
           );
           break;
-        case "fetching":
-          status.update(`${label}\n\n${bar(event.done, event.total)}  calldata ${event.done}/${event.total}`);
-          break;
-        case "receipts":
-          status.update(
-            `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
-              `${event.confirmed} confirmed · ${event.reverted} reverted`
-          );
+      case "fetching":
+        status.update(`${label}\n\n${bar(event.done, event.total)}  calldata ${event.done}/${event.total}`);
+        break;
+      case "dispatched":
+        notifyWalletsMinting(
+          entry.collection ?? "Booked GTD / FCFS mint",
+          entry.contract,
+          event.wallets,
+          chain.chainId
+        );
+        status.update(
+          `${label}\n\n🚀 fired ${event.count} transaction(s) in ${event.ms.toFixed(0)}ms\n\n` +
+            mintingWalletBlock(event.wallets, chain.chainId)
+        );
+        break;
+      case "receipts":
+        status.update(
+          `${label}\n\n${bar(event.confirmed + event.reverted, event.total)}  ` +
+            `${event.confirmed} confirmed · ${event.reverted} reverted · ${event.pending} pending\n\n` +
+            mintResultBlock(event.rows, chain.chainId)
+        );
           break;
       }
     }
@@ -6274,7 +6677,6 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
     finishedAt: Date.now(),
     outcome: `${report.confirmed}/${report.attempted} confirmed`,
   });
-  const firstOk = report.rows.find((r) => r.status === "confirmed");
   await status.finish(
     [
       report.confirmed > 0 ? `<b>✅ Booked mint landed</b>` : `<b>❌ Booked mint bought nothing</b>`,
@@ -6283,10 +6685,29 @@ async function runScheduled(entry: ScheduledMint): Promise<void> {
       `${bar(report.confirmed, report.attempted)}  ${report.confirmed}/${report.attempted} confirmed`,
       `${report.fetched}/${report.requested} wallets got calldata`,
       `spent ${eth(report.totalValue)} ETH · fetch ${report.fetchMs.toFixed(0)}ms`,
-      firstOk ? `\n${txLink(chain.chainId, firstOk.hash, "view a transaction")}` : ``,
+      ``,
+      mintResultBlock(report.rows, chain.chainId),
     ]
       .filter(Boolean)
       .join("\n")
+  );
+  await announceMint({
+    tool: "FCFS",
+    contract: entry.contract,
+    chain,
+    wallets: report.attempted,
+    priceWei: report.unitPriceWei,
+    minted: report.confirmed * entry.quantity,
+    caption:
+      `Booked FCFS mint <code>${esc(entry.id)}</code> · ` +
+      `${report.confirmed}/${report.attempted} confirmed`,
+    slug,
+    txHash: report.rows.find((r) => r.status === "confirmed")?.hash,
+  });
+  await sendMintResultsCsv(
+    currentRuntime().chatId,
+    report.rows,
+    `scheduled-${entry.id}-fcfs.csv`
   );
 }
 
@@ -6843,6 +7264,8 @@ async function onCallback(ctx: Context): Promise<void> {
           return runWithArgs(ctx, ["all"], cmdNfts);
         case "autosweep":
           return cmdAutoSweep(ctx);
+        case "gas":
+          return cmdGas(ctx);
         case "scheduled":
           return cmdScheduled(ctx);
         case "autofire":
@@ -6884,6 +7307,11 @@ async function onCallback(ctx: Context): Promise<void> {
 
     case "as":
       return runWithArgs(ctx, [payload], cmdAutoSweep);
+
+    // gas:set:<gwei> and gas:auto:on|off — the same handler the screen uses,
+    // so a tap and a typed command cannot drift apart.
+    case "gas":
+      return runWithArgs(ctx, rest, cmdGas);
 
     // A booking is the one thing here that spends money with nobody watching,
     // so confirming it is always a separate, deliberate tap.
@@ -7582,6 +8010,7 @@ async function main(): Promise<void> {
   bot.command("nfts", (ctx) => cmdNfts(ctx).catch((e) => fail(ctx, e)));
   bot.command("sweep", (ctx) => cmdSweep(ctx).catch((e) => fail(ctx, e)));
   bot.command("autosweep", (ctx) => cmdAutoSweep(ctx).catch((e) => fail(ctx, e)));
+  bot.command("gas", (ctx) => cmdGas(ctx).catch((e) => fail(ctx, e)));
   bot.command("drain", (ctx) => cmdDrain(ctx).catch((e) => fail(ctx, e)));
   bot.command("mint", (ctx) => cmdMintEntry(ctx).catch((e) => fail(ctx, e)));
   bot.command("check", (ctx) => cmdCheck(ctx).catch((e) => fail(ctx, e)));

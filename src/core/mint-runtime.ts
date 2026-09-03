@@ -26,7 +26,8 @@ export type ReceiptProgress = (
   confirmed: number,
   reverted: number,
   pending: number,
-  total: number
+  total: number,
+  rows: ReceiptRow[]
 ) => void;
 
 /**
@@ -74,7 +75,8 @@ export async function collectReceipts(
       all.filter((r) => r.status === "confirmed").length,
       all.filter((r) => r.status === "reverted").length,
       all.filter((r) => r.status === "pending").length,
-      all.length
+      all.length,
+      all
     );
 
     if (all.every((r) => r.status !== "pending")) break;

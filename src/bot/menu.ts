@@ -137,8 +137,33 @@ export function settingsMenu(duringSetup = false, autoSweepOn = true): InlineKey
   // question they cannot answer.
   if (!duringSetup) {
     keyboard.text(`🤖 Auto-sweep: ${autoSweepOn ? "ON" : "OFF"}`, "a:autosweep").row();
+    keyboard.text("⛽ Mint gas", "a:gas").row();
   }
   return keyboard.text("‹ Back", duringSetup ? "s:cancel" : "m:main");
+}
+
+/**
+ * The tip this bot bids, chosen rather than typed.
+ *
+ * Presets, because the realistic way this number goes wrong is a misplaced
+ * decimal at the worst possible moment, and because the useful range is narrow
+ * enough to fit on one screen. The current value is ticked so the question
+ * "what am I bidding?" is answered without a tap.
+ */
+export function gasMenu(currentGwei: string, autoPrice: boolean): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  const presets = ["0.05", "0.25", "0.5", "1"];
+  const current = Number(currentGwei);
+  presets.forEach((value, index) => {
+    const mark = Number(value) === current ? "✓ " : "";
+    keyboard.text(`${mark}${value} gwei`, `gas:set:${value}`);
+    if (index % 2 === 1) keyboard.row();
+  });
+  if (presets.length % 2 === 1) keyboard.row();
+  return keyboard
+    .text(`📈 Auto-price: ${autoPrice ? "ON" : "OFF"}`, autoPrice ? "gas:auto:off" : "gas:auto:on")
+    .row()
+    .text("‹ Back", "cfg:menu");
 }
 
 export function destinationConfirm(address: string, duringSetup = false): InlineKeyboard {
