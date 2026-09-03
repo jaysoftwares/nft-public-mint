@@ -6,9 +6,12 @@
 //   2. the `--chain` CLI option
 //   3. the `CHAIN` env var
 //
-// OpenSea confirmed support for Robinhood Chain (opensea.io/discover/chain/robinhood),
-// so the existing OpenSea-based mint flow works on it unchanged — only the RPC
-// (in .env) and the explorer links (resolved here) differ from Base.
+// OpenSea confirmed support for Robinhood Chain (opensea.io/discover/chain/robinhood)
+// and for Ink: /chain/ink/contract/… resolves to ChainIdentifier(chainId=57073),
+// so the OpenSea-based mint flow works on both unchanged. SeaDrop 1.0 is deployed
+// at the usual singleton address on Ink too, so the public path works there as well.
+// Base was removed 2026-09-03 at the operator's request; nothing here assumed it
+// except the fallback explorer below.
 
 export interface ChainProfile {
   key: string;          // OpenSea id + --chain value + CHAIN env value
@@ -39,19 +42,21 @@ export const CHAINS: ChainProfile[] = [
     },
   },
   {
-    key: "base",
-    chainId: 8453,
-    name: "Base",
-    explorer: "https://basescan.org",
+    key: "ink",
+    chainId: 57073,
+    name: "Ink",
+    explorer: "https://explorer.inkonchain.com",
     nativeSymbol: "ETH",
     rpc: {
-      alchemyHost: "base-mainnet.g.alchemy.com",
+      alchemyHost: "ink-mainnet.g.alchemy.com",
+      // All three verified live 2026-09-03: each answers eth_chainId with
+      // 57073, and rpc-gel serves eth_feeHistory, which the fee oracle needs.
+      // Ink publishes no separate sequencer hostname, so every endpoint here
+      // is a provider and dispatch shards across them rather than favouring one.
       public: [
-        "https://mainnet.base.org",
-        "https://base-rpc.publicnode.com",
-        // Send-only (rejects eth_chainId/eth_call) but the fastest inclusion
-        // path — planRpcs keeps it for blasting and never reads from it.
-        "https://mainnet-sequencer.base.org",
+        "https://rpc-gel.inkonchain.com",
+        "https://rpc-qnd.inkonchain.com",
+        "https://ink.drpc.org",
       ],
     },
   },
@@ -71,7 +76,9 @@ export const CHAINS: ChainProfile[] = [
   },
 ];
 
-const DEFAULT_EXPLORER = "https://basescan.org";
+// Ethereum, because it is the one chain in this list that cannot be removed
+// out from under the fallback.
+const DEFAULT_EXPLORER = "https://etherscan.io";
 
 // Resolve a chain by its numeric chainId (from the live network) or by its
 // string key (--chain / CHAIN). Returns undefined for unknown chains.
@@ -89,7 +96,7 @@ export function resolveChain(
 
 // Build a block-explorer tx URL for whatever chain we're on. Accepts either the
 // numeric chainId (preferred — it's authoritative) or the chain key. Falls back
-// to Basescan for unknown chains so links are never broken silently.
+// to Etherscan for unknown chains so links are never broken silently.
 export function explorerTx(
   idOrKey: string | number | bigint | null | undefined,
   txHash: string

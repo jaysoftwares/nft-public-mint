@@ -64,7 +64,7 @@ function relative(seconds: number): string {
 }
 
 async function main(): Promise<void> {
-  const chainKey = (arg("chain") ?? process.env.CHAIN ?? "base").toLowerCase();
+  const chainKey = (arg("chain") ?? process.env.CHAIN ?? "robinhood").toLowerCase();
   const lookback = Number(arg("blocks") ?? 200_000);
   const limit = Number(arg("limit") ?? 40);
 

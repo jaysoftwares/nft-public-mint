@@ -17,7 +17,7 @@ const CHAIN_ALIASES: Record<string, string> = {
   ethereum: "ethereum",
   eth: "ethereum",
   mainnet: "ethereum",
-  base: "base",
+  ink: "ink",
   robinhood: "robinhood",
 };
 

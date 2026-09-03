@@ -101,8 +101,11 @@ async function main(): Promise<void> {
       const balance = perChain.get(profile.key)?.get(address) ?? 0n;
       if (balance > 0n) parts.push(`${profile.name} ${formatEther(balance)}`);
     }
-    const baseBalance = perChain.get("base")?.get(address) ?? 0n;
-    const armed = baseBalance >= required;
+    // "Armed" means funded on the chain this run is about, not on whichever
+    // one happened to be hard-coded here.
+    const primary = CHAINS[0]?.key ?? "ethereum";
+    const primaryBalance = perChain.get(primary)?.get(address) ?? 0n;
+    const armed = primaryBalance >= required;
     console.log(
       `  ${String(i).padStart(2)}  ${address}  ` +
         (parts.length > 0 ? parts.join(" · ") : dim("empty")) +

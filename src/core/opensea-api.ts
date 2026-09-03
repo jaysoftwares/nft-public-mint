@@ -31,7 +31,10 @@ export const OPENSEA_API_BASE = "https://api.opensea.io/api/v2";
 /** OpenSea's chain slugs, which differ from our chain keys in places. */
 export const CHAIN_SLUGS: Record<number, string> = {
   1: "ethereum",
-  8453: "base",
+  // Ink. Verified live 2026-09-03: /chain/ink/contract/... answers with
+  // ChainIdentifier(chainId=57073), so OpenSea resolves the slug even where it
+  // has not indexed a given contract.
+  57073: "ink",
   // Robinhood Chain. Verified live against the v2 API: /chain/robinhood/contract/…
   // answers 200, and the drop endpoint reports chain "robinhood". Omitting it
   // made every /fcfs on this chain fail at slug resolution rather than at mint.

@@ -208,7 +208,7 @@ export function withoutKeywordPairs(parts: string[]): string[] {
 }
 
 export const DEFAULT_CONFIG: BotConfig = {
-  chain: "base",
+  chain: "robinhood",
   // Setup sentinel. The Telegram flow refuses wallet creation until each user
   // confirms a real destination in their isolated settings.
   vault: ZeroAddress,

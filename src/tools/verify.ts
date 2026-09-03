@@ -1579,7 +1579,7 @@ async function main(): Promise<void> {
 
   const dashChains = [
     {
-      key: "base",
+      key: "ink",
       name: "Base",
       symbol: "ETH",
       minFundedWei: RESERVE,
@@ -1665,14 +1665,14 @@ async function main(): Promise<void> {
   );
   check("armed and manual add up", dash.wallets.armed === 2 && dash.wallets.manual === 1);
 
-  const baseRow = dash.funding.chains.find((c) => c.key === "base")!;
+  const inkRow = dash.funding.chains.find((c) => c.key === "ink")!;
   const rhRow = dash.funding.chains.find((c) => c.key === "robinhood")!;
   const ethRow = dash.funding.chains.find((c) => c.key === "ethereum")!;
 
-  check("a chain counts only the wallets it answered for", baseRow.funded === 1 && baseRow.empty === 1);
-  check("…and reports the rest as unread rather than empty", baseRow.unknown === 1);
-  check("the funder's balance is reported apart from the set", baseRow.funderWei === parseEther("0.03"));
-  check("…and left out of the set's total", baseRow.totalWei === parseEther("1"));
+  check("a chain counts only the wallets it answered for", inkRow.funded === 1 && inkRow.empty === 1);
+  check("…and reports the rest as unread rather than empty", inkRow.unknown === 1);
+  check("the funder's balance is reported apart from the set", inkRow.funderWei === parseEther("0.03"));
+  check("…and left out of the set's total", inkRow.totalWei === parseEther("1"));
   check("a chain that did not answer is marked unread", !ethRow.read);
   check("…and contributes no empty wallets", ethRow.empty === 0 && ethRow.funded === 0);
 
@@ -1820,12 +1820,12 @@ async function main(): Promise<void> {
   const chainCases: [string[], string | undefined][] = [
     // What the fund flow now emits.
     [["derived+funded", "0.002", "on", "robinhood"], "robinhood"],
-    [["all", "on", "base"], "base"],
+    [["all", "on", "ink"], "ink"],
     [["0xabc", "2", "derived+funded", "wait", "on", "robinhood"], "robinhood"],
-    [["0xabc", "2", "derived+funded", "wait", "at", "17:30", "on", "base"], "base"],
+    [["0xabc", "2", "derived+funded", "wait", "at", "17:30", "on", "ink"], "ink"],
     [["ROBINHOOD"], undefined],
     [["on", "Robinhood"], "robinhood"],
-    [["on", "  base  "], "base"],
+    [["on", "  ink  "], "ink"],
     // No override present.
     [["derived+funded", "0.002"], undefined],
     [[], undefined],
@@ -2414,7 +2414,7 @@ async function main(): Promise<void> {
   );
   check(
     "a contract survives alongside both",
-    withoutKeywordPairs(["funded", "0xabc", "on", "base", "to", VECTORS[0]]).join(" ") ===
+    withoutKeywordPairs(["funded", "0xabc", "on", "ink", "to", VECTORS[0]]).join(" ") ===
       "funded 0xabc"
   );
   check(
@@ -3701,7 +3701,7 @@ async function main(): Promise<void> {
 
   const booked = bookings.add({
     contract: VECTORS[0],
-    chainKey: "base",
+    chainKey: "ink",
     chainId: 8453,
     quantity: 2,
     selector: "derived+funded",
@@ -4097,7 +4097,7 @@ async function main(): Promise<void> {
   check("the allowlist is a schedulable path in its own right", bookings.MINT_PATHS.includes("allowlist"));
   const picked = bookings.add({
     contract: VECTORS[1],
-    chainKey: "base",
+    chainKey: "ink",
     chainId: 8453,
     quantity: 1,
     selector: "3 picked on the card",
@@ -4183,7 +4183,7 @@ async function main(): Promise<void> {
     chatId: 1,
     messageId: 1,
     contract: VECTORS[0],
-    chainKey: "base",
+    chainKey: "ink",
     chainId: 8453,
     chainName: "Base",
     nativeSymbol: "ETH",

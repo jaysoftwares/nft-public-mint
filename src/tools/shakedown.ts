@@ -63,7 +63,7 @@ function arg(name: string, fallback?: string): string | undefined {
 }
 
 async function main(): Promise<void> {
-  const chainKey = (arg("chain") ?? process.env.CHAIN ?? "base").toLowerCase();
+  const chainKey = (arg("chain") ?? process.env.CHAIN ?? "robinhood").toLowerCase();
   const contract = arg("contract");
   const watchSeconds = Number(arg("watch") ?? 0);
 
