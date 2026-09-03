@@ -49,14 +49,22 @@ export const CHAINS: ChainProfile[] = [
     nativeSymbol: "ETH",
     rpc: {
       alchemyHost: "ink-mainnet.g.alchemy.com",
-      // All three verified live 2026-09-03: each answers eth_chainId with
-      // 57073, and rpc-gel serves eth_feeHistory, which the fee oracle needs.
-      // Ink publishes no separate sequencer hostname, so every endpoint here
-      // is a provider and dispatch shards across them rather than favouring one.
+      // All three verified live 2026-09-03: each answers eth_chainId with 57073
+      // and serves eth_feeHistory, which the fee oracle needs. Ink publishes no
+      // separate sequencer hostname, so every endpoint here is a provider and
+      // dispatch shards across them rather than favouring one.
+      //
+      // Order matters more than it looks. The first entry becomes the read URL,
+      // and wsUrlFor derives the socket from it by rewriting https to wss — so
+      // leading with a host that serves no WebSocket costs push delivery for
+      // the whole chain. rpc-gel is exactly that host: it answers HTTP fine and
+      // refuses the upgrade, which dropped copy-mint to 750ms polling and then
+      // to "Your IP has exceeded its request rate limit". The two that do
+      // accept eth_subscribe lead instead.
       public: [
-        "https://rpc-gel.inkonchain.com",
         "https://rpc-qnd.inkonchain.com",
         "https://ink.drpc.org",
+        "https://rpc-gel.inkonchain.com",
       ],
     },
   },

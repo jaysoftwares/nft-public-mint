@@ -48,8 +48,34 @@ const ZERO_TOPIC = `0x${"0".repeat(64)}`;
  */
 const MAX_DEAD_CONNECTS = 3;
 
-/** Polling cadence when push delivery is unavailable. */
+/** Polling cadence when push delivery is unavailable, and all is well. */
 const DEFAULT_POLL_MS = 750;
+
+/**
+ * Ceiling on the interval a failing poll backs off to.
+ *
+ * 750ms is the right cadence against a paid endpoint and far too fast for a
+ * public one: it is roughly eighty eth_getLogs a minute, which Ink's public RPC
+ * answers with "Your IP has exceeded its request rate limit" and then keeps
+ * answering, because nothing here slowed down. A poll that is being refused is
+ * not delivering copy signals anyway, so backing off costs nothing and stops
+ * the endpoint being hammered by a loop that cannot use the answers.
+ */
+const MAX_POLL_BACKOFF_MS = 30_000;
+
+/**
+ * How long the same repeating failure stays quiet after it has been reported.
+ *
+ * The operator needs to be told once that a chain stopped delivering. Being
+ * told every 750ms is not more information — it is the same fact, at a rate
+ * that got Telegram to start refusing the messages.
+ */
+const REPEAT_SILENCE_MS = 15 * 60_000;
+
+/** Rate-limit rejections, which deserve a steeper retreat than a random blip. */
+function isRateLimited(message: string): boolean {
+  return /rate limit|too many requests|429|-32005|-32007|exceeded its request/i.test(message);
+}
 
 /**
  * How long a connection gets to produce a confirmed subscription.
@@ -487,15 +513,51 @@ export class LogWatcher {
     const interval = this.opts.pollIntervalMs ?? DEFAULT_POLL_MS;
     const generation = ++this.pollGeneration;
 
+    // Backoff state lives with the loop, not the watcher: a retarget starts a
+    // new generation and should start from a clean slate rather than inherit
+    // the previous list's grievances.
+    let failures = 0;
+    let delay = interval;
+    let reported: string | undefined;
+    let reportedAt = 0;
+
     const tick = async (): Promise<void> => {
       if (!this.running || generation !== this.pollGeneration) return;
       try {
         await this.replayMissed();
+        if (failures > 0) {
+          this.opts.onStatus(
+            `Polling recovered after ${failures} failed attempt(s).`,
+            "info"
+          );
+        }
+        failures = 0;
+        delay = interval;
+        reported = undefined;
       } catch (err) {
-        this.opts.onStatus(`Poll failed: ${(err as Error).message}`, "warn");
+        failures += 1;
+        const message = (err as Error).message;
+
+        // Retreat, steeply for a rate limit. Capped, so a chain that comes back
+        // is picked up within half a minute rather than hours later.
+        const step = isRateLimited(message) ? 4 : 2;
+        delay = Math.min(MAX_POLL_BACKOFF_MS, interval * step ** Math.min(failures, 6));
+
+        // Say it once. Say it again only if the reason changes, or if it has
+        // been failing quietly for long enough that silence would mislead.
+        const now = Date.now();
+        if (message !== reported || now - reportedAt > REPEAT_SILENCE_MS) {
+          this.opts.onStatus(
+            `Poll failed: ${message} — retrying every ${(delay / 1000).toFixed(1)}s ` +
+              `until it answers.`,
+            "warn"
+          );
+          reported = message;
+          reportedAt = now;
+        }
       }
       if (this.running && generation === this.pollGeneration) {
-        this.pollTimer = setTimeout(() => void tick(), interval);
+        this.pollTimer = setTimeout(() => void tick(), delay);
         this.pollTimer.unref?.();
       }
     };
