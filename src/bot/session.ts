@@ -534,7 +534,26 @@ export class Session {
       );
       this.engines.set(chain.key, engine);
 
-      await this.primeCopyPool(chain.key);
+      // Priming buys latency, not coverage: it warms nonces so a fire does not
+      // pay a round trip at the one moment there is none to spare. A chain that
+      // refuses to prime still detects, and firing fetches the nonce lazily.
+      //
+      // So this must never be allowed to throw out of the loop. It used to sit
+      // outside the guard below, and Ink — whose public RPC rate-limits 512
+      // wallet reads — threw here on every startup. That threw out of
+      // startCopy() partway through, so Robinhood, the chain after Ink in the
+      // list and the one this deployment actually mints on, never got a watcher
+      // at all: for two days copy-mint reported itself healthy on Ethereum and
+      // saw nothing on the chain that mattered.
+      try {
+        await this.primeCopyPool(chain.key);
+      } catch (err) {
+        onStatus(
+          `[${chain.name}] could not warm the wallet pool: ${(err as Error).message}. ` +
+            `Still watching — the first copy on this chain just pays one extra round trip.`,
+          "warn"
+        );
+      }
 
       const watcher = new LogWatcher({
         wsUrl: this.wsUrlFor(chain),

@@ -365,6 +365,29 @@ export class LogWatcher {
     }
 
     if (message.id !== undefined && this.heartbeatRequestIds.delete(message.id)) {
+      // The heartbeat's answer is the chain head, and a confirmed subscription
+      // is covering every block up to it. Recording that is what makes the gap
+      // replay measure the actual hole.
+      //
+      // Without it lastSeenBlock only ever moved when a watched wallet minted,
+      // so a quiet hour left it an hour behind — and the reconnect after it
+      // announced "Skipped 34140 stale block(s)" about blocks the live
+      // subscription had watched the whole time. That reads like the watcher
+      // losing an hour of drops on every retry. It was not; but the message
+      // was indistinguishable from the case where it is, which is worse than
+      // either, and it hid how small the real gaps were.
+      // Held one block back. The head can be announced a moment before a log
+      // in it reaches us, so claiming coverage of the head itself would let a
+      // socket that dies in that instant drop a mint nothing would replay.
+      // One block of overlap costs nothing — emit() dedupes by transaction.
+      if (this.subscribed && typeof message.result === "string") {
+        try {
+          const covered = Number(BigInt(message.result)) - 1;
+          if (covered > this.lastSeenBlock) this.lastSeenBlock = covered;
+        } catch {
+          /* a malformed head is not worth a reconnect — the next probe retries */
+        }
+      }
       return;
     }
 
